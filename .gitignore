@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+envGreenHouse/
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+envGreenHouse/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node modules
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# React build
+GreenHouseFrontend/build/
+GreenHouseFrontend/.env.local
+GreenHouseFrontend/.env.development.local
+GreenHouseFrontend/.env.test.local
+GreenHouseFrontend/.env.production.local
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Data files
+consumption/
+*.txt
+*.csv
+
+# Images (except documentation)
+*.png
+*.jpg
+*.jpeg
+!docs/*.png
+!docs/*.jpg
+
+# Credentials and secrets
+.env
+credentials.json
+config.json
+*.pem
+*.key
+
+# Database
+*.db
+*.sqlite
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Package files
+package-lock.json
+yarn.lock
