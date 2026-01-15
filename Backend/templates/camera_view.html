@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PlantMind - Camera Viewer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            color: white;
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 2.5em;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+
+        .camera-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .camera-4k {
+            grid-column: 1 / -1;  /* Make 4K camera span full width */
+        }
+
+        .camera-4k .camera-view {
+            min-height: 500px;  /* Larger view for 4K camera */
+        }
+
+        .camera-card {
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            overflow: hidden;
+            transition: transform 0.3s ease;
+        }
+
+        .camera-card:hover {
+            transform: translateY(-5px);
+        }
+
+        .camera-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .camera-header h2 {
+            font-size: 1.3em;
+        }
+
+        .camera-info {
+            font-size: 0.85em;
+            opacity: 0.9;
+        }
+
+        .camera-view {
+            position: relative;
+            background: #000;
+            min-height: 300px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .camera-view img {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+
+        .placeholder {
+            color: #666;
+            font-size: 1.2em;
+        }
+
+        .camera-controls {
+            padding: 15px;
+            background: #f8f9fa;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            flex: 1;
+            min-width: 100px;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: scale(1.05);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-success {
+            background: #28a745;
+            color: white;
+        }
+
+        .btn-success:hover {
+            background: #218838;
+            transform: scale(1.05);
+        }
+
+        .btn-danger {
+            background: #dc3545;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #c82333;
+            transform: scale(1.05);
+        }
+
+        .status {
+            padding: 15px;
+            background: white;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+
+        .status-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #eee;
+        }
+
+        .status-item:last-child {
+            border-bottom: none;
+        }
+
+        .badge {
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.85em;
+            font-weight: 600;
+        }
+
+        .badge-success {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .badge-info {
+            background: #d1ecf1;
+            color: #0c5460;
+        }
+
+        @media (max-width: 768px) {
+            .camera-grid {
+                grid-template-columns: 1fr;
+            }
+
+            h1 {
+                font-size: 1.8em;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🌱 PlantMind Camera Viewer</h1>
+
+        <div class="status">
+            <div class="status-item">
+                <strong>System Status:</strong>
+                <span class="badge badge-success">● Online</span>
+            </div>
+            <div class="status-item">
+                <strong>Available Cameras:</strong>
+                <span class="badge badge-info">3 Cameras</span>
+            </div>
+        </div>
+
+        <div class="camera-grid">
+            <!-- Camera 3: NEW 4K Camera - FULL WIDTH, TOP POSITION -->
+            <div class="camera-card camera-4k">
+                <div class="camera-header" style="background: linear-gradient(135deg, #ff6b6b 0%, #ee5a24 100%);">
+                    <h2>🎥 Camera 3 - 4K Ultra HD</h2>
+                    <div class="camera-info">4K USB Camera (Redeagle) • Max: 2592x1944 • 5MP</div>
+                </div>
+                <div class="camera-view" id="camera3-view">
+                    <span class="placeholder">Click "Start Stream" to view 4K camera</span>
+                </div>
+                <div class="camera-controls">
+                    <button class="btn btn-success" onclick="startCamera(3)">▶️ Start Stream</button>
+                    <button class="btn btn-danger" onclick="stopCamera(3)">⏹️ Stop Stream</button>
+                    <button class="btn btn-primary" onclick="capture4K()">📸 Capture 4K Photo</button>
+                    <button class="btn btn-primary" onclick="window.location.href='/camera_4k'" style="background: linear-gradient(135deg, #ff6b6b 0%, #ee5a24 100%);">🖥️ Full Screen View</button>
+                </div>
+            </div>
+
+            <!-- Camera 1: Integrated Camera -->
+            <div class="camera-card">
+                <div class="camera-header">
+                    <h2>📷 Camera 1</h2>
+                    <div class="camera-info">Integrated Camera</div>
+                </div>
+                <div class="camera-view" id="camera1-view">
+                    <span class="placeholder">Click Start to view</span>
+                </div>
+                <div class="camera-controls">
+                    <button class="btn btn-success" onclick="startCamera(1)">Start</button>
+                    <button class="btn btn-danger" onclick="stopCamera(1)">Stop</button>
+                </div>
+            </div>
+
+            <!-- Camera 2: NEW 2K Camera -->
+            <div class="camera-card">
+                <div class="camera-header" style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);">
+                    <h2>📷 Camera 2 - 2K</h2>
+                    <div class="camera-info">2K USB Camera (Redeagle) • Max: 2560x1440</div>
+                </div>
+                <div class="camera-view" id="camera2-view">
+                    <span class="placeholder">Click Start to view</span>
+                </div>
+                <div class="camera-controls">
+                    <button class="btn btn-success" onclick="startCamera(2)">▶️ Start</button>
+                    <button class="btn btn-danger" onclick="stopCamera(2)">⏹️ Stop</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function startCamera(cameraNum) {
+            const viewDiv = document.getElementById(`camera${cameraNum}-view`);
+            const url = `/start_stream_c${cameraNum}`;
+
+            // Clear placeholder
+            viewDiv.innerHTML = `<img src="${url}" alt="Camera ${cameraNum} Stream">`;
+
+            console.log(`Started camera ${cameraNum}`);
+        }
+
+        function stopCamera(cameraNum) {
+            const viewDiv = document.getElementById(`camera${cameraNum}-view`);
+
+            // Send stop request
+            fetch(`/stop_stream_c${cameraNum}`)
+                .then(response => response.text())
+                .then(message => {
+                    console.log(message);
+                    viewDiv.innerHTML = '<span class="placeholder">Stream stopped</span>';
+                })
+                .catch(error => {
+                    console.error('Error stopping camera:', error);
+                });
+        }
+
+        function capture4K() {
+            // Show loading
+            const btn = event.target;
+            const originalText = btn.innerHTML;
+            btn.innerHTML = '📸 Capturing...';
+            btn.disabled = true;
+
+            // Capture image at max resolution
+            fetch('/api/capture_4k', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    resolution: [2592, 1944]  // Max resolution
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    alert(`✓ 4K Image captured!\nSaved to: ${data.path}\nResolution: ${data.resolution[0]}x${data.resolution[1]}`);
+                } else {
+                    alert(`✗ Capture failed: ${data.error}`);
+                }
+            })
+            .catch(error => {
+                alert(`✗ Error: ${error.message}`);
+            })
+            .finally(() => {
+                btn.innerHTML = originalText;
+                btn.disabled = false;
+            });
+        }
+
+        // Auto-refresh status every 5 seconds
+        setInterval(() => {
+            fetch('/api/cameras')
+                .then(response => response.json())
+                .then(data => {
+                    console.log('Camera status updated:', data);
+                })
+                .catch(error => console.error('Status check failed:', error));
+        }, 5000);
+    </script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Live Camera Stream</title>
+</head>
+<body>
+    <h2>Live Feed from Raspberry Pi</h2>
+    <!-- 1280, 720 -->
+    <p>Click the buttons below to start or stop the camera streams.</p><br>
+    <button onclick="fetch('/capture_c1')">Capture Image Cam USB</button>
+    <button onclick="fetch('/capture_c2')">Capture Image Cam RPi</button>
+    <button onclick="fetch('/capture_c1_c2')">Capture Image from Both Cameras</button>
+    <br><br>
+    <img src="{{ url_for('video_c1') }}" width="1280" height="720">
+    <button onclick="fetch('/stop_stream_c1')">Stop Camera</button>
+    <button onclick="fetch('/start_stream_c1')">Start Camera</button>
+    <br><br>
+    <img src="{{ url_for('video_c2') }}" width="640" height="480">
+    <button onclick="fetch('/stop_stream_c2')">Stop Camera</button>
+    <button onclick="fetch('/start_stream_c2')">Start Camera</button>
+</body>
+</html>

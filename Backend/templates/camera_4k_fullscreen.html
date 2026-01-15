@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>4K Camera - Full Screen</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #000;
+            overflow: hidden;
+            height: 100vh;
+        }
+
+        .fullscreen-container {
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            background: #000;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #ff6b6b 0%, #ee5a24 100%);
+            color: white;
+            padding: 15px 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+            z-index: 10;
+        }
+
+        .header h1 {
+            font-size: 1.5em;
+            margin: 0;
+        }
+
+        .header-info {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+        }
+
+        .badge {
+            padding: 6px 15px;
+            border-radius: 20px;
+            font-size: 0.9em;
+            font-weight: 600;
+            background: rgba(255,255,255,0.2);
+        }
+
+        .camera-container {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            background: #000;
+            overflow: hidden;
+        }
+
+        #camera-stream {
+            max-width: 100%;
+            max-height: 100%;
+            width: auto;
+            height: auto;
+            object-fit: contain;
+            display: block;
+        }
+
+        .placeholder {
+            color: #666;
+            font-size: 1.5em;
+            text-align: center;
+        }
+
+        .controls {
+            background: rgba(0,0,0,0.9);
+            padding: 20px 30px;
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            padding: 12px 30px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .btn-success {
+            background: #28a745;
+            color: white;
+        }
+
+        .btn-success:hover {
+            background: #218838;
+            transform: scale(1.05);
+        }
+
+        .btn-danger {
+            background: #dc3545;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #c82333;
+            transform: scale(1.05);
+        }
+
+        .btn-primary {
+            background: #007bff;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #0056b3;
+            transform: scale(1.05);
+        }
+
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+        }
+
+        .btn-secondary:hover {
+            background: #5a6268;
+            transform: scale(1.05);
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: white;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #28a745;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .resolution-selector {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            color: white;
+        }
+
+        .resolution-selector select {
+            padding: 8px 15px;
+            border-radius: 5px;
+            border: none;
+            background: #333;
+            color: white;
+            font-size: 14px;
+            cursor: pointer;
+        }
+
+        .info-overlay {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0,0,0,0.7);
+            color: white;
+            padding: 15px 20px;
+            border-radius: 10px;
+            font-size: 0.9em;
+            backdrop-filter: blur(10px);
+        }
+
+        .info-overlay div {
+            margin: 5px 0;
+        }
+
+        @media (max-width: 768px) {
+            .header h1 {
+                font-size: 1.2em;
+            }
+
+            .controls {
+                padding: 15px;
+            }
+
+            .btn {
+                padding: 10px 20px;
+                font-size: 14px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="fullscreen-container">
+        <div class="header">
+            <h1>🎥 4K Ultra HD Camera - Full Screen</h1>
+            <div class="header-info">
+                <div class="status-indicator">
+                    <div class="status-dot"></div>
+                    <span id="status-text">Ready</span>
+                </div>
+                <span class="badge">2592 x 1944 • 5MP</span>
+            </div>
+        </div>
+
+        <div class="camera-container">
+            <div id="camera-view">
+                <div class="placeholder">
+                    Click "▶️ Start Stream" below to view the 4K camera
+                </div>
+            </div>
+
+            <div class="info-overlay" id="info-overlay" style="display: none;">
+                <div><strong>Camera:</strong> 4K USB Redeagle</div>
+                <div><strong>Device:</strong> /dev/video2</div>
+                <div><strong>Resolution:</strong> <span id="current-res">1280x720</span></div>
+                <div><strong>Status:</strong> <span id="stream-status">Streaming</span></div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <button class="btn btn-success" onclick="startStream()">
+                ▶️ Start Stream
+            </button>
+            <button class="btn btn-danger" onclick="stopStream()">
+                ⏹️ Stop Stream
+            </button>
+            <button class="btn btn-primary" onclick="capturePhoto()">
+                📸 Capture Photo
+            </button>
+
+            <div class="resolution-selector">
+                <label>Quality:</label>
+                <select id="quality-select">
+                    <option value="640x480">VGA (640x480)</option>
+                    <option value="1280x720" selected>HD (1280x720)</option>
+                    <option value="1920x1080">Full HD (1920x1080)</option>
+                </select>
+            </div>
+
+            <button class="btn btn-secondary" onclick="toggleInfo()">
+                ℹ️ Info
+            </button>
+
+            <button class="btn btn-secondary" onclick="goBack()">
+                ← All Cameras
+            </button>
+        </div>
+    </div>
+
+    <script>
+        let streaming = false;
+
+        function startStream() {
+            const viewDiv = document.getElementById('camera-view');
+            const statusText = document.getElementById('status-text');
+
+            // Create image element for stream
+            viewDiv.innerHTML = '<img id="camera-stream" src="/video_c3" alt="4K Camera Stream">';
+
+            streaming = true;
+            statusText.textContent = 'Streaming';
+            document.getElementById('stream-status').textContent = 'Active';
+
+            console.log('Started 4K camera stream');
+        }
+
+        function stopStream() {
+            const viewDiv = document.getElementById('camera-view');
+            const statusText = document.getElementById('status-text');
+
+            // Send stop request
+            fetch('/stop_stream_c3')
+                .then(response => response.text())
+                .then(message => {
+                    console.log(message);
+                    viewDiv.innerHTML = '<div class="placeholder">Stream stopped. Click "▶️ Start Stream" to resume.</div>';
+                    streaming = false;
+                    statusText.textContent = 'Stopped';
+                    document.getElementById('stream-status').textContent = 'Stopped';
+                })
+                .catch(error => {
+                    console.error('Error stopping camera:', error);
+                    alert('Error stopping camera: ' + error.message);
+                });
+        }
+
+        function capturePhoto() {
+            const btn = event.target;
+            const originalHTML = btn.innerHTML;
+            btn.innerHTML = '📸 Capturing...';
+            btn.disabled = true;
+
+            // Capture at maximum resolution
+            fetch('/api/capture_4k', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    resolution: [2592, 1944]  // Max resolution
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    alert(`✓ 4K Photo Captured!\n\nSaved to: ${data.path}\nResolution: ${data.resolution[0]} x ${data.resolution[1]}\n\nThe image has been saved to the backend directory.`);
+                } else {
+                    alert(`✗ Capture Failed\n\n${data.error}`);
+                }
+            })
+            .catch(error => {
+                alert(`✗ Error\n\n${error.message}`);
+            })
+            .finally(() => {
+                btn.innerHTML = originalHTML;
+                btn.disabled = false;
+            });
+        }
+
+        function toggleInfo() {
+            const overlay = document.getElementById('info-overlay');
+            overlay.style.display = overlay.style.display === 'none' ? 'block' : 'none';
+        }
+
+        function goBack() {
+            window.location.href = '/cameras';
+        }
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            if (e.key === ' ' || e.key === 'Spacebar') {
+                e.preventDefault();
+                if (streaming) {
+                    stopStream();
+                } else {
+                    startStream();
+                }
+            } else if (e.key === 'c' || e.key === 'C') {
+                capturePhoto();
+            } else if (e.key === 'i' || e.key === 'I') {
+                toggleInfo();
+            } else if (e.key === 'Escape') {
+                goBack();
+            }
+        });
+
+        // Auto-start stream on page load
+        window.addEventListener('load', () => {
+            setTimeout(() => {
+                startStream();
+            }, 500);
+        });
+    </script>
+</body>
+</html>
