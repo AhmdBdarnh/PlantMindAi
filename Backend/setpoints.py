@@ -4,7 +4,7 @@ from utils.utils import _CUSTOM_PRINT_FUNC
 
 class GH_Setpoints:
     def __init__(self, mqtt_handler, mongo_db_handler, actuator_handler=None):        
-        self.__temperature_setpoint = 25.0
+        self.__temperature_setpoint = 16.0
         self.__humidity_setpoint = 60.0
         self.__light_setpoint = 10.0 # 0 - 18 lux
         self.__soil_ph_setpoint = 7.0

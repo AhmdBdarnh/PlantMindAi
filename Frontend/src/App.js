@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import './App.css';
 
 const API_BASE_URL = 'http://localhost:5000/api';
+const STREAM_BASE_URL = 'http://localhost:5000';
 
 function App() {
   const [sensors, setSensors] = useState(null);
@@ -11,6 +12,30 @@ function App() {
   const [error, setError] = useState(null);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [lastUpdate, setLastUpdate] = useState(null);
+
+  // Camera states with stable keys to prevent stream restarts
+  const [cameras, setCameras] = useState({
+    c1: { enabled: true, name: '2K USB Camera', description: 'Main View', error: false, key: 1 },
+    c2: { enabled: true, name: '4K USB Camera', description: 'Side View', error: false, key: 1 },
+    c3: { enabled: true, name: 'Integrated Camera', description: 'Overview', error: false, key: 1 }
+  });
+  const [fullscreenCamera, setFullscreenCamera] = useState(null);
+
+  // Handle camera stream error
+  const handleCameraError = (cameraId) => {
+    setCameras(prev => ({
+      ...prev,
+      [cameraId]: { ...prev[cameraId], error: true }
+    }));
+  };
+
+  // Reset camera error (retry) - increment key to force reload
+  const retryCamera = (cameraId) => {
+    setCameras(prev => ({
+      ...prev,
+      [cameraId]: { ...prev[cameraId], error: false, key: prev[cameraId].key + 1 }
+    }));
+  };
 
   // Fetch sensor data
   const fetchSensors = async () => {
@@ -164,6 +189,24 @@ function App() {
     }
   };
 
+  // Toggle camera on/off
+  const toggleCamera = (cameraId) => {
+    setCameras(prev => ({
+      ...prev,
+      [cameraId]: { ...prev[cameraId], enabled: !prev[cameraId].enabled }
+    }));
+  };
+
+  // Open camera in fullscreen modal
+  const openFullscreen = (cameraId) => {
+    setFullscreenCamera(cameraId);
+  };
+
+  // Close fullscreen modal
+  const closeFullscreen = () => {
+    setFullscreenCamera(null);
+  };
+
   // Auto-refresh data every 3 seconds
   useEffect(() => {
     // Fetch data on mount
@@ -270,6 +313,184 @@ function App() {
             </div>
           </div>
         </section>
+
+        {/* Camera Monitoring Section */}
+        <section className="section camera-section">
+          <h2>📹 Camera Monitoring</h2>
+          <div className="camera-grid">
+            {/* Camera 1 - USB Camera */}
+            <div className={`camera-card ${cameras.c1.enabled ? 'active' : 'inactive'}`}>
+              <div className="camera-header">
+                <div className="camera-info">
+                  <h3>{cameras.c1.name}</h3>
+                  <span className="camera-description">{cameras.c1.description}</span>
+                </div>
+                <div className="camera-controls">
+                  <button
+                    className={`camera-toggle-btn ${cameras.c1.enabled ? 'on' : 'off'}`}
+                    onClick={() => toggleCamera('c1')}
+                    title={cameras.c1.enabled ? 'Disable Camera' : 'Enable Camera'}
+                  >
+                    {cameras.c1.enabled ? '●' : '○'}
+                  </button>
+                  <button
+                    className="camera-fullscreen-btn"
+                    onClick={() => openFullscreen('c1')}
+                    disabled={!cameras.c1.enabled}
+                    title="Fullscreen"
+                  >
+                    ⛶
+                  </button>
+                </div>
+              </div>
+              <div className="camera-feed">
+                {cameras.c1.enabled ? (
+                  cameras.c1.error ? (
+                    <div className="camera-error">
+                      <span className="error-icon">⚠️</span>
+                      <span>Stream Failed</span>
+                      <button className="btn-retry" onClick={() => retryCamera('c1')}>Retry</button>
+                    </div>
+                  ) : (
+                    <img
+                      key={cameras.c1.key}
+                      src={`${STREAM_BASE_URL}/video_c1`}
+                      alt="Camera 1 Feed"
+                      className="camera-stream"
+                      onError={() => handleCameraError('c1')}
+                    />
+                  )
+                ) : (
+                  <div className="camera-offline">
+                    <span className="offline-icon">📷</span>
+                    <span>Camera Disabled</span>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Camera 2 - RPi Camera */}
+            <div className={`camera-card ${cameras.c2.enabled ? 'active' : 'inactive'}`}>
+              <div className="camera-header">
+                <div className="camera-info">
+                  <h3>{cameras.c2.name}</h3>
+                  <span className="camera-description">{cameras.c2.description}</span>
+                </div>
+                <div className="camera-controls">
+                  <button
+                    className={`camera-toggle-btn ${cameras.c2.enabled ? 'on' : 'off'}`}
+                    onClick={() => toggleCamera('c2')}
+                    title={cameras.c2.enabled ? 'Disable Camera' : 'Enable Camera'}
+                  >
+                    {cameras.c2.enabled ? '●' : '○'}
+                  </button>
+                  <button
+                    className="camera-fullscreen-btn"
+                    onClick={() => openFullscreen('c2')}
+                    disabled={!cameras.c2.enabled}
+                    title="Fullscreen"
+                  >
+                    ⛶
+                  </button>
+                </div>
+              </div>
+              <div className="camera-feed">
+                {cameras.c2.enabled ? (
+                  cameras.c2.error ? (
+                    <div className="camera-error">
+                      <span className="error-icon">⚠️</span>
+                      <span>Stream Failed</span>
+                      <button className="btn-retry" onClick={() => retryCamera('c2')}>Retry</button>
+                    </div>
+                  ) : (
+                    <img
+                      key={cameras.c2.key}
+                      src={`${STREAM_BASE_URL}/video_c2`}
+                      alt="Camera 2 Feed"
+                      className="camera-stream"
+                      onError={() => handleCameraError('c2')}
+                    />
+                  )
+                ) : (
+                  <div className="camera-offline">
+                    <span className="offline-icon">📷</span>
+                    <span>Camera Disabled</span>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Camera 3 - USB Camera 2 */}
+            <div className={`camera-card ${cameras.c3.enabled ? 'active' : 'inactive'}`}>
+              <div className="camera-header">
+                <div className="camera-info">
+                  <h3>{cameras.c3.name}</h3>
+                  <span className="camera-description">{cameras.c3.description}</span>
+                </div>
+                <div className="camera-controls">
+                  <button
+                    className={`camera-toggle-btn ${cameras.c3.enabled ? 'on' : 'off'}`}
+                    onClick={() => toggleCamera('c3')}
+                    title={cameras.c3.enabled ? 'Disable Camera' : 'Enable Camera'}
+                  >
+                    {cameras.c3.enabled ? '●' : '○'}
+                  </button>
+                  <button
+                    className="camera-fullscreen-btn"
+                    onClick={() => openFullscreen('c3')}
+                    disabled={!cameras.c3.enabled}
+                    title="Fullscreen"
+                  >
+                    ⛶
+                  </button>
+                </div>
+              </div>
+              <div className="camera-feed">
+                {cameras.c3.enabled ? (
+                  cameras.c3.error ? (
+                    <div className="camera-error">
+                      <span className="error-icon">⚠️</span>
+                      <span>Stream Failed</span>
+                      <button className="btn-retry" onClick={() => retryCamera('c3')}>Retry</button>
+                    </div>
+                  ) : (
+                    <img
+                      key={cameras.c3.key}
+                      src={`${STREAM_BASE_URL}/video_c3`}
+                      alt="Camera 3 Feed"
+                      className="camera-stream"
+                      onError={() => handleCameraError('c3')}
+                    />
+                  )
+                ) : (
+                  <div className="camera-offline">
+                    <span className="offline-icon">📷</span>
+                    <span>Camera Disabled</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Fullscreen Camera Modal */}
+        {fullscreenCamera && (
+          <div className="camera-modal" onClick={closeFullscreen}>
+            <div className="camera-modal-content" onClick={(e) => e.stopPropagation()}>
+              <div className="camera-modal-header">
+                <h3>{cameras[fullscreenCamera].name} - {cameras[fullscreenCamera].description}</h3>
+                <button className="camera-modal-close" onClick={closeFullscreen}>×</button>
+              </div>
+              <div className="camera-modal-body">
+                <img
+                  src={`${STREAM_BASE_URL}/video_${fullscreenCamera}`}
+                  alt={`${cameras[fullscreenCamera].name} Feed`}
+                  className="camera-stream-fullscreen"
+                />
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Sensor Section */}
         <section className="section">

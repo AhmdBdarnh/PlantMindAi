@@ -29,7 +29,7 @@ mqtt_handler = MqttHandler("114fcbcf879e4e88a21d9f0bd7ab1ccc.s1.eu.hivemq.cloud"
 # mosquitto_sub -h 114fcbcf879e4e88a21d9f0bd7ab1ccc.s1.eu.hivemq.cloud -p 8883 -u "SmartGreenHouse" -P "SmartGreenHouse2025" -t "env_monitoring_system/actuators/light/dc" 
 # initialize the mongo db handler
 mongo_db_handler = MongoDBHandler(
-    "mongodb+srv://smartGh-00:Smartgreenhouse1@greenhouse.ibf6l7y.mongodb.net/?retryWrites=true&w=majority&appName=GreenHouse", "GreenHouse"
+    "mongodb+srv://PlantMind:ShenkarPlantMind@plantmindai.lma5ro9.mongodb.net/?retryWrites=true&w=majority&appName=PlantMindAi", "GreenHouse"
 )
 
 # # dht22 setup
@@ -293,86 +293,67 @@ def temperature_sp_adjustment_task():
     
     while True:
         temperature_pause_event.wait()  # Wait until the event is set
-        
+        _CUSTOM_PRINT_FUNC(f"[TEMP] Mode={setpoints.get_operation_mode()} | PID loop running")
+
         # Read temperature setpoint safely
         temperature_set_point = setpoints.get_temperature_setpoint()
-        
+
         # Update setpoint for the controller
         temperature_pid.setpoint = temperature_set_point
-        
+
         # Read temperature safely
         try:
             temperature_semaphore.acquire()
             current_temp = env_sensors.get_air_temperature_C()
         except Exception as e:
-            _CUSTOM_PRINT_FUNC(f"Error reading temperature: {e}")
+            _CUSTOM_PRINT_FUNC(f"[TEMP] Error reading temperature: {e}")
             continue
         finally:
             temperature_semaphore.release()
-        
-        # Calculate control output using PID
-        # Positive output = heating needed
-        # Negative output = cooling needed
-        # Output near zero = within deadband
+
+        _CUSTOM_PRINT_FUNC(f"[TEMP] Temp={current_temp:.2f}°C  Setpoint={temperature_set_point:.2f}°C  Error={temperature_set_point - current_temp:.2f}")
+
         raw_output = temperature_pid(current_temp)
-        
-        # Anti-windup logic: If output is saturated, prevent integral accumulation
+
+        # Anti-windup logic
         if (raw_output >= OUTPUT_LIMITS[1] and (temperature_set_point - current_temp) > 0) or \
            (raw_output <= OUTPUT_LIMITS[0] and (temperature_set_point - current_temp) < 0):
-            # Skip integral accumulation when output is clamped
             temperature_pid._integral -= (temperature_set_point - current_temp) * KI_TEMP * SAMPLE_TIME
-        
+
         control_output = raw_output
 
-        # Apply deadband to prevent oscillation
         if abs(temperature_set_point - current_temp) < DEADBAND:
-            # Within deadband - no action needed
             control_output = 0
-        
-        # Apply control based on output sign
-        if control_output > 0:  # Positive output = heating
-            # Scale heating power from 0-1 range to MIN_POWER-MAX_POWER range
-            heat_power_scaled = control_output # This is 0 to 1
+
+        _CUSTOM_PRINT_FUNC(f"[TEMP] PID output={control_output:.4f}  Action={'HEATING' if control_output > 0 else 'COOLING' if control_output < 0 else 'IDLE'}")
+
+        if control_output > 0:  # HEATING
+            heat_power_scaled = control_output
             heater_duty_cycle = int(MIN_POWER + (POWER_RANGE * heat_power_scaled))
-            heater_duty_cycle = max(MIN_POWER, min(MAX_POWER, heater_duty_cycle)) # Clamp to be safe
-            
-            # Apply heating
-            while not env_actuators.set_heater_duty_cycle(heater_duty_cycle):
-                time.sleep(0.1)
+            heater_duty_cycle = max(MIN_POWER, min(MAX_POWER, heater_duty_cycle))
+            _CUSTOM_PRINT_FUNC(f"[TEMP] Setting heater ON → duty={heater_duty_cycle}")
+            if not env_actuators.set_heater_duty_cycle(heater_duty_cycle):
+                _CUSTOM_PRINT_FUNC("[TEMP] WARNING: heater set failed")
+            if not env_actuators.set_heater_fan_duty_cycle(heater_duty_cycle):
+                _CUSTOM_PRINT_FUNC("[TEMP] WARNING: heater fan set failed")
+            env_actuators.set_fan_duty_cycle(0)
 
-            while not env_actuators.set_heater_fan_duty_cycle(heater_duty_cycle):  # Heater fan matches heater
-                time.sleep(0.1)
-
-            while not env_actuators.set_fan_duty_cycle(0): # Cooling fan off
-                time.sleep(0.1)
-            
-        elif control_output < 0:  # Negative output = cooling
-            # Scale cooling power from 0-1 range (abs value) to MIN_POWER-MAX_POWER range
-            cool_power_scaled = abs(control_output) # This is 0 to 1
+        elif control_output < 0:  # COOLING
+            cool_power_scaled = abs(control_output)
             fan_duty_cycle = int(MIN_POWER + (POWER_RANGE * cool_power_scaled))
-            fan_duty_cycle = max(MIN_POWER, min(MAX_POWER, fan_duty_cycle)) # Clamp to be safe
-            
-            # Turn off heating
-            while not env_actuators.set_heater_duty_cycle(0):
-                time.sleep(0.1)
-            while not env_actuators.set_heater_fan_duty_cycle(0):
-                time.sleep(0.1)
-            
-            # Apply cooling
-            while not env_actuators.set_fan_duty_cycle(fan_duty_cycle):
-                time.sleep(0.1)
-            
-        else:  # Output is zero (within deadband or exactly at setpoint)
-            # Turn everything off
-            while not env_actuators.set_heater_duty_cycle(0):
-                time.sleep(0.1)
+            fan_duty_cycle = max(MIN_POWER, min(MAX_POWER, fan_duty_cycle))
+            _CUSTOM_PRINT_FUNC(f"[TEMP] Setting fan ON → duty={fan_duty_cycle}")
+            env_actuators.set_heater_duty_cycle(0)
+            env_actuators.set_heater_fan_duty_cycle(0)
+            if not env_actuators.set_fan_duty_cycle(fan_duty_cycle):
+                _CUSTOM_PRINT_FUNC("[TEMP] WARNING: fan set failed")
 
-            while not env_actuators.set_heater_fan_duty_cycle(0):
-                time.sleep(0.1)
+        else:  # IDLE
+            _CUSTOM_PRINT_FUNC("[TEMP] IDLE — all actuators OFF")
+            env_actuators.set_heater_duty_cycle(0)
+            env_actuators.set_heater_fan_duty_cycle(0)
+            env_actuators.set_fan_duty_cycle(0)
 
-            while not env_actuators.set_fan_duty_cycle(0):
-                time.sleep(0.1)
-        
         time.sleep(SAMPLE_TIME)
 
 
@@ -517,8 +498,6 @@ def get_last_sensor_update():
 
 def app_task():
     global serial_logger_thread, last_sensor_update, env_sensors, env_actuators, setpoints, camera, s3_handler, mqtt_handler, mongo_db_handler
-    setpoints.set_operation_mode("manual")  # Set initial operation mode to manual
-    env_actuators.stop_all_actuators()  # Stop all actuators when mode changes
     last_time_captured = datetime.datetime.now() - datetime.timedelta(hours=IMAGE_CAP_INTERVAL)
     last_sensor_update = datetime.datetime.now() - datetime.timedelta(seconds=10)
     last_actuators_update = datetime.datetime.now() - datetime.timedelta(seconds=1)
@@ -1008,6 +987,37 @@ def operation_mode():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+# ==================== SETPOINTS API ====================
+
+@app.route('/api/setpoints', methods=['GET', 'POST'])
+def setpoints_api():
+    """Get or update setpoints"""
+    try:
+        if request.method == 'GET':
+            return jsonify({'success': True, 'setpoints': setpoints.get_all_setpoints()})
+        data = request.get_json()
+        if 'temperature' in data:
+            val = float(data['temperature'])
+            setpoints.set_temperature_setpoint(val)
+            mongo_db_handler._MongoDBHandler__db['setpoints'].insert_one({
+                'type': 'temperature', 'message': str(val), 'timestamp': __import__('datetime').datetime.now()
+            })
+        if 'light' in data:
+            val = float(data['light'])
+            setpoints.set_light_setpoint(val)
+            mongo_db_handler._MongoDBHandler__db['setpoints'].insert_one({
+                'type': 'light_intensity', 'message': str(val), 'timestamp': __import__('datetime').datetime.now()
+            })
+        if 'soil_moisture' in data:
+            val = float(data['soil_moisture'])
+            setpoints.set_soil_humidity_setpoint(val)
+            mongo_db_handler._MongoDBHandler__db['setpoints'].insert_one({
+                'type': 'soil_moisture', 'message': str(val), 'timestamp': __import__('datetime').datetime.now()
+            })
+        return jsonify({'success': True, 'setpoints': setpoints.get_all_setpoints()})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 # ==================== WEB ROUTES ====================
 
 @app.route('/')
@@ -1042,6 +1052,21 @@ def stop_stream_c1():
 @app.route('/stop_stream_c2')
 def stop_stream_c2():
     camera.stop_camera_RPi()
+    return "Camera stopped."
+
+@app.route('/video_c3')
+def video_c3():
+    return Response(camera.generate_video_stream_camera_USB2(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/start_stream_c3')
+def start_stream_c3():
+    return Response(camera.generate_video_stream_camera_USB2(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/stop_stream_c3')
+def stop_stream_c3():
+    camera.stop_camera_USB2()
     return "Camera stopped."
 
 # @app.route('/capture_c1')
@@ -1134,8 +1159,8 @@ if __name__ == "__main__":
     setpoints.set_control_thread_event("temperature", temperature_pause_event)
     setpoints.set_control_thread_event("light", light_pause_event)
     setpoints.set_control_thread_event("moisture", soil_pause_event)
-    setpoints.set_soil_humidity_hysteresis(20.0)  # Set default hysteresis value
-    setpoints.set_operation_mode("manual")  # Set initial operation mode to manual
+    setpoints.set_soil_humidity_hysteresis(20.0)
+    setpoints.set_operation_mode("autonomous")  # Start in autonomous mode
 
     # Start Flask in a separate thread
     flask_thread = threading.Thread(target=run_flask)
@@ -1152,7 +1177,7 @@ if __name__ == "__main__":
     # start the threads
     temperature_thread.start()
     light_thread.start()
-    soil_thread.start()
+    # soil_thread.start()  # Water pump disabled for now
     app_thread.start()
     _CUSTOM_PRINT_FUNC("Starting serial logger thread...")    
     set_serial_log_enabled(True)  # Enable serial logging
@@ -1162,5 +1187,5 @@ if __name__ == "__main__":
     serial_logger_thread.join()
     temperature_thread.join()
     light_thread.join()
-    soil_thread.join()
+    # soil_thread.join()  # Water pump disabled for now
     app_thread.join()

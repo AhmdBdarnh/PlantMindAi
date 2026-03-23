@@ -3,7 +3,9 @@ import threading
 import board
 import busio
 import gpiod
-import adafruit_ads1x15.ads1115 as ads
+import adafruit_ads1x15.ads1115 as ADS
+from adafruit_ads1x15.ads1x15 import Pin
+from adafruit_ads1x15.analog_in import AnalogIn
 from datetime import timedelta
 
 # Import the separated sensor drivers
@@ -29,11 +31,11 @@ class GH_Sensors:
         self.__ads_resolution = 65535.0 # maximum resolution for ads sensor (16-bit)
         
         # ads channels
-        self.__ads_channels = [ads.P0, ads.P1, ads.P2, ads.P3]
-        self.__ads_sensor = ads.ADS1115(self.__general_i2c)
+        self.__ads_sensor = ADS.ADS1115(self.__general_i2c)
+        self.__ads_channels = [Pin.A0, Pin.A1, Pin.A2, Pin.A3]
         
         # gpiod
-        self.chip = gpiod.chip('gpiochip4')
+        self.chip = gpiod.Chip('/dev/gpiochip4')
         
         # Initialize sensor drivers
         self.soil_sensor = SoilSensor(self.__ads_sensor, self.__ads_channels)

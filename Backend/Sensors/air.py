@@ -22,13 +22,12 @@ class AirSensor:
         """Get air temperature in Celsius"""
         try:
             tempC = self.__dht22.temperature
-            if tempC == None:
+            if tempC is None:
                 return self.__prev_temp
-            
             self.__prev_temp = tempC
             return tempC
-        except RuntimeError as err:
-            _CUSTOM_PRINT_FUNC(f"Sensors: {err.args[0]}")
+        except Exception as err:
+            _CUSTOM_PRINT_FUNC(f"Sensors: {err}")
             return self.__prev_temp
     
     def get_air_temperature_F(self):
@@ -53,6 +52,6 @@ class AirSensor:
 
             self.__prev_hum = hum
             return hum
-        except RuntimeError as err:
-            _CUSTOM_PRINT_FUNC(f"Sensors: {err.args[0]}")
+        except Exception as err:
+            _CUSTOM_PRINT_FUNC(f"Sensors: {err}")
             return self.__prev_hum

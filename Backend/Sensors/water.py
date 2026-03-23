@@ -16,7 +16,7 @@ class WaterFlowSensor:
         self.__flow_rate = 0.0
         self.__water_amount = 0.0
         self.__counter = 0
-        self.__chip = gpiod.chip('gpiochip4')
+        self.__chip = gpiod.Chip('/dev/gpiochip4')
         self.__water_flow_sensor_pin = None
         self.__PULSES_PER_LITRE = 450.0  # pulses per litre for the flow sensor
 
@@ -33,24 +33,29 @@ class WaterFlowSensor:
 
     def set_water_flow_sensor_pin(self, pin):
         """Set up the water flow sensor with the specified pin"""
-        self.__water_flow_sensor_pin = self.__chip.get_line(pin)        
-        config = gpiod.line_request()
-        config.consumer = "Water_Flow"
-        config.request_type = gpiod.line_request.EVENT_BOTH_EDGES        
-        self.__water_flow_sensor_pin.request(config=config, default_val=0)
-        
+        # gpiod v2 API
+        line_settings = gpiod.LineSettings(
+            direction=gpiod.line.Direction.INPUT,
+            edge_detection=gpiod.line.Edge.BOTH
+        )
+        line_config = {pin: line_settings}
+        self.__water_flow_sensor_pin = self.__chip.request_lines(
+            consumer="Water_Flow",
+            config=line_config
+        )
+
         self.__counter = 0
         self.__water_flow_running = True
-        
+
         # Start threads for pulse counting and flow rate calculation
         self.__water_flow_thread = threading.Thread(
-            target=self.__water_flow_pulse_counter, 
+            target=self.__water_flow_pulse_counter,
             daemon=True
         )
         self.__water_flow_thread.start()
 
         self.__flow_rate_thread = threading.Thread(
-            target=self.__calculate_flow_rate, 
+            target=self.__calculate_flow_rate,
             daemon=True
         )
         self.__flow_rate_thread.start()
@@ -58,10 +63,10 @@ class WaterFlowSensor:
     def __water_flow_pulse_counter(self):
         """Thread function to count pulses from the water flow sensor"""
         while self.__water_flow_running:
-            if self.__water_flow_sensor_pin.event_wait(timedelta(seconds=1)):
-                event = self.__water_flow_sensor_pin.event_read()
-                if event.event_type == gpiod.line_event.RISING_EDGE:
-                    self.__counter += 1
+            if self.__water_flow_sensor_pin.wait_edge_events(timedelta(seconds=1)):
+                for event in self.__water_flow_sensor_pin.read_edge_events():
+                    if event.event_type == gpiod.line.Edge.RISING:
+                        self.__counter += 1
 
     def __calculate_flow_rate(self):
         """Thread function to calculate flow rate based on pulse count"""
