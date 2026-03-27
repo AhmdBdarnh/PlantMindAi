@@ -145,8 +145,38 @@ class MongoDBHandler:
             _CUSTOM_PRINT_FUNC(f"Error retrieving latest document: {e}")
             return None
 
+    def insert_capture_session(self, session_doc: dict) -> bool:
+        """
+        Store a full capture session document in the capture_sessions collection.
+        session_doc should contain: session_id, timestamp, images[], health, camera_count.
+        S3 keys (not presigned URLs) are stored so they can be refreshed on read.
+        """
+        try:
+            self.__db['capture_sessions'].insert_one(session_doc)
+            return True
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error inserting capture session: {e}")
+            return False
+
+    def get_capture_sessions(self, limit: int = 20) -> list:
+        """
+        Return the most recent capture sessions, newest first.
+        _id is excluded to make serialisation easier.
+        """
+        try:
+            cursor = (
+                self.__db['capture_sessions']
+                .find({}, {'_id': 0})
+                .sort('timestamp', pymongo.DESCENDING)
+                .limit(limit)
+            )
+            return list(cursor)
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error fetching capture sessions: {e}")
+            return []
+
     def close_connection(self):
-        try:            
+        try:
             self.__client.close()
             return True
         except Exception as e:

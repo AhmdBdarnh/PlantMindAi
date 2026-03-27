@@ -1,3 +1,4 @@
+import time
 import numpy as np
 import threading
 from utils.utils import _CUSTOM_PRINT_FUNC
@@ -70,20 +71,19 @@ class GH_Setpoints:
         self.operation_mode = mode
 
         if mode == "manual":
-            # Stop all control threads if they are running
+            # Signal all PID threads to pause
             for control_thread_event in self.__control_threads_events.values():
-                if control_thread_event is not None:
-                    # pause the thread
+                if isinstance(control_thread_event, threading.Event):
                     control_thread_event.clear()
-            
+            # Wait for threads to finish their current iteration (PID sample time is 0.1s)
+            time.sleep(0.3)
             self.__actuator_handler.stop_all_actuators()
-            
+
         if mode == "autonomous":
             self.__actuator_handler.stop_all_actuators()
-            # Resume all control threads if they are paused
+            # Resume all PID threads
             for control_thread_event in self.__control_threads_events.values():
-                if control_thread_event is not None:
-                    # resume the thread
+                if isinstance(control_thread_event, threading.Event):
                     control_thread_event.set()
 
         _CUSTOM_PRINT_FUNC(f'initial setpoints: {self.get_all_setpoints()}')

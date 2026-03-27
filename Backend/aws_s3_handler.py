@@ -1,3 +1,4 @@
+import os
 import boto3
 import botocore
 import io
@@ -5,9 +6,52 @@ from utils.utils import _CUSTOM_PRINT_FUNC
 
 class S3Handler:
     def __init__(self, bucket_name: str, region_name: str = 'us-east-1'):
-        self.__s3_client = boto3.client('s3')
+        aws_key = os.environ.get('AWS_ACCESS_KEY_ID')
+        aws_secret = os.environ.get('AWS_SECRET_ACCESS_KEY')
+        if aws_key and aws_secret:
+            self.__s3_client = boto3.client(
+                's3',
+                region_name=region_name,
+                aws_access_key_id=aws_key,
+                aws_secret_access_key=aws_secret,
+            )
+        else:
+            self.__s3_client = boto3.client('s3', region_name=region_name)
         self.__bucket_name = bucket_name
-        self.__s3_region = region_name        
+        self.__s3_region = region_name
+
+    def generate_presigned_url(self, object_key: str, expiry_seconds: int = 3600) -> str:
+        """Generate a pre-signed URL so a private S3 object can be viewed in a browser."""
+        try:
+            return self.__s3_client.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': self.__bucket_name, 'Key': object_key},
+                ExpiresIn=expiry_seconds,
+            )
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"❌ Error generating presigned URL: {e}")
+            return self.get_s3_url(object_key)
+
+    def upload_bytes(self, data: bytes, object_name: str) -> str:
+        """Upload raw bytes to S3. Returns a 1-hour presigned URL so it can be displayed in browser."""
+        try:
+            self.__s3_client.upload_fileobj(
+                io.BytesIO(data),
+                self.__bucket_name,
+                object_name,
+                ExtraArgs={'ContentType': 'image/jpeg'},
+            )
+            _CUSTOM_PRINT_FUNC(f"Uploaded bytes to {self.__bucket_name}/{object_name}.")
+            return self.generate_presigned_url(object_name, expiry_seconds=3600)
+        except botocore.exceptions.NoCredentialsError:
+            _CUSTOM_PRINT_FUNC("❌ AWS credentials not found.")
+            return None
+        except botocore.exceptions.ClientError as e:
+            _CUSTOM_PRINT_FUNC(f"❌ AWS Client Error: {e}")
+            return None
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"❌ Error uploading bytes: {e}")
+            return None
 
     def upload_file(self, file_path: str, object_name: str) -> None:
         try:

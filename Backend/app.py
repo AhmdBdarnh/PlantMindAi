@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 import time
 import datetime
 import board
@@ -10,6 +13,7 @@ from mongo_db_handler import MongoDBHandler
 from aws_s3_handler import S3Handler
 from rpi_camera import GH_Camera
 from setpoints import GH_Setpoints
+from plant_health import PlantHealthChecker
 from serial_logger import serial_logger_task
 import threading
 import numpy as np
@@ -20,7 +24,8 @@ from flask_cors import CORS
 from utils.utils import set_serial_log_enabled
 from utils.utils import _CUSTOM_PRINT_FUNC
 
-IMAGE_CAP_INTERVAL = 6  # hours interval to capture the image (every x hours)
+CAPTURE_INTERVAL_SECONDS = 120       # capture images every 2 minutes
+HEALTH_CHECK_INTERVAL_SECONDS = 1800 # call Plant.id API every 30 minutes (saves credits)
 RESOURCES_CONSUMPTION_LOG_AND_RESET_INTERVAL = 1  # hours interval to log and reset the resources consumption
 
 # initialize the mqtt handler 
@@ -220,13 +225,23 @@ mongo_db_handler.create_collection("actuators_data", "fan", mongo_db_handler.act
 # create the setpoints collections in the database
 mongo_db_handler.create_collection("plant_images", "plant image", {"_id": "", "image": "", "timestamp": datetime.datetime.now()})
 
-s3_handler = S3Handler("smartgreenhouse-2025", "eu-north-1")
+s3_handler = S3Handler(
+    os.environ.get('AWS_S3_BUCKET', 'plant-mindai'),
+    os.environ.get('AWS_REGION', 'eu-west-1'),
+)
+plant_health_checker = PlantHealthChecker()
+last_health_result = None  # stores the most recent health check result
+capture_history = []       # stores last 2 manual camera captures [{timestamp, urls, camera_count}]
+
+# Sensor cache — updated by app_task every 10s, read by Flask instantly (no semaphore blocking)
+_sensor_cache = {}
+_sensor_cache_lock = threading.Lock()
 
 # a function to toggle light on max and off again after shot
 def toggle_flash_light(state = 1):
     if state == 1:
         if setpoints.get_operation_mode() == "autonomous":
-            setpoints.set_control_thread_event("light", False)  # Pause light control thread
+            light_pause_event.clear()  # Pause light PID thread directly
         # Turn on both light strips to full power
         while not env_actuators.set_light_strip_1_duty_cycle(4095):
             _CUSTOM_PRINT_FUNC("Turning on light strip 1 for camera flash...")
@@ -237,7 +252,7 @@ def toggle_flash_light(state = 1):
             time.sleep(0.1)
     else:
         if setpoints.get_operation_mode() == "autonomous":
-            setpoints.set_control_thread_event("light", True)
+            light_pause_event.set()  # Resume light PID thread directly
         
 # init the camera
 camera = GH_Camera()
@@ -498,7 +513,6 @@ def get_last_sensor_update():
 
 def app_task():
     global serial_logger_thread, last_sensor_update, env_sensors, env_actuators, setpoints, camera, s3_handler, mqtt_handler, mongo_db_handler
-    last_time_captured = datetime.datetime.now() - datetime.timedelta(hours=IMAGE_CAP_INTERVAL)
     last_sensor_update = datetime.datetime.now() - datetime.timedelta(seconds=10)
     last_actuators_update = datetime.datetime.now() - datetime.timedelta(seconds=1)
     
@@ -620,6 +634,33 @@ def app_task():
 
             last_sensor_update = datetime.datetime.now()
 
+            # Update sensor cache so Flask routes can respond instantly
+            water_flow_semaphore.acquire()
+            try:
+                _wf = env_sensors.get_water_flow_rate()
+                _wa = env_sensors.get_total_water_amount()
+            finally:
+                water_flow_semaphore.release()
+
+            with _sensor_cache_lock:
+                _sensor_cache.update({
+                    'air_temperature': air_temp_c,
+                    'air_humidity':    air_humidity,
+                    'light_intensity': light_intensity,
+                    'soil_ph':         soil_ph,
+                    'soil_ec':         soil_ec,
+                    'soil_humidity':   soil_humidity,
+                    'soil_temperature':soil_temp,
+                    'water_flow':      _wf,
+                    'water_amount':    _wa,
+                    'voltage':         voltage,
+                    'current':         current,
+                    'power':           power,
+                    'energy':          energy,
+                    'frequency':       frequency,
+                    'power_factor':    power_factor,
+                })
+
         # update energy & water amount in database every 1 hour
         if (datetime.datetime.now() - last_resources_reset_and_log).total_seconds() > RESOURCES_CONSUMPTION_LOG_AND_RESET_INTERVAL * 3600:
             electricity_semaphore.acquire()
@@ -740,44 +781,164 @@ def app_task():
                 mongo_db_handler.insert_actuator_data(
                     "fan", fan_duty_cycle)
 
-        # capture the image every 6 hours
-        if (datetime.datetime.now() - last_time_captured).total_seconds() > IMAGE_CAP_INTERVAL * 3600:
-            last_time_captured = datetime.datetime.now()
-            _CUSTOM_PRINT_FUNC("Capturing images from cameras...")
-            toggle_flash_light(1)  # Turn on flash light for cameras
-            # capture the image
-            s3_image_count = s3_handler.get_num_of_files()
-
-            last_time_captured = datetime.datetime.now()
-            # image_path_cam0 = camera.capture_store_image(s3_image_count + 1, 0, True) # camera 0 with usb
-            # image_path_cam1 = camera.capture_store_image(s3_image_count + 1, 0) # rpi camera port 0
-
-            i = 0
-            for image_path in [image_path_cam0, image_path_cam1]:
-                if image_path:
-                    # upload the image to s3
-                    s3_handler.upload_file(
-                        image_path, os.path.basename(image_path))
-
-                    # get the s3 url
-                    s3_url = s3_handler.get_s3_url(os.path.basename(image_path))
-
-                    if s3_url:
-                        _CUSTOM_PRINT_FUNC(f"S3 URL: {s3_url}")
-                        # insert the image url to the database
-                        mongo_db_handler.insert_image_data("plant image", s3_url, i)
-                        i += 1
-                        # remove the image from local storage
-                        camera.remove_image(image_path)                    
-                    else:
-                        _CUSTOM_PRINT_FUNC("Error getting S3 URL")                        
-                    time.sleep(1)
-                else:
-                    _CUSTOM_PRINT_FUNC("Error capturing image")
-            toggle_flash_light(0)  # Turn off flash light after capturing images
+        # Scheduled capture is handled by camera_capture_task (every 2 minutes).
 
 
         
+
+# ==================== CAPTURE CYCLE ====================
+
+# Lock prevents concurrent captures (scheduler + manual trigger colliding)
+_capture_running_lock = threading.Lock()
+
+
+def run_full_capture_cycle(triggered_by: str = 'scheduler', run_health_check: bool = True) -> dict:
+    """
+    One full capture cycle:
+      1. Flash light on briefly for better photos.
+      2. Capture one frame from each of the 3 cameras (independently – one failure
+         doesn't block the others).
+      3. Upload each successful image to S3 using a stable key (no expiry).
+      4. Run Plant.id health assessment on the captured images.
+      5. Persist the session document (session_id, timestamp, images, health)
+         to MongoDB's capture_sessions collection.
+      6. Update the in-memory last_health_result so /api/plant_health keeps working.
+
+    Returns the session document (with S3 keys, not presigned URLs).
+    Raises if a capture is already in progress; per-camera failures are logged.
+    """
+    global last_health_result
+
+    if not _capture_running_lock.acquire(blocking=False):
+        raise Exception("A capture cycle is already in progress. Please wait.")
+
+    session_id = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    timestamp = datetime.datetime.now()
+    _CUSTOM_PRINT_FUNC(
+        f"[Capture] Starting session {session_id} (triggered_by={triggered_by})"
+    )
+
+    try:
+        # Step 1 - flash lights for better image quality
+        toggle_flash_light(1)
+        time.sleep(0.5)
+
+        # Step 2 - capture from all cameras
+        try:
+            cam_results = camera.capture_frames_base64()
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"[Capture] Camera capture call failed entirely: {e}")
+            cam_results = []
+
+        # Step 3 - upload each successful capture to S3
+        images = []
+        images_b64_for_health = []
+
+        for cam in cam_results:
+            entry = {
+                "camera_id": cam["camera_id"],
+                "camera_name": cam["name"],
+                "s3_key": None,
+                "success": False,
+                "error": cam.get("error"),
+            }
+            if not cam.get("success"):
+                _CUSTOM_PRINT_FUNC(
+                    f"[Capture] Camera {cam['camera_id']} skipped: {cam.get('error')}"
+                )
+                images.append(entry)
+                continue
+
+            key = f"captures/{session_id}/camera_{cam['camera_id']}.jpg"
+            try:
+                import base64 as _b64
+                img_bytes = _b64.b64decode(cam["b64"])
+                url = s3_handler.upload_bytes(img_bytes, key)
+                if url:
+                    entry["s3_key"] = key
+                    entry["success"] = True
+                    entry["error"] = None
+                    images_b64_for_health.append(cam["b64"])
+                    _CUSTOM_PRINT_FUNC(
+                        f"[Capture] Camera {cam['camera_id']} uploaded -> s3://{key}"
+                    )
+                else:
+                    entry["error"] = "S3 upload returned no URL"
+                    _CUSTOM_PRINT_FUNC(
+                        f"[Capture] Camera {cam['camera_id']} S3 upload failed"
+                    )
+            except Exception as e:
+                entry["error"] = f"S3 upload error: {e}"
+                _CUSTOM_PRINT_FUNC(
+                    f"[Capture] Camera {cam['camera_id']} S3 error: {e}"
+                )
+            images.append(entry)
+
+        # Step 4 - plant health check (only when images available AND caller allows it)
+        health_result = None
+        if not run_health_check:
+            _CUSTOM_PRINT_FUNC(
+                f"[Capture] Health check skipped this cycle "
+                f"(next check in ~{HEALTH_CHECK_INTERVAL_SECONDS // 60} min)"
+            )
+        elif images_b64_for_health:
+            try:
+                _CUSTOM_PRINT_FUNC(
+                    f"[Capture] Running health check on {len(images_b64_for_health)} image(s)..."
+                )
+                health_result = plant_health_checker.check_health(images_b64_for_health)
+                last_health_result = health_result
+                status = "HEALTHY" if health_result.get("is_healthy") else "ISSUES DETECTED"
+                _CUSTOM_PRINT_FUNC(
+                    f"[Capture] Health: {status} ({health_result.get('health_probability')}%)"
+                )
+            except Exception as e:
+                _CUSTOM_PRINT_FUNC(f"[Capture] Health check error: {e}")
+                health_result = {"success": False, "error": str(e)}
+        else:
+            _CUSTOM_PRINT_FUNC("[Capture] No images available - health check skipped")
+
+        # Step 5 - persist session to MongoDB
+        camera_count = sum(1 for img in images if img["success"])
+        session_doc = {
+            "session_id": session_id,
+            "timestamp": timestamp,
+            "triggered_by": triggered_by,
+            "images": images,
+            "health": health_result,
+            "camera_count": camera_count,
+        }
+        mongo_db_handler.insert_capture_session(session_doc)
+        _CUSTOM_PRINT_FUNC(
+            f"[Capture] Session {session_id} saved "
+            f"({camera_count}/3 cameras, health={'ok' if health_result else 'skipped'})"
+        )
+
+        return session_doc
+
+    finally:
+        toggle_flash_light(0)
+        _capture_running_lock.release()
+
+
+def camera_capture_task():
+    """
+    Background thread: captures images every CAPTURE_INTERVAL_SECONDS but only
+    calls the Plant.id health API every HEALTH_CHECK_INTERVAL_SECONDS to preserve credits.
+    """
+    last_health_check_time = datetime.datetime.min  # force check on first run
+    while True:
+        try:
+            now = datetime.datetime.now()
+            seconds_since_health = (now - last_health_check_time).total_seconds()
+            run_health = seconds_since_health >= HEALTH_CHECK_INTERVAL_SECONDS
+            run_full_capture_cycle(triggered_by="scheduler", run_health_check=run_health)
+            if run_health:
+                last_health_check_time = datetime.datetime.now()
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"[CaptureTask] Cycle error: {e}")
+        time.sleep(CAPTURE_INTERVAL_SECONDS)
+
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for React frontend
@@ -899,6 +1060,7 @@ def control_heater():
         if not set_all_heater_dc(duty_cycle):
             return jsonify({'success': False, 'error': 'Failed to set heater'}), 500
 
+        env_actuators.set_mqtt_dc_value_heater(duty_cycle)
         return jsonify({'success': True, 'duty_cycle': duty_cycle})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -921,6 +1083,8 @@ def control_light():
         if not set_all_light_strip_dc(duty_cycle):
             return jsonify({'success': False, 'error': 'Failed to set light'}), 500
 
+        # Keep MQTT tracking value in sync so set_actuators_manual_values doesn't override this
+        env_actuators.set_mqtt_dc_value_light_strip(duty_cycle)
         return jsonify({'success': True, 'duty_cycle': duty_cycle})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -943,6 +1107,7 @@ def control_fan():
         if not env_actuators.set_fan_duty_cycle(duty_cycle):
             return jsonify({'success': False, 'error': 'Failed to set fan'}), 500
 
+        env_actuators.set_mqtt_dc_value_fan(duty_cycle)
         return jsonify({'success': True, 'duty_cycle': duty_cycle})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -965,6 +1130,7 @@ def control_water_pump():
         if not env_actuators.set_water_pump_duty_cycle(duty_cycle):
             return jsonify({'success': False, 'error': 'Failed to set water pump'}), 500
 
+        env_actuators.set_mqtt_dc_value_water_pump(duty_cycle)
         return jsonify({'success': True, 'duty_cycle': duty_cycle})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -1018,56 +1184,155 @@ def setpoints_api():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+# ==================== PLANT HEALTH ====================
+
+@app.route('/api/plant_health', methods=['GET'])
+def get_plant_health():
+    """Return the most recent scheduled health check result."""
+    if last_health_result is None:
+        return jsonify({'success': False, 'error': 'No health check has run yet. Please wait up to 1 minute.'}), 404
+    return jsonify(last_health_result), 200
+
+@app.route('/api/plant_health', methods=['POST'])
+def check_plant_health():
+    """Trigger an immediate capture + health check and return the result."""
+    try:
+        session_doc = run_full_capture_cycle(triggered_by='health_check')
+        health = session_doc.get('health')
+        if health:
+            return jsonify(health), 200
+        return jsonify({'success': False, 'error': 'No images captured for health check'}), 500
+    except Exception as e:
+        if 'already in progress' in str(e):
+            return jsonify({'success': False, 'error': str(e)}), 409
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ==================== CAPTURE SESSIONS API ====================
+
+@app.route('/api/capture_sessions', methods=['GET'])
+def get_capture_sessions():
+    """
+    Return the last N capture sessions from MongoDB.
+    Fresh presigned S3 URLs (1-hour expiry) are generated for each image so the
+    frontend can display them regardless of when the session was saved.
+    Query param: ?limit=20 (default)
+    """
+    try:
+        limit = min(int(request.args.get('limit', 20)), 50)
+        sessions = mongo_db_handler.get_capture_sessions(limit)
+        for session in sessions:
+            for img in session.get('images', []):
+                if img.get('s3_key'):
+                    img['url'] = s3_handler.generate_presigned_url(
+                        img['s3_key'], expiry_seconds=3600
+                    )
+                else:
+                    img['url'] = None
+            # Serialise datetime to ISO string
+            if hasattr(session.get('timestamp'), 'isoformat'):
+                session['timestamp'] = session['timestamp'].isoformat()
+        return jsonify({'success': True, 'sessions': sessions}), 200
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/capture_sessions', methods=['POST'])
+def trigger_capture_now():
+    """
+    Trigger an immediate capture cycle from the frontend.
+    Returns the newly created session document with fresh presigned URLs.
+    Returns 409 if a capture is already running.
+    """
+    try:
+        session_doc = run_full_capture_cycle(triggered_by='manual')
+        # Generate fresh URLs for the response
+        for img in session_doc.get('images', []):
+            if img.get('s3_key'):
+                img['url'] = s3_handler.generate_presigned_url(
+                    img['s3_key'], expiry_seconds=3600
+                )
+            else:
+                img['url'] = None
+        if hasattr(session_doc.get('timestamp'), 'isoformat'):
+            session_doc['timestamp'] = session_doc['timestamp'].isoformat()
+        return jsonify({'success': True, 'session': session_doc}), 200
+    except Exception as e:
+        if 'already in progress' in str(e):
+            return jsonify({'success': False, 'error': str(e)}), 409
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# Legacy endpoint kept for backward compatibility
+@app.route('/api/capture_images', methods=['GET'])
+def get_capture_images():
+    """Legacy: redirect to capture_sessions."""
+    try:
+        sessions = mongo_db_handler.get_capture_sessions(2)
+        captures = []
+        for session in sessions:
+            urls = []
+            for img in session.get('images', []):
+                if img.get('s3_key'):
+                    urls.append(s3_handler.generate_presigned_url(img['s3_key'], expiry_seconds=3600))
+            ts = session.get('timestamp')
+            captures.append({
+                'timestamp': ts.isoformat() if hasattr(ts, 'isoformat') else str(ts),
+                'urls': urls,
+                'camera_count': session.get('camera_count', 0),
+                'health': session.get('health'),
+            })
+        return jsonify({'success': True, 'captures': captures}), 200
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/capture_images', methods=['POST'])
+def capture_images_now():
+    """Legacy: triggers a full capture cycle."""
+    try:
+        session_doc = run_full_capture_cycle(triggered_by='manual')
+        urls = []
+        for img in session_doc.get('images', []):
+            if img.get('s3_key'):
+                urls.append(s3_handler.generate_presigned_url(img['s3_key'], expiry_seconds=3600))
+        ts = session_doc.get('timestamp')
+        entry = {
+            'timestamp': ts.isoformat() if hasattr(ts, 'isoformat') else str(ts),
+            'urls': urls,
+            'camera_count': session_doc.get('camera_count', 0),
+            'health': session_doc.get('health'),
+        }
+        return jsonify({'success': True, 'captures': [entry]}), 200
+    except Exception as e:
+        if 'already in progress' in str(e):
+            return jsonify({'success': False, 'error': str(e)}), 409
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 # ==================== WEB ROUTES ====================
 
 @app.route('/')
 def index():
     return render_template('index.html')
 
+# Live streaming disabled – cameras are now capture-only (every 2 minutes).
+# These stubs return 410 Gone so any remaining frontend img-src requests fail fast.
+
 @app.route('/video_c1')
-def video_c1():
-    return Response(camera.generate_video_stream_camera_USB(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
 @app.route('/video_c2')
-def video_c2():
-    return Response(camera.generate_video_stream_camera_RPi(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
+@app.route('/video_c3')
 @app.route('/start_stream_c1')
-def start_stream_c1():
-    return Response(camera.generate_video_stream_camera_USB(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-    
 @app.route('/start_stream_c2')
-def start_stream_c2():
-    return Response(camera.generate_video_stream_camera_RPi(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+@app.route('/start_stream_c3')
+def stream_disabled():
+    return jsonify({'error': 'Live streaming disabled. Use /api/capture_sessions.'}), 410
 
 @app.route('/stop_stream_c1')
-def stop_stream_c1():
-    camera.stop_camera_USB()
-    return "Camera stopped."
-
 @app.route('/stop_stream_c2')
-def stop_stream_c2():
-    camera.stop_camera_RPi()
-    return "Camera stopped."
-
-@app.route('/video_c3')
-def video_c3():
-    return Response(camera.generate_video_stream_camera_USB2(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
-@app.route('/start_stream_c3')
-def start_stream_c3():
-    return Response(camera.generate_video_stream_camera_USB2(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
 @app.route('/stop_stream_c3')
-def stop_stream_c3():
-    camera.stop_camera_USB2()
-    return "Camera stopped."
+def stop_stream_disabled():
+    return 'Streaming is disabled.', 410
+
+# (old streaming route definitions removed)
 
 # @app.route('/capture_c1')
 # def capture_c1():    
@@ -1173,12 +1438,15 @@ if __name__ == "__main__":
     light_thread = threading.Thread(target=light_sp_adjustment_task)
     soil_thread = threading.Thread(target=set_soil_moisture_setpoint_task)
     app_thread = threading.Thread(target=app_task)
+    capture_thread = threading.Thread(target=camera_capture_task, daemon=True)
 
     # start the threads
     temperature_thread.start()
     light_thread.start()
     # soil_thread.start()  # Water pump disabled for now
     app_thread.start()
+    capture_thread.start()
+    _CUSTOM_PRINT_FUNC(f"[Capture] Scheduled camera capture every {CAPTURE_INTERVAL_SECONDS}s")
     _CUSTOM_PRINT_FUNC("Starting serial logger thread...")    
     set_serial_log_enabled(True)  # Enable serial logging
     serial_logger_thread.start()
