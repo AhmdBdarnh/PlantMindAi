@@ -1,141 +1,157 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import './App.css';
+import Dashboard from './pages/Dashboard';
+import PlantEnvironment from './pages/PlantEnvironment';
+import ActuatorControl from './pages/ActuatorControl';
+import ResourceConsumption from './pages/ResourceConsumption';
+import PlantGrowth from './pages/PlantGrowth';
+import LiveCams from './pages/LiveCams';
 
 const API_BASE_URL = 'http://localhost:5000/api';
+const MAX_HISTORY = 60;
+
+const NAV_ITEMS = [
+  { id: 'dashboard',    label: 'Dashboard',            icon: 'M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6' },
+  { id: 'environment',  label: 'Plant Environment',    icon: 'M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z' },
+  { id: 'actuators',    label: 'Actuator Control',     icon: 'M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4' },
+  { id: 'resources',    label: 'Resource Consumption', icon: 'M13 10V3L4 14h7v7l9-11h-7z' },
+  { id: 'growth',       label: 'Plant Growth',         icon: 'M3 9a2 2 0 014 0v9a2 2 0 01-4 0V9zM9 3a2 2 0 014 0v15a2 2 0 01-4 0V3zM15 6a2 2 0 014 0v12a2 2 0 01-4 0V6z' },
+  { id: 'livecams',     label: 'Live Cams',            icon: 'M15 10l4.553-2.069A1 1 0 0121 8.82v6.36a1 1 0 01-1.447.894L15 14M3 8a2 2 0 012-2h10a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z' },
+];
 
 function App() {
-  const [sensors, setSensors] = useState(null);
-  const [actuators, setActuators] = useState(null);
+  const [activePage, setActivePage]     = useState('dashboard');
+  const [sidebarOpen, setSidebarOpen]   = useState(true);
+
+  // Core data
+  const [sensors, setSensors]           = useState(null);
+  const [actuators, setActuators]       = useState(null);
   const [operationMode, setOperationMode] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
-  const [autoRefresh, setAutoRefresh] = useState(true);
-  const [lastUpdate, setLastUpdate] = useState(null);
+  const [setpoints, setSetpoints]       = useState(null);
+
+  // Status
+  const [loading, setLoading]           = useState(false);
+  const [error, setError]               = useState(null);
+  const [lastUpdate, setLastUpdate]     = useState(null);
+  const [autoRefresh, setAutoRefresh]   = useState(true);
+
+  // Sensor history for charts (ring buffer)
+  const [sensorHistory, setSensorHistory] = useState([]);
 
   // Plant health
-  const [healthResult, setHealthResult] = useState(null);
-  const [healthLoading, setHealthLoading] = useState(false);
+  const [healthResult, setHealthResult]       = useState(null);
+  const [healthLoading, setHealthLoading]     = useState(false);
   const [healthLastChecked, setHealthLastChecked] = useState(null);
 
-  // Capture sessions gallery
-  const [showCaptureSessions, setShowCaptureSessions] = useState(false);
-  const [captureSessions, setCaptureSessions] = useState([]);
+  // Capture sessions
+  const [captureSessions, setCaptureSessions]             = useState([]);
   const [captureSessionsLoading, setCaptureSessionsLoading] = useState(false);
-  const [captureManualLoading, setCaptureManualLoading] = useState(false);
-  const [captureManualError, setCaptureManualError] = useState(null);
+  const [captureManualLoading, setCaptureManualLoading]   = useState(false);
+  const [captureManualError, setCaptureManualError]       = useState(null);
 
   // ==================== DATA FETCHING ====================
 
+  const safeJson = async (res) => {
+    const text = await res.text();
+    try { return JSON.parse(text); } catch { return null; }
+  };
+
   const fetchSensors = async () => {
     try {
-      const response = await fetch(`${API_BASE_URL}/sensors`);
-      const data = await response.json();
+      const res  = await fetch(`${API_BASE_URL}/sensors`);
+      const data = await safeJson(res);
+      if (!data) { setError('Backend is offline — start the Flask server on port 5000'); return; }
       if (data.success) {
         setSensors(data.data);
         setLastUpdate(new Date().toLocaleTimeString());
+        setSensorHistory(prev => {
+          const entry = { ...data.data, time: new Date().toLocaleTimeString() };
+          return [...prev, entry].slice(-MAX_HISTORY);
+        });
       }
-    } catch (err) {
-      setError('Failed to connect to backend: ' + err.message);
+    } catch {
+      setError('Backend is offline — start the Flask server on port 5000');
     }
   };
 
   const fetchActuators = async () => {
     try {
-      const response = await fetch(`${API_BASE_URL}/actuators`);
-      const data = await response.json();
-      if (data.success) {
-        setActuators(data.data);
-      }
-    } catch (err) {
-      // silent – sensor error message is enough
-    }
+      const res  = await fetch(`${API_BASE_URL}/actuators`);
+      const data = await safeJson(res);
+      if (data?.success) setActuators(data.data);
+    } catch {}
   };
 
   const fetchOperationMode = async () => {
     try {
-      const response = await fetch(`${API_BASE_URL}/operation_mode`);
-      const data = await response.json();
-      if (data.success) setOperationMode(data.mode);
-    } catch (err) {
-      // silent
-    }
+      const res  = await fetch(`${API_BASE_URL}/operation_mode`);
+      const data = await safeJson(res);
+      if (data?.success) setOperationMode(data.mode);
+    } catch {}
+  };
+
+  const fetchSetpoints = async () => {
+    try {
+      const res  = await fetch(`${API_BASE_URL}/setpoints`);
+      const data = await safeJson(res);
+      if (data?.success) setSetpoints(data.setpoints);
+    } catch {}
   };
 
   const fetchAllData = useCallback(async () => {
     setLoading(true);
     setError(null);
-    await Promise.all([fetchSensors(), fetchActuators(), fetchOperationMode()]);
+    await Promise.all([fetchSensors(), fetchActuators(), fetchOperationMode(), fetchSetpoints()]);
     setLoading(false);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ==================== OPERATION MODE ====================
 
   const toggleOperationMode = async () => {
-    setLoading(true);
-    setError(null);
     try {
       const newMode = operationMode === 'manual' ? 'autonomous' : 'manual';
-      const response = await fetch(`${API_BASE_URL}/operation_mode`, {
+      const res  = await fetch(`${API_BASE_URL}/operation_mode`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: newMode }),
       });
-      const data = await response.json();
-      if (data.success) {
-        setOperationMode(data.mode);
-      } else {
-        setError(data.error || 'Failed to change operation mode');
-      }
+      const data = await res.json();
+      if (data.success) setOperationMode(data.mode);
+      else setError(data.error || 'Failed to change mode');
     } catch (err) {
-      setError('Failed to connect to backend: ' + err.message);
-    } finally {
-      setLoading(false);
+      setError('Connection failed: ' + err.message);
     }
   };
 
   // ==================== ACTUATOR CONTROL ====================
 
-  const controlActuator = async (actuatorName, state) => {
-    setLoading(true);
-    setError(null);
+  const controlActuator = async (name, state) => {
     try {
-      const response = await fetch(`${API_BASE_URL}/actuators/${actuatorName}`, {
+      const res  = await fetch(`${API_BASE_URL}/actuators/${name}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ state }),
       });
-      const data = await response.json();
-      if (data.success) {
-        await fetchActuators();
-      } else {
-        setError(data.error || `Failed to control ${actuatorName}`);
-      }
+      const data = await res.json();
+      if (data.success) await fetchActuators();
+      else setError(data.error || `Failed to control ${name}`);
     } catch (err) {
-      setError('Failed to connect to backend: ' + err.message);
-    } finally {
-      setLoading(false);
+      setError('Connection failed: ' + err.message);
     }
   };
 
-  const controlActuatorPower = async (actuatorName, dutyCycle) => {
-    setLoading(true);
-    setError(null);
+  const controlActuatorPower = async (name, dutyCycle) => {
     try {
-      const response = await fetch(`${API_BASE_URL}/actuators/${actuatorName}`, {
+      const res  = await fetch(`${API_BASE_URL}/actuators/${name}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ duty_cycle: dutyCycle }),
       });
-      const data = await response.json();
-      if (data.success) {
-        await fetchActuators();
-      } else {
-        setError(data.error || `Failed to control ${actuatorName}`);
-      }
+      const data = await res.json();
+      if (data.success) await fetchActuators();
+      else setError(data.error || `Failed to control ${name}`);
     } catch (err) {
-      setError('Failed to connect to backend: ' + err.message);
-    } finally {
-      setLoading(false);
+      setError('Connection failed: ' + err.message);
     }
   };
 
@@ -143,25 +159,21 @@ function App() {
 
   const fetchLatestHealthResult = async () => {
     try {
-      const response = await fetch(`${API_BASE_URL}/plant_health`);
-      if (response.status === 404) return;
-      const data = await response.json();
+      const res = await fetch(`${API_BASE_URL}/plant_health`);
+      if (res.status === 404) return;
+      const data = await res.json();
       setHealthResult(data);
       setHealthLastChecked(new Date().toLocaleTimeString());
-    } catch (err) {
-      // silent
-    }
+    } catch {}
   };
 
   const checkPlantHealth = async () => {
     setHealthLoading(true);
     try {
-      const response = await fetch(`${API_BASE_URL}/plant_health`, { method: 'POST' });
-      const data = await response.json();
+      const res  = await fetch(`${API_BASE_URL}/plant_health`, { method: 'POST' });
+      const data = await res.json();
       setHealthResult(data);
       setHealthLastChecked(new Date().toLocaleTimeString());
-      // Also refresh capture sessions if the panel is open
-      if (showCaptureSessions) fetchCaptureSessions();
     } catch (err) {
       setHealthResult({ success: false, error: 'Connection error: ' + err.message });
     } finally {
@@ -174,705 +186,226 @@ function App() {
   const fetchCaptureSessions = async () => {
     setCaptureSessionsLoading(true);
     try {
-      const response = await fetch(`${API_BASE_URL}/capture_sessions?limit=20`);
-      const data = await response.json();
+      const res  = await fetch(`${API_BASE_URL}/capture_sessions?limit=20`);
+      const data = await res.json();
       if (data.success) setCaptureSessions(data.sessions);
-    } catch (err) {
-      // silent
-    } finally {
-      setCaptureSessionsLoading(false);
-    }
+    } catch {}
+    finally { setCaptureSessionsLoading(false); }
   };
 
   const triggerCaptureNow = async () => {
     setCaptureManualLoading(true);
     setCaptureManualError(null);
     try {
-      const response = await fetch(`${API_BASE_URL}/capture_sessions`, { method: 'POST' });
-      const data = await response.json();
-      if (data.success) {
-        // Prepend the new session, keep list sorted newest-first
-        setCaptureSessions(prev => [data.session, ...prev].slice(0, 20));
-        // Also refresh health result since a health check ran
-        fetchLatestHealthResult();
-      } else {
+      const res  = await fetch(`${API_BASE_URL}/capture_sessions`, { method: 'POST' });
+      const data = await res.json();
+      if (!data.success) {
         setCaptureManualError(data.error || 'Capture failed');
+        setCaptureManualLoading(false);
+        return;
       }
+      // 202 pending — session is being built in the background; poll until it appears
+      const poll = async (attemptsLeft) => {
+        await fetchCaptureSessions();
+        fetchLatestHealthResult();
+        setCaptureManualLoading(false);
+        if (attemptsLeft > 1) {
+          // Schedule one more refresh after 5 s to pick up health result
+          setTimeout(() => {
+            fetchCaptureSessions();
+            fetchLatestHealthResult();
+          }, 5000);
+        }
+      };
+      setTimeout(() => poll(2), 10000);
     } catch (err) {
       setCaptureManualError('Connection error: ' + err.message);
-    } finally {
       setCaptureManualLoading(false);
     }
   };
 
   // ==================== EFFECTS ====================
 
-  // Initial load + auto-refresh every 3 seconds
   useEffect(() => {
     fetchAllData();
     if (autoRefresh) {
-      const interval = setInterval(fetchAllData, 3000);
-      return () => clearInterval(interval);
+      const id = setInterval(fetchAllData, 3000);
+      return () => clearInterval(id);
     }
   }, [autoRefresh]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Fetch latest health result on mount and every 60 seconds
   useEffect(() => {
     fetchLatestHealthResult();
-    const interval = setInterval(fetchLatestHealthResult, 60000);
-    return () => clearInterval(interval);
+    const id = setInterval(fetchLatestHealthResult, 60000);
+    return () => clearInterval(id);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Load capture sessions whenever the gallery opens
   useEffect(() => {
-    if (showCaptureSessions) fetchCaptureSessions();
-  }, [showCaptureSessions]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Auto-refresh sessions every 2 minutes while the gallery is open
-  useEffect(() => {
-    if (!showCaptureSessions) return;
-    const interval = setInterval(fetchCaptureSessions, 120000);
-    return () => clearInterval(interval);
-  }, [showCaptureSessions]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ==================== HELPERS ====================
-
-  const formatTimestamp = (ts) => {
-    if (!ts) return 'Unknown';
-    try {
-      const d = new Date(ts);
-      return d.toLocaleString();
-    } catch {
-      return ts;
-    }
-  };
-
-  const healthBadge = (session) => {
-    const h = session.health;
-    if (!h) return { label: 'No check', cls: 'badge-neutral' };
-    if (!h.success) return { label: 'Check failed', cls: 'badge-error' };
-    if (h.is_healthy) return { label: `Healthy ${h.health_probability}%`, cls: 'badge-healthy' };
-    return { label: `Issues ${h.health_probability}%`, cls: 'badge-unhealthy' };
-  };
+    fetchCaptureSessions();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ==================== RENDER ====================
 
   return (
-    <div className="App">
-      <header className="App-header">
-        <h1>🌱 Smart Greenhouse Control Panel</h1>
-      </header>
+    <div className="app-layout">
 
-      <div className="container">
-        {/* Status Bar */}
-        <div className="status-bar">
-          <div className="status-info">
-            {lastUpdate && (
-              <span className="last-update">🕒 Last Update: {lastUpdate}</span>
+      {/* ── Sidebar ── */}
+      <aside className={`sidebar ${sidebarOpen ? '' : 'sidebar-collapsed'}`}>
+        <div className="sidebar-brand">
+          <svg className="brand-leaf" viewBox="0 0 24 24" fill="none">
+            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14.5v-4.74l-4 2.31-1-1.73 4-2.31-4-2.31 1-1.73 4 2.31V4.5h2v4.8l4-2.31 1 1.73-4 2.31 4 2.31-1 1.73-4-2.31v4.74h-2z" fill="currentColor"/>
+          </svg>
+          {sidebarOpen && <span className="brand-name">PlantMind AI</span>}
+        </div>
+
+        <nav className="sidebar-nav">
+          {NAV_ITEMS.map(item => (
+            <button
+              key={item.id}
+              className={`nav-item ${activePage === item.id ? 'nav-active' : ''}`}
+              onClick={() => setActivePage(item.id)}
+              title={!sidebarOpen ? item.label : ''}
+            >
+              <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d={item.icon} />
+              </svg>
+              {sidebarOpen && <span className="nav-label">{item.label}</span>}
+            </button>
+          ))}
+        </nav>
+
+        <div className="sidebar-footer">
+          {sidebarOpen && operationMode && (
+            <div className={`mode-pill mode-pill-${operationMode}`}>
+              <span className="mode-dot" />
+              {operationMode === 'autonomous' ? 'Autonomous' : 'Manual'}
+            </div>
+          )}
+          {sidebarOpen && (
+            <div className="sidebar-plant-label">Lettuce</div>
+          )}
+        </div>
+      </aside>
+
+      {/* ── Main area ── */}
+      <div className="main-area">
+
+        {/* Top header */}
+        <header className="top-header">
+          <button className="sidebar-toggle-btn" onClick={() => setSidebarOpen(v => !v)} aria-label="Toggle sidebar">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M4 6h16M4 12h16M4 18h16" strokeLinecap="round"/>
+            </svg>
+          </button>
+
+          <span className="header-page-title">
+            {NAV_ITEMS.find(n => n.id === activePage)?.label}
+          </span>
+
+          <div className="header-right">
+            {loading && (
+              <span className="header-spinner" title="Loading…">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="spin-svg">
+                  <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" strokeLinecap="round"/>
+                </svg>
+              </span>
             )}
-            {loading && <span className="loading-indicator">⟳ Loading...</span>}
-          </div>
-          <div className="refresh-controls">
-            <label className="refresh-toggle">
+            {lastUpdate && (
+              <span className="header-update">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="icon-xs">
+                  <circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2" strokeLinecap="round"/>
+                </svg>
+                {lastUpdate}
+              </span>
+            )}
+            <label className="auto-refresh-label">
               <input
                 type="checkbox"
                 checked={autoRefresh}
-                onChange={(e) => setAutoRefresh(e.target.checked)}
+                onChange={e => setAutoRefresh(e.target.checked)}
               />
-              <span>Auto-Refresh (3s)</span>
+              <span>Auto-refresh</span>
             </label>
-            <button
-              onClick={fetchAllData}
-              disabled={loading}
-              className="btn btn-secondary btn-refresh"
-            >
-              🔄 Refresh Now
+            <button className="btn-icon-header" onClick={fetchAllData} disabled={loading} title="Refresh now">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                <path d="M1 4v6h6M23 20v-6h-6" strokeLinecap="round" strokeLinejoin="round"/>
+                <path d="M20.49 9A9 9 0 005.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 013.51 15" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
             </button>
           </div>
-        </div>
+        </header>
 
-        {/* Error Display */}
+        {/* Error banner */}
         {error && (
-          <div className="error-box">
-            <strong>Error:</strong> {error}
+          <div className="error-banner">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="icon-sm">
+              <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+            </svg>
+            {error}
+            <button onClick={() => setError(null)} className="error-close">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round"/>
+              </svg>
+            </button>
           </div>
         )}
 
-        {/* Operation Mode */}
-        <section className="section mode-section">
-          <div className="mode-container">
-            <div className="mode-info">
-              <h2>🎚️ Operation Mode</h2>
-              {operationMode ? (
-                <div className="mode-display">
-                  <p className="mode-text">
-                    Current Mode:{' '}
-                    <span className={`mode-badge ${operationMode}`}>
-                      {operationMode.toUpperCase()}
-                    </span>
-                  </p>
-                  {operationMode === 'manual' ? (
-                    <p className="mode-description">
-                      Manual mode: You have full control over all actuators
-                    </p>
-                  ) : (
-                    <p className="mode-description">
-                      Autonomous mode: PID controllers automatically manage climate
-                    </p>
-                  )}
-                </div>
-              ) : (
-                <p className="mode-text">Click button to fetch current mode</p>
-              )}
-            </div>
-            <div className="mode-controls">
-              <button
-                onClick={fetchOperationMode}
-                disabled={loading}
-                className="btn btn-primary"
-              >
-                {loading ? 'Loading...' : '🔄 Check Mode'}
-              </button>
-              <button
-                onClick={toggleOperationMode}
-                disabled={loading || !operationMode}
-                className={`btn btn-toggle ${operationMode === 'autonomous' ? 'btn-manual' : 'btn-autonomous'}`}
-              >
-                {loading
-                  ? 'Switching...'
-                  : operationMode === 'manual'
-                  ? '🤖 Switch to Autonomous'
-                  : '👤 Switch to Manual'}
-              </button>
-            </div>
-          </div>
-        </section>
-
-        {/* Plant Captures Section */}
-        <section className="section camera-section">
-          <div className="camera-section-header">
-            <h2>📸 Plant Captures</h2>
-            <div className="camera-section-actions">
-              <button
-                className="btn btn-captures"
-                onClick={() => setShowCaptureSessions(true)}
-              >
-                🖼️ View Captures
-              </button>
-              <button
-                className="btn btn-health-check"
-                onClick={checkPlantHealth}
-                disabled={healthLoading}
-              >
-                {healthLoading ? 'Analyzing...' : '🔬 Check Plant Health Now'}
-              </button>
-            </div>
-          </div>
-
-          {/* Auto-capture status banner */}
-          <div className="capture-auto-banner">
-            <span className="capture-auto-icon">⏱️</span>
-            <div className="capture-auto-text">
-              <strong>Automatic capture active</strong>
-              <span>Cameras capture every 2 minutes → uploaded to S3 → plant health checked automatically.</span>
-            </div>
-          </div>
-
-          {/* Plant Health Result */}
-          {healthLastChecked && (
-            <p className="health-auto-info">
-              Auto-check every 60s · Last updated: {healthLastChecked}
-            </p>
+        {/* Page content */}
+        <main className="page-content">
+          {activePage === 'dashboard' && (
+            <Dashboard
+              sensors={sensors}
+              setpoints={setpoints}
+              lastUpdate={lastUpdate}
+              captureSessions={captureSessions}
+            />
           )}
-          {healthResult && (
-            <div
-              className={`health-result-panel ${
-                healthResult.success
-                  ? healthResult.is_healthy
-                    ? 'healthy'
-                    : 'unhealthy'
-                  : 'error'
-              }`}
-            >
-              {!healthResult.success ? (
-                <p className="health-error">Error: {healthResult.error}</p>
-              ) : (
-                <>
-                  <div className="health-summary">
-                    <span className="health-icon">
-                      {healthResult.is_healthy ? '✅' : '⚠️'}
-                    </span>
-                    <div>
-                      <h3 className="health-title">
-                        {healthResult.is_healthy
-                          ? 'Plant is Healthy'
-                          : 'Plant Health Issue Detected'}
-                      </h3>
-                      <p className="health-confidence">
-                        Health confidence: <strong>{healthResult.health_probability}%</strong>
-                        {' · '}{healthResult.images_sent} image
-                        {healthResult.images_sent !== 1 ? 's' : ''} analyzed
-                      </p>
-                    </div>
-                  </div>
-
-                  {!healthResult.is_healthy &&
-                    healthResult.diseases &&
-                    healthResult.diseases.length > 0 && (
-                      <div className="disease-list">
-                        <h4>Detected Issues</h4>
-                        {healthResult.diseases.map((disease, idx) => (
-                          <div key={idx} className="disease-card">
-                            <div className="disease-header">
-                              <span className="disease-name">{disease.name}</span>
-                              <span className="disease-probability">
-                                {disease.probability}%
-                              </span>
-                            </div>
-                            {disease.description && (
-                              <p className="disease-description">{disease.description}</p>
-                            )}
-                            {disease.treatment && (
-                              <div className="disease-treatment">
-                                {disease.treatment.prevention &&
-                                  disease.treatment.prevention.length > 0 && (
-                                    <div>
-                                      <strong>Prevention:</strong>
-                                      <ul>
-                                        {disease.treatment.prevention.map((p, i) => (
-                                          <li key={i}>{p}</li>
-                                        ))}
-                                      </ul>
-                                    </div>
-                                  )}
-                                {disease.treatment.biological &&
-                                  disease.treatment.biological.length > 0 && (
-                                    <div>
-                                      <strong>Biological treatment:</strong>
-                                      <ul>
-                                        {disease.treatment.biological.map((b, i) => (
-                                          <li key={i}>{b}</li>
-                                        ))}
-                                      </ul>
-                                    </div>
-                                  )}
-                                {disease.treatment.chemical &&
-                                  disease.treatment.chemical.length > 0 && (
-                                    <div>
-                                      <strong>Chemical treatment:</strong>
-                                      <ul>
-                                        {disease.treatment.chemical.map((c, i) => (
-                                          <li key={i}>{c}</li>
-                                        ))}
-                                      </ul>
-                                    </div>
-                                  )}
-                              </div>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                </>
-              )}
-            </div>
+          {activePage === 'environment' && (
+            <PlantEnvironment
+              sensors={sensors}
+              sensorHistory={sensorHistory}
+              lastUpdate={lastUpdate}
+            />
           )}
-        </section>
-
-        {/* ===================== CAPTURE SESSIONS OVERLAY ===================== */}
-        {showCaptureSessions && (
-          <div className="sessions-overlay">
-            <div className="sessions-page">
-              {/* Header */}
-              <div className="sessions-header">
-                <div>
-                  <h2>🖼️ Plant Capture Sessions</h2>
-                  <p className="sessions-subtitle">
-                    Automatic captures every 2 minutes · Stored in S3 + MongoDB
-                  </p>
-                </div>
-                <button
-                  className="sessions-close"
-                  onClick={() => setShowCaptureSessions(false)}
-                >
-                  ✕ Close
-                </button>
-              </div>
-
-              {/* Manual trigger */}
-              <div className="sessions-controls">
-                <button
-                  className="btn btn-capture-now"
-                  onClick={triggerCaptureNow}
-                  disabled={captureManualLoading}
-                >
-                  {captureManualLoading
-                    ? '⏳ Capturing & uploading...'
-                    : '📸 Capture Now'}
-                </button>
-                <button
-                  className="btn btn-secondary"
-                  onClick={fetchCaptureSessions}
-                  disabled={captureSessionsLoading}
-                >
-                  🔄 Refresh
-                </button>
-                {captureManualError && (
-                  <div className="sessions-error">❌ {captureManualError}</div>
-                )}
-              </div>
-
-              {captureManualLoading && (
-                <div className="sessions-loading-bar">
-                  <div className="sessions-loading-fill" />
-                  <p>Capturing from all 3 cameras, uploading to S3, running health check…</p>
-                </div>
-              )}
-
-              {/* Session list */}
-              {captureSessionsLoading && captureSessions.length === 0 && (
-                <div className="sessions-empty">
-                  <p>Loading capture sessions…</p>
-                </div>
-              )}
-
-              {!captureSessionsLoading && captureSessions.length === 0 && (
-                <div className="sessions-empty">
-                  <p>
-                    No captures yet. The system captures every 2 minutes automatically,
-                    or press <strong>Capture Now</strong> to take photos immediately.
-                  </p>
-                </div>
-              )}
-
-              {captureSessions.map((session, idx) => {
-                const badge = healthBadge(session);
-                const ts = formatTimestamp(session.timestamp);
-                const isLatest = idx === 0;
-                const successImages = (session.images || []).filter(img => img.success);
-                const failedImages = (session.images || []).filter(img => !img.success);
-
-                return (
-                  <div
-                    key={session.session_id || idx}
-                    className={`session-card ${isLatest ? 'session-latest' : 'session-previous'}`}
-                  >
-                    {/* Card header */}
-                    <div className="session-card-header">
-                      <div className="session-card-meta">
-                        <span className={`session-label ${isLatest ? 'label-latest' : 'label-previous'}`}>
-                          {isLatest ? '🟢 Latest' : `#${idx + 1}`}
-                        </span>
-                        <span className="session-timestamp">🕒 {ts}</span>
-                        <span className="session-camera-count">
-                          📷 {session.camera_count}/3 cameras
-                        </span>
-                        {session.triggered_by && (
-                          <span className="session-trigger">
-                            {session.triggered_by === 'manual' ? '👆 Manual' : '⏱️ Auto'}
-                          </span>
-                        )}
-                      </div>
-                      <span className={`session-health-badge ${badge.cls}`}>
-                        {badge.label}
-                      </span>
-                    </div>
-
-                    {/* Images row */}
-                    <div className="session-images-row">
-                      {successImages.length === 0 && (
-                        <p className="session-no-images">
-                          No images were captured in this session.
-                        </p>
-                      )}
-                      {successImages.map((img) => (
-                        <div key={img.camera_id} className="session-image-card">
-                          <div className="session-cam-label">Camera {img.camera_id}</div>
-                          <div className="session-cam-name">{img.camera_name}</div>
-                          {img.url ? (
-                            <a href={img.url} target="_blank" rel="noopener noreferrer">
-                              <img
-                                src={img.url}
-                                alt={`Camera ${img.camera_id}`}
-                                className="session-image"
-                                onError={(e) => {
-                                  e.target.style.display = 'none';
-                                  e.target.nextSibling.style.display = 'flex';
-                                }}
-                              />
-                              <div className="session-image-expired" style={{ display: 'none' }}>
-                                🔗 URL expired – <a href={img.url} target="_blank" rel="noopener noreferrer">open link</a>
-                              </div>
-                            </a>
-                          ) : (
-                            <div className="session-image-missing">No URL</div>
-                          )}
-                          <div className="session-s3-badge">✅ S3</div>
-                        </div>
-                      ))}
-
-                      {/* Failed camera placeholders */}
-                      {failedImages.map((img) => (
-                        <div key={img.camera_id} className="session-image-card session-image-failed">
-                          <div className="session-cam-label">Camera {img.camera_id}</div>
-                          <div className="session-cam-name">{img.camera_name}</div>
-                          <div className="session-image-error">
-                            <span>⚠️ Failed</span>
-                            {img.error && <small>{img.error}</small>}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-
-                    {/* Health details (collapsed by default for older sessions) */}
-                    {session.health && session.health.success && (
-                      <div className={`session-health ${session.health.is_healthy ? 'health-ok' : 'health-warn'}`}>
-                        <span>
-                          {session.health.is_healthy ? '✅ Healthy' : '⚠️ Issues detected'}
-                          {' — '}confidence: <strong>{session.health.health_probability}%</strong>
-                          {!session.health.is_healthy &&
-                            session.health.diseases &&
-                            session.health.diseases.length > 0 &&
-                            ` · Top issue: ${session.health.diseases[0].name} (${session.health.diseases[0].probability}%)`}
-                        </span>
-                      </div>
-                    )}
-                    {session.health && !session.health.success && (
-                      <div className="session-health health-error-row">
-                        ⚠️ Health check failed: {session.health.error}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
-
-        {/* ==================== SENSOR SECTION ==================== */}
-        <section className="section">
-          <h2>📊 Sensor Readings</h2>
-          {sensors ? (
-            <div className="data-grid">
-              <div className="data-card">
-                <h3>🌡️ Air Temperature</h3>
-                <p className="value">{sensors.air_temperature}°C</p>
-              </div>
-              <div className="data-card">
-                <h3>💧 Air Humidity</h3>
-                <p className="value">{sensors.air_humidity}%</p>
-              </div>
-              <div className="data-card">
-                <h3>💡 Light Intensity</h3>
-                <p className="value">{sensors.light_intensity} Lux</p>
-              </div>
-              <div className="data-card">
-                <h3>🌿 Soil Humidity</h3>
-                <p className="value">{sensors.soil_humidity}%</p>
-              </div>
-              <div className="data-card">
-                <h3>🧪 Soil pH</h3>
-                <p className="value">{sensors.soil_ph}</p>
-              </div>
-              <div className="data-card">
-                <h3>⚡ Soil EC</h3>
-                <p className="value">{sensors.soil_ec} µS/cm</p>
-              </div>
-              <div className="data-card">
-                <h3>🌡️ Soil Temp</h3>
-                <p className="value">{sensors.soil_temperature}°C</p>
-              </div>
-              <div className="data-card">
-                <h3>🚰 Water Flow</h3>
-                <p className="value">{sensors.water_flow} L/min</p>
-              </div>
-              <div className="data-card">
-                <h3>💧 Water Amount</h3>
-                <p className="value">{sensors.water_amount} L</p>
-              </div>
-              <div className="data-card">
-                <h3>⚡ Voltage</h3>
-                <p className="value">{sensors.voltage} V</p>
-              </div>
-              <div className="data-card">
-                <h3>🔌 Current</h3>
-                <p className="value">{sensors.current} A</p>
-              </div>
-              <div className="data-card">
-                <h3>💡 Power</h3>
-                <p className="value">{sensors.power} W</p>
-              </div>
-              <div className="data-card">
-                <h3>🔋 Energy</h3>
-                <p className="value">{sensors.energy} Wh</p>
-              </div>
-              <div className="data-card">
-                <h3>📡 Frequency</h3>
-                <p className="value">{sensors.frequency} Hz</p>
-              </div>
-            </div>
-          ) : (
-            <div className="no-data">
-              <p>No sensor data available. Waiting for data...</p>
-            </div>
+          {activePage === 'actuators' && (
+            <ActuatorControl
+              actuators={actuators}
+              operationMode={operationMode}
+              onToggleMode={toggleOperationMode}
+              onControlState={controlActuator}
+              onControlPower={controlActuatorPower}
+              loading={loading}
+            />
           )}
-        </section>
-
-        {/* ==================== ACTUATOR SECTION ==================== */}
-        <section className="section">
-          <h2>🎛️ Actuator Controls</h2>
-
-          {operationMode === 'autonomous' && (
-            <div className="warning-box">
-              <strong>⚠️ Warning:</strong> System is in AUTONOMOUS mode. Manual controls are
-              disabled. Switch to MANUAL mode to control actuators manually.
-            </div>
+          {activePage === 'resources' && (
+            <ResourceConsumption
+              sensors={sensors}
+              sensorHistory={sensorHistory}
+            />
           )}
-
-          {actuators ? (
-            <div className="actuator-grid">
-              {/* Heater */}
-              <div className="actuator-card">
-                <h3>🔥 Heater</h3>
-                <p className="status">
-                  Status:{' '}
-                  <span className={`badge ${actuators.heater.state}`}>
-                    {actuators.heater.state.toUpperCase()}
-                  </span>
-                </p>
-                <p className="percentage">{actuators.heater.percentage}% Power</p>
-                <div className="power-control">
-                  <label htmlFor="heater-power" className="slider-label">
-                    Power Level: {Math.round((actuators.heater.duty_cycle / 4095) * 100)}%
-                  </label>
-                  <input
-                    type="range"
-                    id="heater-power"
-                    min="0"
-                    max="4095"
-                    value={actuators.heater.duty_cycle}
-                    onChange={(e) => controlActuatorPower('heater', parseInt(e.target.value))}
-                    disabled={loading || operationMode === 'autonomous'}
-                    className="power-slider"
-                  />
-                  <div className="slider-markers">
-                    <span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>
-                  </div>
-                </div>
-                <div className="button-group">
-                  <button onClick={() => controlActuator('heater', 'on')} disabled={loading || operationMode === 'autonomous'} className="btn btn-success">Turn ON</button>
-                  <button onClick={() => controlActuator('heater', 'off')} disabled={loading || operationMode === 'autonomous'} className="btn btn-danger">Turn OFF</button>
-                </div>
-              </div>
-
-              {/* Light Strips */}
-              <div className="actuator-card">
-                <h3>💡 Light Strips</h3>
-                <p className="status">
-                  Status:{' '}
-                  <span className={`badge ${actuators.light.state}`}>
-                    {actuators.light.state.toUpperCase()}
-                  </span>
-                </p>
-                <p className="percentage">{actuators.light.percentage}% Power</p>
-                <div className="power-control">
-                  <label htmlFor="light-power" className="slider-label">
-                    Brightness: {Math.round((actuators.light.duty_cycle / 4095) * 100)}%
-                  </label>
-                  <input
-                    type="range"
-                    id="light-power"
-                    min="0"
-                    max="4095"
-                    value={actuators.light.duty_cycle}
-                    onChange={(e) => controlActuatorPower('light', parseInt(e.target.value))}
-                    disabled={loading || operationMode === 'autonomous'}
-                    className="power-slider"
-                  />
-                  <div className="slider-markers">
-                    <span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>
-                  </div>
-                </div>
-                <div className="button-group">
-                  <button onClick={() => controlActuator('light', 'on')} disabled={loading || operationMode === 'autonomous'} className="btn btn-success">Turn ON</button>
-                  <button onClick={() => controlActuator('light', 'off')} disabled={loading || operationMode === 'autonomous'} className="btn btn-danger">Turn OFF</button>
-                </div>
-              </div>
-
-              {/* Fan */}
-              <div className="actuator-card">
-                <h3>🌀 Fan</h3>
-                <p className="status">
-                  Status:{' '}
-                  <span className={`badge ${actuators.fan.state}`}>
-                    {actuators.fan.state.toUpperCase()}
-                  </span>
-                </p>
-                <p className="percentage">{actuators.fan.percentage}% Power</p>
-                <div className="power-control">
-                  <label htmlFor="fan-power" className="slider-label">
-                    Speed: {Math.round((actuators.fan.duty_cycle / 4095) * 100)}%
-                  </label>
-                  <input
-                    type="range"
-                    id="fan-power"
-                    min="0"
-                    max="4095"
-                    value={actuators.fan.duty_cycle}
-                    onChange={(e) => controlActuatorPower('fan', parseInt(e.target.value))}
-                    disabled={loading || operationMode === 'autonomous'}
-                    className="power-slider"
-                  />
-                  <div className="slider-markers">
-                    <span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>
-                  </div>
-                </div>
-                <div className="button-group">
-                  <button onClick={() => controlActuator('fan', 'on')} disabled={loading || operationMode === 'autonomous'} className="btn btn-success">Turn ON</button>
-                  <button onClick={() => controlActuator('fan', 'off')} disabled={loading || operationMode === 'autonomous'} className="btn btn-danger">Turn OFF</button>
-                </div>
-              </div>
-
-              {/* Water Pump */}
-              <div className="actuator-card">
-                <h3>💦 Water Pump</h3>
-                <p className="status">
-                  Status:{' '}
-                  <span className={`badge ${actuators.water_pump.state}`}>
-                    {actuators.water_pump.state.toUpperCase()}
-                  </span>
-                </p>
-                <p className="percentage">{actuators.water_pump.percentage}% Power</p>
-                <div className="power-control">
-                  <label htmlFor="pump-power" className="slider-label">
-                    Flow Rate: {Math.round((actuators.water_pump.duty_cycle / 4095) * 100)}%
-                  </label>
-                  <input
-                    type="range"
-                    id="pump-power"
-                    min="0"
-                    max="4095"
-                    value={actuators.water_pump.duty_cycle}
-                    onChange={(e) => controlActuatorPower('water_pump', parseInt(e.target.value))}
-                    disabled={loading || operationMode === 'autonomous'}
-                    className="power-slider"
-                  />
-                  <div className="slider-markers">
-                    <span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>
-                  </div>
-                </div>
-                <div className="button-group">
-                  <button onClick={() => controlActuator('water_pump', 'on')} disabled={loading || operationMode === 'autonomous'} className="btn btn-success">Turn ON</button>
-                  <button onClick={() => controlActuator('water_pump', 'off')} disabled={loading || operationMode === 'autonomous'} className="btn btn-danger">Turn OFF</button>
-                </div>
-              </div>
-            </div>
-          ) : (
-            <div className="no-data">
-              <p>No actuator data available. Waiting for data...</p>
-            </div>
+          {activePage === 'livecams' && (
+            <LiveCams
+              captureSessions={captureSessions}
+              captureManualLoading={captureManualLoading}
+              onCapture={triggerCaptureNow}
+              onRefreshSessions={fetchCaptureSessions}
+            />
           )}
-        </section>
+          {activePage === 'growth' && (
+            <PlantGrowth
+              captureSessions={captureSessions}
+              captureSessionsLoading={captureSessionsLoading}
+              captureManualLoading={captureManualLoading}
+              captureManualError={captureManualError}
+              healthResult={healthResult}
+              healthLoading={healthLoading}
+              healthLastChecked={healthLastChecked}
+              onCapture={triggerCaptureNow}
+              onRefreshSessions={fetchCaptureSessions}
+              onCheckHealth={checkPlantHealth}
+            />
+          )}
+        </main>
       </div>
     </div>
   );

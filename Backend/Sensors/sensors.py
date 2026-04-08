@@ -25,24 +25,24 @@ class GH_Sensors:
     - Light sensors (intensity)
     - Water flow sensor
     """
-    def __init__(self, general_i2c):
-        self.__general_i2c = general_i2c        
+    def __init__(self, general_i2c, mongo_db_handler=None):
+        self.__general_i2c = general_i2c
         self.__Vref = 5.0 # ads source voltage
         self.__ads_resolution = 65535.0 # maximum resolution for ads sensor (16-bit)
-        
+
         # ads channels
         self.__ads_sensor = ADS.ADS1115(self.__general_i2c)
         self.__ads_channels = [Pin.A0, Pin.A1, Pin.A2, Pin.A3]
-        
+
         # gpiod
         self.chip = gpiod.Chip('/dev/gpiochip4')
-        
+
         # Initialize sensor drivers
         self.soil_sensor = SoilSensor(self.__ads_sensor, self.__ads_channels)
         self.air_sensor = AirSensor()
         self.electricity_sensor = ElectricitySensor()
-        self.light_sensor = LightSensor(ads_sensor=self.__ads_sensor, ads_channels=self.__ads_channels, I2C=self.__general_i2c)        
-        self.water_flow_sensor = WaterFlowSensor()
+        self.light_sensor = LightSensor(ads_sensor=self.__ads_sensor, ads_channels=self.__ads_channels, I2C=self.__general_i2c)
+        self.water_flow_sensor = WaterFlowSensor(mongo_db_handler=mongo_db_handler)
 
     def set_water_flow_sensor_pin(self, pin):
         """Set up the water flow sensor with the specified pin"""

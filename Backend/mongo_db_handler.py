@@ -158,6 +158,18 @@ class MongoDBHandler:
             _CUSTOM_PRINT_FUNC(f"Error inserting capture session: {e}")
             return False
 
+    def update_capture_session_health(self, session_id: str, health: dict) -> bool:
+        """Patch the health field of an existing capture session after async health check."""
+        try:
+            self.__db['capture_sessions'].update_one(
+                {'session_id': session_id},
+                {'$set': {'health': health}}
+            )
+            return True
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error updating session health: {e}")
+            return False
+
     def get_capture_sessions(self, limit: int = 20) -> list:
         """
         Return the most recent capture sessions, newest first.
@@ -174,6 +186,28 @@ class MongoDBHandler:
         except Exception as e:
             _CUSTOM_PRINT_FUNC(f"Error fetching capture sessions: {e}")
             return []
+
+    def upsert_state(self, key: str, value) -> bool:
+        """Save a single running value (e.g. water_amount) — one document per key, always overwritten."""
+        try:
+            self.__db['system_state'].update_one(
+                {'key': key},
+                {'$set': {'key': key, 'value': value, 'timestamp': datetime.datetime.now()}},
+                upsert=True,
+            )
+            return True
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error upserting state '{key}': {e}")
+            return False
+
+    def get_state(self, key: str):
+        """Load a previously saved running value. Returns None if not found."""
+        try:
+            doc = self.__db['system_state'].find_one({'key': key})
+            return doc['value'] if doc else None
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error getting state '{key}': {e}")
+            return None
 
     def close_connection(self):
         try:

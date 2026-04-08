@@ -1,7 +1,7 @@
 try:
     from picamera2 import Picamera2
     PICAMERA2_AVAILABLE = True
-except ImportError:
+except Exception:
     PICAMERA2_AVAILABLE = False
     print("Warning: picamera2 not available. RPi CSI camera will not work.")
 
@@ -19,13 +19,14 @@ from utils.utils import _CUSTOM_PRINT_FUNC
 
 def _find_camera_device(name_pattern: str) -> int:
     """
-    Scan all /dev/video* devices via v4l2-ctl and return the device index
+    Scan /dev/video0–/dev/video9 via v4l2-ctl and return the device index
     whose Card type contains name_pattern (case-insensitive).
     Prefers even-numbered nodes (main capture) over odd ones (metadata).
     Returns None if not found.
+    Scans only video0-9 to avoid slow queries on the 15+ pisp backend nodes.
     """
     candidates = []
-    for path in sorted(glob.glob('/dev/video*')):
+    for path in sorted(glob.glob('/dev/video[0-9]')):
         try:
             idx = int(path.replace('/dev/video', ''))
         except ValueError:
@@ -45,18 +46,71 @@ def _find_camera_device(name_pattern: str) -> int:
     return even[0] if even else candidates[0]
 
 
+# ==================== PERSISTENT FRAME GRABBERS ====================
+
+class _USBGrabber:
+    """
+    Background thread: keeps one USB camera open and continuously stores the
+    latest frame as JPEG. As simple as possible — no format flags, no locks.
+    """
+
+    def __init__(self, dev_idx):
+        self._dev = dev_idx
+        self._jpeg = None
+        self._lock = threading.Lock()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while True:
+
+            cap = cv2.VideoCapture(self._dev)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            if not cap.isOpened():
+                cap.release()
+                time.sleep(2)
+                continue
+            consecutive_failures = 0
+            while consecutive_failures < 30:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    consecutive_failures += 1
+                    time.sleep(0.1)
+                    continue
+                consecutive_failures = 0
+                _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                with self._lock:
+                    self._jpeg = buf.tobytes()
+            cap.release()
+            time.sleep(1)
+
+    def get_jpeg(self) -> "bytes | None":
+        with self._lock:
+            return self._jpeg
+
+
+
+
+# ==================== MAIN CAMERA CLASS ====================
+
 class GH_Camera:
     """
     Stateless camera handler for scheduled image capture.
-    No persistent camera connections are kept open between captures.
-    Each capture opens the device, reads frames, then releases it.
-    A per-instance lock prevents concurrent captures from conflicting.
+    Live polling uses persistent grabber threads (real-time, no open/close overhead).
+    Scheduled high-res captures use per-device open/close with the capture lock.
     """
 
     def __init__(self):
         self.__last_path = ""
-        # Global lock to prevent concurrent captures across all cameras
         self._capture_lock = threading.Lock()
+
+        # Persistent grabbers — device indices confirmed via v4l2-ctl --list-devices:
+        #   Camera 1: 2K USB Camera  → /dev/video2
+        #   Camera 2: 4K USB Camera  → /dev/video4
+        #   Camera 3: Integrated     → /dev/video0
+        self._grabber1 = _USBGrabber(2)
+        self._grabber2 = _USBGrabber(4)
+        self._grabber3 = _USBGrabber(0)
 
     def remove_image(self, path=None):
         try:
@@ -154,112 +208,131 @@ class GH_Camera:
 
     def capture_frames_base64(self) -> list:
         """
-        Capture one frame from each of the 3 cameras independently.
-        Returns a list of 3 dicts (one per camera):
-            {
-                'camera_id': int,      # 1, 2, or 3
-                'name': str,           # Human-readable camera name
-                'b64': str | None,     # Base64 JPEG string, or None on failure
-                'success': bool,
-                'error': str | None,   # Error message if not successful
-            }
-        If one camera fails, its entry has success=False and the others continue.
-        A lock prevents concurrent invocations from interfering with each other.
+        Grab the latest frame from each live grabber and return as base64 JPEG.
+        No device open/close — grabbers already keep cameras open continuously.
+        Returns a list of 3 dicts (one per camera).
         """
+        configs = [
+            (1, self._grabber1, '2K USB Camera'),
+            (2, self._grabber2, '4K USB Camera'),
+            (3, self._grabber3, 'Integrated Camera'),
+        ]
         results = []
-
-        with self._capture_lock:
-
-            # ---- Camera 1: 2K USB Camera ----------------------------------------
-            cam1 = {
-                'camera_id': 1,
-                'name': '2K USB Camera',
-                'b64': None,
-                'success': False,
-                'error': None,
-            }
-            try:
-                dev1 = _find_camera_device('2k usb')
-                if dev1 is None:
-                    dev1 = 0
-                    _CUSTOM_PRINT_FUNC("[Camera 1] '2k usb' not found via v4l2, trying /dev/video0")
-                frame = self._capture_usb_frame(dev1)
-                # Fallback to device 0 if auto-discovered device fails and isn't already 0
-                if frame is None and dev1 != 0:
-                    _CUSTOM_PRINT_FUNC(f"[Camera 1] /dev/video{dev1} failed, falling back to /dev/video0")
-                    frame = self._capture_usb_frame(0)
-                if frame is not None:
-                    cam1['b64'] = self._encode_frame_b64(frame)
-                    cam1['success'] = True
-                    _CUSTOM_PRINT_FUNC(f"[Camera 1] Capture OK from /dev/video{dev1}")
-                else:
-                    cam1['error'] = f"All attempts failed for Camera 1 (tried /dev/video{dev1})"
-                    _CUSTOM_PRINT_FUNC(f"[Camera 1] {cam1['error']}")
-            except Exception as e:
-                cam1['error'] = str(e)
-                _CUSTOM_PRINT_FUNC(f"[Camera 1] Unexpected error: {e}")
-            results.append(cam1)
-
-            # ---- Camera 2: RPi CSI camera (fallback: 4K USB) --------------------
-            cam2 = {
-                'camera_id': 2,
-                'name': 'RPi/4K Camera',
-                'b64': None,
-                'success': False,
-                'error': None,
-            }
-            try:
-                frame = None
-                if PICAMERA2_AVAILABLE:
-                    _CUSTOM_PRINT_FUNC("[Camera 2] Trying RPi CSI camera via picamera2...")
-                    frame = self._capture_picamera_frame(0)
-                if frame is None:
-                    dev2 = _find_camera_device('4k usb')
-                    if dev2 is None:
-                        dev2 = 2
-                        _CUSTOM_PRINT_FUNC("[Camera 2] '4k usb' not found via v4l2, trying /dev/video2")
-                    _CUSTOM_PRINT_FUNC(f"[Camera 2] Trying 4K USB on /dev/video{dev2}...")
-                    frame = self._capture_usb_frame(dev2, resolution=(1280, 720))
-                if frame is not None:
-                    cam2['b64'] = self._encode_frame_b64(frame)
-                    cam2['success'] = True
-                    _CUSTOM_PRINT_FUNC("[Camera 2] Capture OK")
-                else:
-                    cam2['error'] = "Camera 2 failed: CSI unavailable and 4K USB capture failed"
-                    _CUSTOM_PRINT_FUNC(f"[Camera 2] {cam2['error']}")
-            except Exception as e:
-                cam2['error'] = str(e)
-                _CUSTOM_PRINT_FUNC(f"[Camera 2] Unexpected error: {e}")
-            results.append(cam2)
-
-            # ---- Camera 3: Integrated Camera ------------------------------------
-            cam3 = {
-                'camera_id': 3,
-                'name': 'Integrated Camera',
-                'b64': None,
-                'success': False,
-                'error': None,
-            }
-            try:
-                dev3 = _find_camera_device('integrated')
-                if dev3 is None:
-                    dev3 = 5
-                    _CUSTOM_PRINT_FUNC("[Camera 3] 'integrated' not found via v4l2, trying /dev/video5")
-                frame = self._capture_usb_frame(dev3, resolution=(1280, 720))
-                if frame is not None:
-                    cam3['b64'] = self._encode_frame_b64(frame)
-                    cam3['success'] = True
-                    _CUSTOM_PRINT_FUNC(f"[Camera 3] Capture OK from /dev/video{dev3}")
-                else:
-                    cam3['error'] = f"All attempts failed for Camera 3 (tried /dev/video{dev3})"
-                    _CUSTOM_PRINT_FUNC(f"[Camera 3] {cam3['error']}")
-            except Exception as e:
-                cam3['error'] = str(e)
-                _CUSTOM_PRINT_FUNC(f"[Camera 3] Unexpected error: {e}")
-            results.append(cam3)
+        for cam_id, grabber, name in configs:
+            jpeg = grabber.get_jpeg()
+            if jpeg:
+                results.append({
+                    'camera_id': cam_id,
+                    'name': name,
+                    'b64': base64.b64encode(jpeg).decode('utf-8'),
+                    'success': True,
+                    'error': None,
+                })
+                _CUSTOM_PRINT_FUNC(f"[Camera {cam_id}] Capture OK ({len(jpeg)//1024}KB)")
+            else:
+                results.append({
+                    'camera_id': cam_id,
+                    'name': name,
+                    'b64': None,
+                    'success': False,
+                    'error': 'No frame available — camera may still be initializing',
+                })
+                _CUSTOM_PRINT_FUNC(f"[Camera {cam_id}] No frame available yet")
 
         successful = sum(1 for r in results if r['success'])
-        _CUSTOM_PRINT_FUNC(
-            f"[Camera] Capture cycle complete: {successful}/3 cameras successful"
-        )
+        _CUSTOM_PRINT_FUNC(f"[Camera] Capture complete: {successful}/3 cameras")
         return results
+
+    # ==================== SINGLE-FRAME ENDPOINT (real-time polling) ====================
+
+    def get_frame_jpeg(self, cam_id: int) -> "bytes | None":
+        """
+        Return the latest JPEG frame from the persistent grabber for the given camera.
+        Near-instant — no camera open/close overhead. Used by the live cams polling endpoint.
+        """
+        try:
+            if cam_id == 1:
+                return self._grabber1.get_jpeg()
+            elif cam_id == 2:
+                return self._grabber2.get_jpeg()
+            elif cam_id == 3:
+                return self._grabber3.get_jpeg()
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"[Camera {cam_id}] get_frame_jpeg error: {e}")
+        return None
+
+    # ==================== MJPEG LIVE STREAM GENERATORS ====================
+
+    def _mjpeg_usb_generator(self, device_idx, width=640, height=480):
+        cap = None
+        try:
+            cap = cv2.VideoCapture(device_idx, cv2.CAP_V4L2)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            while True:
+                if self._capture_lock.locked():
+                    cap.release()
+                    time.sleep(0.5)
+                    cap = cv2.VideoCapture(device_idx, cv2.CAP_V4L2)
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                    continue
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    time.sleep(0.1)
+                    continue
+                _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                       + buf.tobytes() + b'\r\n')
+        except GeneratorExit:
+            pass
+        finally:
+            if cap is not None:
+                cap.release()
+
+    def _mjpeg_picamera_generator(self, cam_id=0, width=640, height=480):
+        if not PICAMERA2_AVAILABLE:
+            dev = _find_camera_device('4k usb') or 4
+            yield from self._mjpeg_usb_generator(dev, width, height)
+            return
+        cam = None
+        try:
+            cam = Picamera2(cam_id)
+            config = cam.create_video_configuration(
+                main={"size": (width, height), "format": "RGB888"}
+            )
+            cam.configure(config)
+            cam.start()
+            while True:
+                if self._capture_lock.locked():
+                    time.sleep(0.3)
+                    continue
+                frame = cam.capture_array()
+                if frame is None:
+                    time.sleep(0.05)
+                    continue
+                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                _, buf = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                       + buf.tobytes() + b'\r\n')
+        except GeneratorExit:
+            pass
+        finally:
+            if cam is not None:
+                try: cam.stop()
+                except Exception: pass
+                try: cam.close()
+                except Exception: pass
+
+    def stream_camera_1(self):
+        dev = _find_camera_device('2k usb') or 2
+        return self._mjpeg_usb_generator(dev)
+
+    def stream_camera_2(self):
+        return self._mjpeg_picamera_generator(cam_id=0)
+
+    def stream_camera_3(self):
+        dev = _find_camera_device('integrated') or 0
+        return self._mjpeg_usb_generator(dev)

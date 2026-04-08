@@ -10,7 +10,7 @@ HEALTH_DETAILS = "local_name,description,url,treatment,classification,common_nam
 class PlantHealthChecker:
     def __init__(self, api_key=None):
         self._api_key = api_key or os.environ.get(
-            'PLANT_ID_API_KEY', 'DR11O5JkxLSLvbB4eINRfHnYm0c8hPzhKfWvccngbh2uzcrc4y'
+            'PLANT_ID_API_KEY', 'je18ysqgEm3v9hMtQXx4IPrIREAaFINKgqusoo5yqTTtOa1lhk'
         )
         _base_url = os.environ.get('PLANT_ID_API_URL', 'https://plant.id/api/v3').rstrip('/')
         self._health_url = _base_url + '/health_assessment'

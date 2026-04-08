@@ -1,176 +1,185 @@
+import datetime
 import time
-import numpy as np
 import threading
 from utils.utils import _CUSTOM_PRINT_FUNC
 
-class GH_Setpoints:
-    def __init__(self, mqtt_handler, mongo_db_handler, actuator_handler=None):        
-        self.__temperature_setpoint = 16.0
-        self.__humidity_setpoint = 60.0
-        self.__light_setpoint = 10.0 # 0 - 18 lux
-        self.__soil_ph_setpoint = 7.0
-        self.__soil_ec_setpoint = 150.0
-        self.__soil_temp_setpoint = 25.0
-        self.__soil_humidity_setpoint = 80.0
-        self.__water_flow_setpoint = 2 # L/h
 
-        self.operation_mode = "autonomous"  # Default operation mode (can be "manual" or "autonomous")
-        
+class GH_Setpoints:
+    def __init__(self, mqtt_handler, mongo_db_handler, actuator_handler=None):
+        # Research-based defaults for lettuce (PlantMindAI_Lettuce_Research_Summary.pdf)
+        self.__temperature_setpoint      = 23.0
+        self.__humidity_setpoint         = 70.0
+        self.__light_setpoint            = 10.0
+        self.__soil_ph_setpoint          = 5.8
+        self.__soil_ec_setpoint          = 150.0
+        self.__soil_temp_setpoint        = 25.0
+        self.__soil_humidity_setpoint    = 70.0
+        self.__soil_humidity_hysteresis  = 20.0
+        self.__water_flow_setpoint       = 2.0
+        self.operation_mode              = "autonomous"
+
         self.__control_threads_events = {
             "temperature": threading.Event(),
-            "light": threading.Event(),
-            "moisture": threading.Event() 
-        }        
+            "light":       threading.Event(),
+            "moisture":    threading.Event(),
+        }
 
-        self.__mqtt_handler = mqtt_handler
+        self.__mqtt_handler    = mqtt_handler
         self.__mongo_db_handler = mongo_db_handler
         self.__actuator_handler = actuator_handler
 
-        self.__soil_humidity_hysteresis = 20.0  # Default hysteresis value for soil humidity control
+        # Load latest values from MongoDB — overrides defaults if saved previously
+        self._load_from_mongo("temperature",    lambda v: setattr(self, '_GH_Setpoints__temperature_setpoint',     float(v)))
+        self._load_from_mongo("humidity",       lambda v: setattr(self, '_GH_Setpoints__humidity_setpoint',        float(v)))
+        self._load_from_mongo("light_intensity",lambda v: setattr(self, '_GH_Setpoints__light_setpoint',           float(v)))
+        self._load_from_mongo("soil_ph",        lambda v: setattr(self, '_GH_Setpoints__soil_ph_setpoint',         float(v)))
+        self._load_from_mongo("soil_ec",        lambda v: setattr(self, '_GH_Setpoints__soil_ec_setpoint',         float(v)))
+        self._load_from_mongo("soil_temp",      lambda v: setattr(self, '_GH_Setpoints__soil_temp_setpoint',       float(v)))
+        self._load_from_mongo("soil_moisture",  lambda v: setattr(self, '_GH_Setpoints__soil_humidity_setpoint',   float(v)))
+        self._load_from_mongo("soil_hysteresis",lambda v: setattr(self, '_GH_Setpoints__soil_humidity_hysteresis', float(v)))
+        self._load_from_mongo("water_flow",     lambda v: setattr(self, '_GH_Setpoints__water_flow_setpoint',      float(v)))
+        self._load_from_mongo("operation_mode", lambda v: setattr(self, 'operation_mode',                          str(v)))
 
-        temp = self.__mongo_db_handler.get_latest_doc_where("setpoints", {"type": "temperature"})
-        if temp is not None:
-            self.__temperature_setpoint = int(temp["message"])
+        _CUSTOM_PRINT_FUNC(f"[Setpoints] Loaded: {self.get_all_setpoints()}")
 
-        hum = self.__mongo_db_handler.get_latest_doc_where("setpoints", {"type": "humidity"})
-        if hum is not None:
-            self.__humidity_setpoint = int(hum["message"])
+    # ── Internal helpers ───────────────────────────────────────────────────────
 
-        light = self.__mongo_db_handler.get_latest_doc_where("setpoints", {"type": "light_intensity"})
-        if light is not None:
-            self.__light_setpoint = int(light["message"])
+    def _load_from_mongo(self, type_key: str, apply_fn) -> None:
+        """Load the latest saved value for type_key and apply it."""
+        try:
+            doc = self.__mongo_db_handler.get_latest_doc_where("setpoints", {"type": type_key})
+            if doc is not None:
+                apply_fn(doc["message"])
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"[Setpoints] Could not load '{type_key}' from MongoDB: {e}")
 
-        soil_ph = self.__mongo_db_handler.get_latest_doc_where("setpoints", {"type": "soil_ph"})
-        if soil_ph is not None:
-            self.__soil_ph_setpoint = int(soil_ph["message"])
+    def _save(self, type_key: str, value) -> None:
+        """Persist a setpoint value to MongoDB."""
+        try:
+            self.__mongo_db_handler._MongoDBHandler__db['setpoints'].insert_one({
+                'type':      type_key,
+                'message':   str(value),
+                'timestamp': datetime.datetime.now(),
+            })
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"[Setpoints] Could not save '{type_key}' to MongoDB: {e}")
 
-        soil_ec = self.__mongo_db_handler.get_latest_doc_where("setpoints", {"type": "soil_ec"})
-        if soil_ec is not None:
-            self.__soil_ec_setpoint = int(soil_ec["message"])
-
-        soil_temp = self.__mongo_db_handler.get_latest_doc_where("setpoints", {"type": "soil_temp"})
-        if soil_temp is not None:
-            self.__soil_temp_setpoint = int(soil_temp["message"])
-
-        soil_humidity = self.__mongo_db_handler.get_latest_doc_where("setpoints", {"type": "soil_moisture"})
-        if soil_humidity is not None:
-            self.__soil_humidity_setpoint = int(soil_humidity["message"])
-
-        water_flow = self.__mongo_db_handler.get_latest_doc_where("setpoints", {"type": "water_flow"})
-        if water_flow is not None:
-            self.__water_flow_setpoint = int(water_flow["message"])
-
-        operation_mode = self.__mongo_db_handler.get_latest_doc_where("setpoints", {"type": "operation_mode"})
-        if operation_mode is not None:
-            self.operation_mode = operation_mode["message"]
+    # ── Operation mode ─────────────────────────────────────────────────────────
 
     def set_operation_mode(self, mode: str) -> None:
         if mode not in ["manual", "autonomous"]:
             raise ValueError("Invalid operation mode. Choose 'manual' or 'autonomous'.")
-        _CUSTOM_PRINT_FUNC(f"Setting operation mode to {mode}")
         self.operation_mode = mode
+        self._save("operation_mode", mode)
+        _CUSTOM_PRINT_FUNC(f"[Setpoints] Operation mode → {mode}")
 
         if mode == "manual":
-            # Signal all PID threads to pause
-            for control_thread_event in self.__control_threads_events.values():
-                if isinstance(control_thread_event, threading.Event):
-                    control_thread_event.clear()
-            # Wait for threads to finish their current iteration (PID sample time is 0.1s)
+            for event in self.__control_threads_events.values():
+                if isinstance(event, threading.Event):
+                    event.clear()
             time.sleep(0.3)
             self.__actuator_handler.stop_all_actuators()
 
         if mode == "autonomous":
             self.__actuator_handler.stop_all_actuators()
-            # Resume all PID threads
-            for control_thread_event in self.__control_threads_events.values():
-                if isinstance(control_thread_event, threading.Event):
-                    control_thread_event.set()
+            for event in self.__control_threads_events.values():
+                if isinstance(event, threading.Event):
+                    event.set()
 
-        _CUSTOM_PRINT_FUNC(f'initial setpoints: {self.get_all_setpoints()}')
-                
     def get_operation_mode(self) -> str:
-        """Get the current operation mode."""
         return self.operation_mode
-    
-    def set_control_thread_event(self, control_thread_name: str, event: threading.Event) -> None:
-        if control_thread_name not in self.__control_threads_events:
-            raise ValueError(f"Invalid control thread name: {control_thread_name}")
-        _CUSTOM_PRINT_FUNC(f"Setting control thread event for {control_thread_name}")
-        self.__control_threads_events[control_thread_name] = event
 
-    def set_temperature_setpoint(self, temperature_setpoint: float) -> None:
-        _CUSTOM_PRINT_FUNC(f"Setting temperature setpoint to {temperature_setpoint} C")
-        self.__temperature_setpoint = temperature_setpoint
+    def set_control_thread_event(self, name: str, event: threading.Event) -> None:
+        if name not in self.__control_threads_events:
+            raise ValueError(f"Invalid control thread name: {name}")
+        self.__control_threads_events[name] = event
 
-    def get_soil_humidity_hysteresis(self) -> float:
-        """Get the hysteresis value for soil humidity control."""
-        return  self.__soil_humidity_hysteresis
-    
-    def set_soil_humidity_hysteresis(self, hysteresis: float) -> None:
-        """Set the hysteresis value for soil humidity control."""
-        _CUSTOM_PRINT_FUNC(f"Setting soil humidity hysteresis to {hysteresis} %")
-        self.__soil_humidity_hysteresis = hysteresis
+    # ── Setters (each auto-saves to MongoDB) ───────────────────────────────────
+
+    def set_temperature_setpoint(self, value: float) -> None:
+        self.__temperature_setpoint = float(value)
+        self._save("temperature", value)
+        _CUSTOM_PRINT_FUNC(f"[Setpoints] Temperature → {value} °C")
+
+    def set_humidity_setpoint(self, value: float) -> None:
+        self.__humidity_setpoint = float(value)
+        self._save("humidity", value)
+        _CUSTOM_PRINT_FUNC(f"[Setpoints] Humidity → {value} %")
+
+    def set_light_setpoint(self, value: float) -> None:
+        self.__light_setpoint = float(value)
+        self._save("light_intensity", value)
+        _CUSTOM_PRINT_FUNC(f"[Setpoints] Light → {value}")
+
+    def set_soil_ph_setpoint(self, value: float) -> None:
+        self.__soil_ph_setpoint = float(value)
+        self._save("soil_ph", value)
+        _CUSTOM_PRINT_FUNC(f"[Setpoints] Soil pH → {value}")
+
+    def set_soil_ec_setpoint(self, value: float) -> None:
+        self.__soil_ec_setpoint = float(value)
+        self._save("soil_ec", value)
+        _CUSTOM_PRINT_FUNC(f"[Setpoints] Soil EC → {value} mS/cm")
+
+    def set_soil_temp_setpoint(self, value: float) -> None:
+        self.__soil_temp_setpoint = float(value)
+        self._save("soil_temp", value)
+        _CUSTOM_PRINT_FUNC(f"[Setpoints] Soil temp → {value} °C")
+
+    def set_soil_humidity_setpoint(self, value: float) -> None:
+        self.__soil_humidity_setpoint = float(value)
+        self._save("soil_moisture", value)
+        _CUSTOM_PRINT_FUNC(f"[Setpoints] Soil moisture → {value} %")
+
+    def set_soil_humidity_hysteresis(self, value: float) -> None:
+        self.__soil_humidity_hysteresis = float(value)
+        self._save("soil_hysteresis", value)
+        _CUSTOM_PRINT_FUNC(f"[Setpoints] Soil hysteresis → {value} %")
+
+    def set_water_flow_setpoint(self, value: float) -> None:
+        self.__water_flow_setpoint = float(value)
+        self._save("water_flow", value)
+        _CUSTOM_PRINT_FUNC(f"[Setpoints] Water flow → {value} L/h")
+
+    # ── Getters ────────────────────────────────────────────────────────────────
 
     def get_temperature_setpoint(self) -> float:
         return self.__temperature_setpoint
-    
-    def set_humidity_setpoint(self, humidity_setpoint: float) -> None:
-        _CUSTOM_PRINT_FUNC(f"Setting humidity setpoint to {humidity_setpoint} %")
-        self.__humidity_setpoint = humidity_setpoint
 
     def get_humidity_setpoint(self) -> float:
         return self.__humidity_setpoint
-    
-    def set_light_setpoint(self, light_setpoint: float) -> None:
-        _CUSTOM_PRINT_FUNC(f"Setting light setpoint to {light_setpoint} lux")
-        self.__light_setpoint = light_setpoint
 
     def get_light_setpoint(self) -> float:
         return self.__light_setpoint
-    
-    def set_soil_ph_setpoint(self, soil_ph_setpoint: float) -> None:
-        _CUSTOM_PRINT_FUNC(f"Setting soil pH setpoint to {soil_ph_setpoint}")
-        self.__soil_ph_setpoint = soil_ph_setpoint
 
     def get_soil_ph_setpoint(self) -> float:
         return self.__soil_ph_setpoint
-    
-    def set_soil_ec_setpoint(self, soil_ec_setpoint: float) -> None:
-        _CUSTOM_PRINT_FUNC(f"Setting soil EC setpoint to {soil_ec_setpoint} mS/cm")
-        self.__soil_ec_setpoint = soil_ec_setpoint
 
     def get_soil_ec_setpoint(self) -> float:
         return self.__soil_ec_setpoint
-    
-    def set_soil_temp_setpoint(self, soil_temp_setpoint: float) -> None:
-        _CUSTOM_PRINT_FUNC(f"Setting soil temperature setpoint to {soil_temp_setpoint} C")
-        self.__soil_temp_setpoint = soil_temp_setpoint
 
     def get_soil_temp_setpoint(self) -> float:
         return self.__soil_temp_setpoint
-    
-    def set_soil_humidity_setpoint(self, soil_humidity_setpoint: float) -> None:
-        _CUSTOM_PRINT_FUNC(f"Setting soil humidity setpoint to {soil_humidity_setpoint} %")
-        self.__soil_humidity_setpoint = soil_humidity_setpoint
 
     def get_soil_humidity_setpoint(self) -> float:
         return self.__soil_humidity_setpoint
-    
-    def set_water_flow_setpoint(self, water_flow_setpoint: float) -> None:
-        _CUSTOM_PRINT_FUNC(f"Setting water flow setpoint to {water_flow_setpoint} L/h")
-        self.__water_flow_setpoint = water_flow_setpoint
+
+    def get_soil_humidity_hysteresis(self) -> float:
+        return self.__soil_humidity_hysteresis
 
     def get_water_flow_setpoint(self) -> float:
         return self.__water_flow_setpoint
 
     def get_all_setpoints(self) -> dict:
         return {
-            "temperature_setpoint": self.__temperature_setpoint,
-            "humidity_setpoint": self.__humidity_setpoint,
-            "light_setpoint": self.__light_setpoint,
-            "soil_ph_setpoint": self.__soil_ph_setpoint,
-            "soil_ec_setpoint": self.__soil_ec_setpoint,
-            "soil_temp_setpoint": self.__soil_temp_setpoint,
-            "soil_humidity_setpoint": self.__soil_humidity_setpoint,
-            "water_flow_setpoint": self.__water_flow_setpoint,
+            "temperature":      self.__temperature_setpoint,
+            "humidity":         self.__humidity_setpoint,
+            "light":            self.__light_setpoint,
+            "soil_ph":          self.__soil_ph_setpoint,
+            "soil_ec":          self.__soil_ec_setpoint,
+            "soil_temp":        self.__soil_temp_setpoint,
+            "soil_moisture":    self.__soil_humidity_setpoint,
+            "soil_hysteresis":  self.__soil_humidity_hysteresis,
+            "water_flow":       self.__water_flow_setpoint,
+            "operation_mode":   self.operation_mode,
         }
