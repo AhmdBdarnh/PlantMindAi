@@ -35,8 +35,6 @@ import control_loops
 import routes
 
 from config import (
-    CAPTURE_INTERVAL_SECONDS,
-    HEALTH_CHECK_INTERVAL_SECONDS,
     RESOURCES_CONSUMPTION_LOG_AND_RESET_INTERVAL,
     DHT22_PIN,
     WATER_FLOW_SENSOR_PIN,
@@ -262,17 +260,11 @@ if __name__ == "__main__":
         args=(env_sensors, env_actuators, setpoints, soil_semaphore, soil_pause_event),
     )
     app_thread = threading.Thread(target=app_loop.app_task)
-    capture_thread = threading.Thread(
-        target=capture_manager.camera_capture_task,
-        args=(CAPTURE_INTERVAL_SECONDS, HEALTH_CHECK_INTERVAL_SECONDS),
-        daemon=True,
-    )
 
     temperature_thread.start()
     light_thread.start()
     soil_thread.start()
     app_thread.start()
-    capture_thread.start()
 
     _CUSTOM_PRINT_FUNC("Starting serial logger thread...")
     set_serial_log_enabled(True)

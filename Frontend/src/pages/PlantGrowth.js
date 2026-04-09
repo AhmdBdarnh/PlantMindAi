@@ -150,7 +150,7 @@ export default function PlantGrowth({
             </span>
           )}
           <span style={{ fontSize: 12, color: 'var(--text-muted)', marginLeft: 'auto' }}>
-            Auto-capture every 2 min · {captureSessions.length} session{captureSessions.length !== 1 ? 's' : ''}
+            {captureSessions.length} session{captureSessions.length !== 1 ? 's' : ''}
           </span>
         </div>
 
@@ -288,20 +288,6 @@ export default function PlantGrowth({
             </>
           )}
 
-          <div className="health-divider" />
-
-          {/* Auto-capture info */}
-          <div style={{
-            background: 'var(--bg)',
-            borderRadius: 'var(--r-sm)',
-            padding: '10px 12px',
-            fontSize: 11.5,
-            color: 'var(--text-muted)',
-            lineHeight: 1.5,
-          }}>
-            <strong style={{ color: 'var(--text)' }}>Auto-capture</strong> runs every 2 minutes,
-            uploads to S3, and triggers an AI health check automatically.
-          </div>
         </div>
       </div>
     </div>

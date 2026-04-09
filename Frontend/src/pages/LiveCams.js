@@ -1,62 +1,13 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useState } from 'react';
 
 const CAMERAS = [
-  { id: 1, name: '2K USB Camera' },
-  { id: 2, name: 'RPi / 4K Camera' },
-  { id: 3, name: 'Integrated Camera' },
+  { id: 1, name: '2K USB Camera',    streamPath: '/video_c1' },
+  { id: 2, name: 'RPi / 4K Camera', streamPath: '/video_c2' },
+  { id: 3, name: 'Integrated Camera', streamPath: '/video_c3' },
 ];
 
-const POLL_INTERVAL_MS = 300; // ~3 FPS
-
 function CamCard({ cam }) {
-  const [blobUrl, setBlobUrl]   = useState(null);
-  const [status, setStatus]     = useState('connecting'); // connecting | live | error
-  const [fps, setFps]           = useState(0);
-  const prevBlobRef             = useRef(null);
-  const activeRef               = useRef(true);
-  const frameCountRef           = useRef(0);
-  const lastFpsCheckRef         = useRef(Date.now());
-
-  useEffect(() => {
-    activeRef.current = true;
-
-    async function fetchFrame() {
-      if (!activeRef.current) return;
-      try {
-        const res = await fetch(`/api/frame/${cam.id}?t=${Date.now()}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const blob = await res.blob();
-        const url  = URL.createObjectURL(blob);
-
-        // Revoke previous blob to free memory
-        if (prevBlobRef.current) URL.revokeObjectURL(prevBlobRef.current);
-        prevBlobRef.current = url;
-
-        setBlobUrl(url);
-        setStatus('live');
-
-        // FPS counter
-        frameCountRef.current += 1;
-        const now = Date.now();
-        if (now - lastFpsCheckRef.current >= 1000) {
-          setFps(frameCountRef.current);
-          frameCountRef.current = 0;
-          lastFpsCheckRef.current = now;
-        }
-      } catch {
-        setStatus('error');
-      }
-    }
-
-    const id = setInterval(fetchFrame, POLL_INTERVAL_MS);
-    fetchFrame(); // immediate first frame
-
-    return () => {
-      activeRef.current = false;
-      clearInterval(id);
-      if (prevBlobRef.current) URL.revokeObjectURL(prevBlobRef.current);
-    };
-  }, [cam.id]);
+  const [status, setStatus] = useState('connecting'); // connecting | live | error
 
   const dotColor = status === 'live' ? '#22c55e' : status === 'error' ? '#ef4444' : '#f59e0b';
   const dotGlow  = status === 'live' ? '0 0 6px #22c55e' : 'none';
@@ -91,9 +42,6 @@ function CamCard({ cam }) {
         </span>
         <span style={{ color: '#64748b', fontSize: 12 }}>{cam.name}</span>
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
-          {status === 'live' && fps > 0 && (
-            <span style={{ color: '#475569', fontSize: 11 }}>{fps} fps</span>
-          )}
           {status === 'live' && (
             <span style={{
               background: 'rgba(34,197,94,.15)',
@@ -126,19 +74,22 @@ function CamCard({ cam }) {
         position: 'relative',
         overflow: 'hidden',
       }}>
-        {blobUrl && status !== 'error' ? (
+        {status !== 'error' ? (
           <img
-            src={blobUrl}
+            src={cam.streamPath}
             alt={`Camera ${cam.id}`}
+            onLoad={() => setStatus('live')}
+            onError={() => setStatus('error')}
             style={{
               width: '100%', height: '100%',
               objectFit: 'contain',
-              display: 'block',
+              display: status === 'error' ? 'none' : 'block',
             }}
           />
-        ) : (
+        ) : null}
+        {status !== 'live' && (
           <div style={{
-            width: '100%', height: '100%',
+            position: 'absolute', inset: 0,
             display: 'flex', flexDirection: 'column',
             alignItems: 'center', justifyContent: 'center',
             gap: 12, color: '#334155',
@@ -204,7 +155,7 @@ export default function LiveCams() {
           Live Camera Feeds
         </span>
         <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-          3 cameras · ~3 FPS polling
+          3 cameras · MJPEG stream · ~15 FPS
         </span>
 
         {/* Capture button */}

@@ -20,12 +20,9 @@ from utils.utils import _CUSTOM_PRINT_FUNC
 def _find_camera_device(name_pattern: str) -> int:
     """
     Scan /dev/video0–/dev/video9 via v4l2-ctl and return the device index
-    whose Card type contains name_pattern (case-insensitive).
-    Prefers even-numbered nodes (main capture) over odd ones (metadata).
-    Returns None if not found.
-    Scans only video0-9 to avoid slow queries on the 15+ pisp backend nodes.
+    whose Card type contains name_pattern (case-insensitive) AND supports
+    Video Capture. Returns None if not found.
     """
-    candidates = []
     for path in sorted(glob.glob('/dev/video[0-9]')):
         try:
             idx = int(path.replace('/dev/video', ''))
@@ -36,14 +33,12 @@ def _find_camera_device(name_pattern: str) -> int:
                 ['v4l2-ctl', '--device', path, '--info'],
                 capture_output=True, text=True, timeout=2
             )
-            if name_pattern.lower() in result.stdout.lower():
-                candidates.append(idx)
+            info = result.stdout.lower()
+            if name_pattern.lower() in info and 'video capture' in info:
+                return idx
         except Exception:
             pass
-    if not candidates:
-        return None
-    even = [c for c in candidates if c % 2 == 0]
-    return even[0] if even else candidates[0]
+    return None
 
 
 # ==================== PERSISTENT FRAME GRABBERS ====================
@@ -51,24 +46,26 @@ def _find_camera_device(name_pattern: str) -> int:
 class _USBGrabber:
     """
     Background thread: keeps one USB camera open and continuously stores the
-    latest frame as JPEG. As simple as possible — no format flags, no locks.
+    latest frame as JPEG. Pass dev_idx=None to create a no-op grabber for
+    cameras that are not connected.
     """
 
     def __init__(self, dev_idx):
-        self._dev = dev_idx
+        self._dev = dev_idx       # None means camera not found/connected
         self._jpeg = None
         self._lock = threading.Lock()
-        threading.Thread(target=self._run, daemon=True).start()
+        if dev_idx is not None:
+            threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
         while True:
-
-            cap = cv2.VideoCapture(self._dev)
+            cap = cv2.VideoCapture(self._dev, cv2.CAP_V4L2)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             if not cap.isOpened():
                 cap.release()
-                time.sleep(2)
+                time.sleep(5)
                 continue
             consecutive_failures = 0
             while consecutive_failures < 30:
@@ -82,7 +79,7 @@ class _USBGrabber:
                 with self._lock:
                     self._jpeg = buf.tobytes()
             cap.release()
-            time.sleep(1)
+            time.sleep(2)
 
     def get_jpeg(self) -> "bytes | None":
         with self._lock:
@@ -104,13 +101,23 @@ class GH_Camera:
         self.__last_path = ""
         self._capture_lock = threading.Lock()
 
-        # Persistent grabbers — device indices confirmed via v4l2-ctl --list-devices:
-        #   Camera 1: 2K USB Camera  → /dev/video2
-        #   Camera 2: 4K USB Camera  → /dev/video4
-        #   Camera 3: Integrated     → /dev/video0
-        self._grabber1 = _USBGrabber(2)
-        self._grabber2 = _USBGrabber(4)
-        self._grabber3 = _USBGrabber(0)
+        # Dynamically find camera devices by name so device numbers
+        # don't break after reboot or USB reconnection.
+        # Returns None if the camera is not connected — grabber will be a no-op.
+        dev_2k  = _find_camera_device('2k usb')
+        dev_4k  = _find_camera_device('4k usb')
+        dev_int = _find_camera_device('integrated')
+
+        _CUSTOM_PRINT_FUNC(
+            f"[Camera] Devices — "
+            f"2K:/dev/video{dev_2k if dev_2k is not None else 'N/A'}  "
+            f"4K:/dev/video{dev_4k if dev_4k is not None else 'N/A'}  "
+            f"Integrated:/dev/video{dev_int if dev_int is not None else 'N/A'}"
+        )
+
+        self._grabber1 = _USBGrabber(dev_2k)   # Camera 1: 2K USB
+        self._grabber2 = _USBGrabber(dev_4k)   # Camera 2: 4K USB
+        self._grabber3 = _USBGrabber(dev_int)  # Camera 3: Integrated
 
     def remove_image(self, path=None):
         try:
@@ -263,76 +270,28 @@ class GH_Camera:
 
     # ==================== MJPEG LIVE STREAM GENERATORS ====================
 
-    def _mjpeg_usb_generator(self, device_idx, width=640, height=480):
-        cap = None
-        try:
-            cap = cv2.VideoCapture(device_idx, cv2.CAP_V4L2)
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            while True:
-                if self._capture_lock.locked():
-                    cap.release()
-                    time.sleep(0.5)
-                    cap = cv2.VideoCapture(device_idx, cv2.CAP_V4L2)
-                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-                    continue
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    time.sleep(0.1)
-                    continue
-                _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    def _mjpeg_from_grabber(self, grabber, target_fps=15):
+        """
+        Serve MJPEG frames from a persistent grabber thread.
+        No second VideoCapture open — reuses the grabber's shared JPEG buffer.
+        """
+        interval = 1.0 / target_fps
+        while True:
+            t0 = time.time()
+            jpeg = grabber.get_jpeg()
+            if jpeg:
                 yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                       + buf.tobytes() + b'\r\n')
-        except GeneratorExit:
-            pass
-        finally:
-            if cap is not None:
-                cap.release()
-
-    def _mjpeg_picamera_generator(self, cam_id=0, width=640, height=480):
-        if not PICAMERA2_AVAILABLE:
-            dev = _find_camera_device('4k usb') or 4
-            yield from self._mjpeg_usb_generator(dev, width, height)
-            return
-        cam = None
-        try:
-            cam = Picamera2(cam_id)
-            config = cam.create_video_configuration(
-                main={"size": (width, height), "format": "RGB888"}
-            )
-            cam.configure(config)
-            cam.start()
-            while True:
-                if self._capture_lock.locked():
-                    time.sleep(0.3)
-                    continue
-                frame = cam.capture_array()
-                if frame is None:
-                    time.sleep(0.05)
-                    continue
-                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                _, buf = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                       + buf.tobytes() + b'\r\n')
-        except GeneratorExit:
-            pass
-        finally:
-            if cam is not None:
-                try: cam.stop()
-                except Exception: pass
-                try: cam.close()
-                except Exception: pass
+                       + jpeg + b'\r\n')
+            elapsed = time.time() - t0
+            remaining = interval - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
 
     def stream_camera_1(self):
-        dev = _find_camera_device('2k usb') or 2
-        return self._mjpeg_usb_generator(dev)
+        return self._mjpeg_from_grabber(self._grabber1)
 
     def stream_camera_2(self):
-        return self._mjpeg_picamera_generator(cam_id=0)
+        return self._mjpeg_from_grabber(self._grabber2)
 
     def stream_camera_3(self):
-        dev = _find_camera_device('integrated') or 0
-        return self._mjpeg_usb_generator(dev)
+        return self._mjpeg_from_grabber(self._grabber3)
