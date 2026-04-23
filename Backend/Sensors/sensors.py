@@ -38,6 +38,8 @@ class GH_Sensors:
         self.electricity_sensor = ElectricitySensor()
         self.light_sensor = LightSensor(ads_sensor=self.__ads_sensor, ads_channels=self.__ads_channels, I2C=self.__general_i2c)
         self.water_flow_sensor = WaterFlowSensor(mongo_db_handler=mongo_db_handler)
+        self.fertilizer_flow_sensor = WaterFlowSensor(mongo_db_handler=mongo_db_handler) # Assuming similar flow sensor for fertilizer
+
 
     def set_water_flow_sensor_pin(self, pin):
         """Set up the water flow sensor with the specified pin"""
@@ -54,6 +56,22 @@ class GH_Sensors:
     def reset_water_amount(self):
         """Reset the total water amount to zero"""
         return self.water_flow_sensor.reset_water_amount()
+
+    def set_fertilizer_flow_sensor_pin(self, pin):
+        """Set up the fertilizer flow sensor with the specified pin"""
+        self.fertilizer_flow_sensor.set_water_flow_sensor_pin(pin)
+
+    def get_fertilizer_flow_rate(self):
+        """Get fertilizer flow rate in liters per minute"""
+        return self.fertilizer_flow_sensor.get_water_flow_rate()
+    
+    def get_total_fertilizer_amount(self):
+        """Get total fertilizer amount in liters"""
+        return self.fertilizer_flow_sensor.get_total_water_amount()
+    
+    def reset_fertilizer_amount(self):
+        """Reset the total fertilizer amount to zero"""
+        return self.fertilizer_flow_sensor.reset_water_amount()
 
     # Soil sensor functions - delegated to soil_sensor
     def set_soil_sensor_pins(self):

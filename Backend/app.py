@@ -58,7 +58,7 @@ mongo_db_handler = MongoDBHandler(MONGO_URI, MONGO_DB_NAME)
 # ── Hardware setup ────────────────────────────────────────────────────────────
 
 i2c = busio.I2C(board.SCL, board.SDA)
-
+fertilizer_flow_sensor_pin = 16
 env_sensors = GH_Sensors(i2c, mongo_db_handler=mongo_db_handler)
 env_sensors.set_dht22_pin(DHT22_PIN)
 env_sensors.set_soil_moisture_ads1115_channel(ADS1115_SOIL_CH)
@@ -70,6 +70,11 @@ try:
     env_sensors.set_water_flow_sensor_pin(WATER_FLOW_SENSOR_PIN)
 except OSError as e:
     _CUSTOM_PRINT_FUNC(f"[Warning] Water flow sensor GPIO busy ({e}) — continuing without it")
+
+try:
+    env_sensors.set_fertilizer_flow_sensor_pin(fertilizer_flow_sensor_pin)
+except OSError as e:
+    _CUSTOM_PRINT_FUNC(f"[Warning] Fertilizer flow sensor GPIO busy ({e}) — continuing without it")
 
 env_actuators = GH_Actuators(ESP32_I2C_ADDRESS, i2c, ESP32_ENDIANNESS)
 setpoints     = GH_Setpoints(mqtt_handler, mongo_db_handler, env_actuators)
@@ -112,7 +117,9 @@ time.sleep(1)
 _retry(lambda: env_actuators.setup_fan_esp32(pin=19, channel=3, timer_src=0, frequency=5000, duty_cycle=0),            "fan setup")
 time.sleep(5)
 _retry(lambda: env_actuators.setup_water_pump_esp32(pin=33, channel=4, timer_src=2, frequency=1000, duty_cycle=0),     "water pump setup")
-time.sleep(1)
+time.sleep(5)
+_retry(lambda: env_actuators.setup_fertilizer_pump_esp32(pin=25, channel=6, timer_src=2, frequency=1000, duty_cycle=0), "fertilizer pump setup")
+time.sleep(5)
 
 # ── MQTT subscriptions / publications ─────────────────────────────────────────
 
@@ -120,10 +127,12 @@ mqtt_handler.set_subscription("env_monitoring_system/actuators/heater/dc",     e
 mqtt_handler.set_subscription("env_monitoring_system/actuators/light/dc",      env_actuators.set_mqtt_dc_value_light_strip)
 mqtt_handler.set_subscription("env_monitoring_system/actuators/water_pump/dc", env_actuators.set_mqtt_dc_value_water_pump)
 mqtt_handler.set_subscription("env_monitoring_system/actuators/fan/dc",        env_actuators.set_mqtt_dc_value_fan)
+mqtt_handler.set_subscription("env_monitoring_system/actuators/fertilizer_pump/dc", env_actuators.set_mqtt_dc_value_fertilizer_pump)
 mqtt_handler.set_subscription("loops/setpoints/temperature",                   setpoints.set_temperature_setpoint)
 mqtt_handler.set_subscription("loops/setpoints/light_intensity",               setpoints.set_light_setpoint)
 mqtt_handler.set_subscription("loops/setpoints/soil_moisture",                 setpoints.set_soil_humidity_setpoint)
 mqtt_handler.set_subscription("loops/setpoints/water_flow",                    setpoints.set_water_flow_setpoint)
+mqtt_handler.set_subscription("loops/setpoints/fertilizer_flow",               setpoints.set_fertilizer_flow_setpoint)
 mqtt_handler.set_subscription("loops/setpoints/operation_mode",                setpoints.set_operation_mode)
 
 mqtt_handler.set_publish("env_monitoring_system/sensors/air_temperature_C", 0)
@@ -134,15 +143,17 @@ mqtt_handler.set_publish("env_monitoring_system/sensors/soil_ec",            0)
 mqtt_handler.set_publish("env_monitoring_system/sensors/soil_temp",          0)
 mqtt_handler.set_publish("env_monitoring_system/sensors/soil_humidity",      0)
 mqtt_handler.set_publish("env_monitoring_system/sensors/water_flow",         0)
+mqtt_handler.set_publish("env_monitoring_system/sensors/fertilizer_flow",    0)
 mqtt_handler.set_publish("env_monitoring_system/sensors/voltage",            0)
 mqtt_handler.set_publish("env_monitoring_system/sensors/current",            0)
 mqtt_handler.set_publish("env_monitoring_system/resources/energy",           0)
 mqtt_handler.set_publish("env_monitoring_system/resources/water_amount",     0)
+mqtt_handler.set_publish("env_monitoring_system/resources/fertilizer_amount", 0)
 mqtt_handler.set_publish("env_monitoring_system/actuators/heater/state",     0)
 mqtt_handler.set_publish("env_monitoring_system/actuators/light/state",      0)
 mqtt_handler.set_publish("env_monitoring_system/actuators/water_pump/state", 0)
 mqtt_handler.set_publish("env_monitoring_system/actuators/fan/state",        0)
-
+mqtt_handler.set_publish("env_monitoring_system/actuators/fertilizer_pump/state", 0)
 # ── MongoDB collections ───────────────────────────────────────────────────────
 
 mongo_db_handler.create_collection("sensors_data", "air temp",       mongo_db_handler.sensor_field_doc_temp("dht22.temperature",       "temperature", 0.0, "C"))
@@ -153,14 +164,17 @@ mongo_db_handler.create_collection("sensors_data", "soil ec",        mongo_db_ha
 mongo_db_handler.create_collection("sensors_data", "soil temp",      mongo_db_handler.sensor_field_doc_temp("soil_temp",               "temperature", 0.0, "C"))
 mongo_db_handler.create_collection("sensors_data", "soil humidity",  mongo_db_handler.sensor_field_doc_temp("soil_humidity",           "humidity",    0.0, "%"))
 mongo_db_handler.create_collection("sensors_data", "water flow",     mongo_db_handler.sensor_field_doc_temp("water_flow",              "flow",        0.0, "L/min"))
+mongo_db_handler.create_collection("sensors_data", "fertilizer flow", mongo_db_handler.sensor_field_doc_temp("fertilizer_flow",       "flow",        0.0, "L/min"))
 mongo_db_handler.create_collection("sensors_data", "voltage",        mongo_db_handler.sensor_field_doc_temp("pzem-004t.voltage",       "voltage",     0.0, "V"))
 mongo_db_handler.create_collection("sensors_data", "current",        mongo_db_handler.sensor_field_doc_temp("pzem-004t.current",       "current",     0.0, "A"))
 mongo_db_handler.create_collection("resources",    "energy consumption",  mongo_db_handler.resource_field_doc_temp("pzem-004t.energy",     "energy_consumption", 0.0, "Wh"))
 mongo_db_handler.create_collection("resources",    "water consumption",   mongo_db_handler.resource_field_doc_temp("water_flow.total_amount", "water_amount",   0.0, "L"))
+mongo_db_handler.create_collection("resources",    "fertilizer consumption", mongo_db_handler.resource_field_doc_temp("fertilizer_flow.total_amount", "fertilizer_amount", 0.0, "L"))
 mongo_db_handler.create_collection("actuators_data", "heater",       mongo_db_handler.actuator_field_doc_temp("heater",     "heater",     0))
 mongo_db_handler.create_collection("actuators_data", "light",        mongo_db_handler.actuator_field_doc_temp("light",      "light",      0))
 mongo_db_handler.create_collection("actuators_data", "water pump",   mongo_db_handler.actuator_field_doc_temp("water_pump", "water pump", 0))
 mongo_db_handler.create_collection("actuators_data", "fan",          mongo_db_handler.actuator_field_doc_temp("fan",        "fan",        0))
+mongo_db_handler.create_collection("actuators_data", "fertilizer pump", mongo_db_handler.actuator_field_doc_temp("fertilizer_pump", "fertilizer pump", 0))
 mongo_db_handler.create_collection("plant_images",   "plant image",  {"_id": "", "image": "", "timestamp": datetime.datetime.now()})
 
 # ── Other singletons ──────────────────────────────────────────────────────────
