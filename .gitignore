@@ -82,3 +82,4 @@ htmlcov/
 # Package files
 package-lock.json
 yarn.lock
+git_update_commands.sh
