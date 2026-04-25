@@ -33,6 +33,7 @@ class GH_Actuators:
         self.__light_strip_1_mqtt_dc_value = 0
         self.__light_strip_2_mqtt_dc_value = 0
         self.__water_pump_mqtt_dc_value = 0
+        self.__fertilizer_pump_mqtt_dc_value = 0
 
     def restart_esp32(self) -> bool:
         try:
@@ -240,6 +241,24 @@ class GH_Actuators:
             # _CUSTOM_PRINT_FUNC(f"Error setting water pump duty cycle: {e}")
             return False
 
+    def setup_fertilizer_pump_esp32(self, pin: int, channel: int, timer_src: int, frequency: int, duty_cycle: int) -> bool:
+        self.__fertilizer_pump_pin = pin
+        self.__fertilizer_pump_channel = channel
+        self.__fertilizer_pump_frequency = frequency
+        self.__fertilizer_pump_duty_cycle = duty_cycle
+        self.__fertilizer_pump_timer_src = timer_src
+        try:
+            return self.__send_init_request(pin, channel, timer_src, frequency, duty_cycle, "fertilizer_pump")
+        except Exception as e:
+            return False
+
+    def set_fertilizer_pump_duty_cycle(self, duty_cycle: int) -> bool:
+        try:
+            self.__fertilizer_pump_duty_cycle = duty_cycle
+            return self.__send_duty_cycle_update_request(duty_cycle, self.__fertilizer_pump_pin, self.__fertilizer_pump_channel, "fertilizer_pump")
+        except Exception as e:
+            return False
+
     # get current actuator duty cycles
     def get_water_pump_duty_cycle(self) -> int:
         try:
@@ -283,11 +302,24 @@ class GH_Actuators:
             _CUSTOM_PRINT_FUNC("Light strip 2 not initialized.")
             return 0
 
+    def get_fertilizer_pump_duty_cycle(self) -> int:
+        try:
+            return self.__fertilizer_pump_duty_cycle
+        except AttributeError:
+            _CUSTOM_PRINT_FUNC("Fertilizer pump not initialized.")
+            return 0
+
     def set_mqtt_dc_value_water_pump(self, mqtt_dc_value: int):
         self.__water_pump_mqtt_dc_value = mqtt_dc_value
-    
+
     def get_mqtt_dc_value_water_pump(self) -> int:
         return self.__water_pump_mqtt_dc_value
+
+    def set_mqtt_dc_value_fertilizer_pump(self, mqtt_dc_value: int):
+        self.__fertilizer_pump_mqtt_dc_value = mqtt_dc_value
+
+    def get_mqtt_dc_value_fertilizer_pump(self) -> int:
+        return self.__fertilizer_pump_mqtt_dc_value
 
     def set_mqtt_dc_value_heater(self, mqtt_dc_value: int):
         self.__heater_mqtt_dc_value = mqtt_dc_value
@@ -311,6 +343,9 @@ class GH_Actuators:
         try:
             # Set all duty cycles to 0
             while not self.set_water_pump_duty_cycle(0):
+                time.sleep(0.1)
+
+            while not self.set_fertilizer_pump_duty_cycle(0):
                 time.sleep(0.1)
 
             while not self.set_heater_duty_cycle(0):
