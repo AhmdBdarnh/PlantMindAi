@@ -1,13 +1,51 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 
 const CAMERAS = [
-  { id: 1, name: '2K USB Camera',    streamPath: '/video_c1' },
-  { id: 2, name: 'RPi / 4K Camera', streamPath: '/video_c2' },
-  { id: 3, name: 'Integrated Camera', streamPath: '/video_c3' },
+  { id: 1, displayId: 1, name: '2K USB Camera', streamPath: '/video_c1' },
+  { id: 2, displayId: 2, name: '4K USB Camera', streamPath: '/video_c2' },
+  { id: 4, displayId: 3, name: 'USB Webcam',    streamPath: '/video_c4' },
 ];
 
 function CamCard({ cam }) {
-  const [status, setStatus] = useState('connecting'); // connecting | live | error
+  const [status, setStatus]         = useState('connecting'); // connecting | live | error
+  const [capturing, setCapturing]   = useState(false);
+  const [captureMsg, setCaptureMsg] = useState(null); // null | { ok: bool, text: string }
+
+  // If no first frame arrives within 8 s, mark as unavailable
+  useEffect(() => {
+    if (status !== 'connecting') return;
+    const t = setTimeout(() => setStatus('error'), 8000);
+    return () => clearTimeout(t);
+  }, [status]);
+
+  const captureOne = async () => {
+    setCapturing(true);
+    setCaptureMsg(null);
+    try {
+      const res = await fetch(`/api/capture_local/${cam.id}`, { method: 'POST' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setCaptureMsg({ ok: false, text: data.error || 'Capture failed' });
+      } else {
+        const blob = await res.blob();
+        const disposition = res.headers.get('Content-Disposition') || '';
+        const nameMatch = disposition.match(/filename="?([^"]+)"?/);
+        const rawName = nameMatch ? nameMatch[1] : `cam${cam.id}_capture.jpg`;
+        const filename = rawName.replace(`cam${cam.id}_`, `cam${cam.displayId}_`);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(url);
+        setCaptureMsg({ ok: true, text: 'Saved' });
+      }
+    } catch (e) {
+      setCaptureMsg({ ok: false, text: e.message });
+    }
+    setCapturing(false);
+    setTimeout(() => setCaptureMsg(null), 3000);
+  };
 
   const dotColor = status === 'live' ? '#22c55e' : status === 'error' ? '#ef4444' : '#f59e0b';
   const dotGlow  = status === 'live' ? '0 0 6px #22c55e' : 'none';
@@ -38,7 +76,7 @@ function CamCard({ cam }) {
           transition: 'background .3s',
         }} />
         <span style={{ color: '#e2e8f0', fontWeight: 700, fontSize: 13 }}>
-          Camera {cam.id}
+          Camera {cam.displayId}
         </span>
         <span style={{ color: '#64748b', fontSize: 12 }}>{cam.name}</span>
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -64,6 +102,40 @@ function CamCard({ cam }) {
               Unavailable
             </span>
           )}
+
+          {/* Per-camera capture button */}
+          {captureMsg && (
+            <span style={{
+              fontSize: 11, fontWeight: 600,
+              color: captureMsg.ok ? '#22c55e' : '#ef4444',
+            }}>
+              {captureMsg.ok ? '✓' : '✗'} {captureMsg.text}
+            </span>
+          )}
+          <button
+            onClick={captureOne}
+            disabled={capturing || status === 'error'}
+            title="Capture frame"
+            style={{
+              display: 'flex', alignItems: 'center', gap: 4,
+              background: capturing ? '#1e3a5f' : 'rgba(37,99,235,.2)',
+              color: status === 'error' ? '#475569' : '#60a5fa',
+              border: '1px solid rgba(37,99,235,.35)',
+              borderRadius: 6,
+              padding: '3px 8px', fontSize: 11, fontWeight: 600,
+              cursor: (capturing || status === 'error') ? 'not-allowed' : 'pointer',
+              opacity: status === 'error' ? 0.4 : 1,
+              transition: 'background .2s',
+            }}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+              style={{ width: 12, height: 12 }}>
+              <path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"
+                strokeLinecap="round" strokeLinejoin="round"/>
+              <circle cx="12" cy="13" r="4" strokeLinecap="round"/>
+            </svg>
+            {capturing ? '…' : 'Capture'}
+          </button>
         </div>
       </div>
 
@@ -77,7 +149,7 @@ function CamCard({ cam }) {
         {status !== 'error' ? (
           <img
             src={cam.streamPath}
-            alt={`Camera ${cam.id}`}
+            alt={`Camera ${cam.displayId}`}
             onLoad={() => setStatus('live')}
             onError={() => setStatus('error')}
             style={{
@@ -122,7 +194,7 @@ function CamCard({ cam }) {
 }
 
 export default function LiveCams() {
-  const [capturing, setCapturing] = useState(false);
+  const [capturing, setCapturing]       = useState(false);
   const [captureResult, setCaptureResult] = useState(null);
 
   const captureAll = async () => {
@@ -155,7 +227,7 @@ export default function LiveCams() {
           Live Camera Feeds
         </span>
         <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-          3 cameras · MJPEG stream · ~15 FPS
+          3 cameras · MJPEG stream · ~30 FPS
         </span>
 
         {/* Capture button */}
@@ -204,12 +276,8 @@ export default function LiveCams() {
         </div>
       )}
 
-      {/* Grid */}
-      <div style={{
-        display: 'grid',
-        gridTemplateColumns: 'repeat(3, 1fr)',
-        gap: 16,
-      }}>
+      {/* Grid — 2×2 */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 16 }}>
         {CAMERAS.map(cam => <CamCard key={cam.id} cam={cam} />)}
       </div>
 
@@ -218,8 +286,12 @@ export default function LiveCams() {
           0%, 100% { opacity: 1; box-shadow: 0 0 8px #22c55e; }
           50%       { opacity: .4; box-shadow: 0 0 2px #22c55e; }
         }
-        @media (max-width: 900px) {
-          .livecams-grid { grid-template-columns: repeat(2,1fr) !important; }
+        @keyframes spin {
+          from { transform: rotate(0deg); }
+          to   { transform: rotate(360deg); }
+        }
+        @media (max-width: 700px) {
+          .livecams-bottom { grid-template-columns: 1fr !important; }
         }
       `}</style>
     </div>

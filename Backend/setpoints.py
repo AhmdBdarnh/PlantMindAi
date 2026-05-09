@@ -16,6 +16,7 @@ class GH_Setpoints:
         self.__soil_humidity_setpoint    = 70.0
         self.__soil_humidity_hysteresis  = 20.0
         self.__water_flow_setpoint       = 2.0
+        self.__fertilizer_flow_setpoint  = 0.5
         self.operation_mode              = "autonomous"
 
         self.__control_threads_events = {
@@ -38,6 +39,7 @@ class GH_Setpoints:
         self._load_from_mongo("soil_moisture",  lambda v: setattr(self, '_GH_Setpoints__soil_humidity_setpoint',   float(v)))
         self._load_from_mongo("soil_hysteresis",lambda v: setattr(self, '_GH_Setpoints__soil_humidity_hysteresis', float(v)))
         self._load_from_mongo("water_flow",     lambda v: setattr(self, '_GH_Setpoints__water_flow_setpoint',      float(v)))
+        self._load_from_mongo("fertilizer_flow",lambda v: setattr(self, '_GH_Setpoints__fertilizer_flow_setpoint', float(v)))
         self._load_from_mongo("operation_mode", lambda v: setattr(self, 'operation_mode',                          str(v)))
 
         _CUSTOM_PRINT_FUNC(f"[Setpoints] Loaded: {self.get_all_setpoints()}")
@@ -141,6 +143,11 @@ class GH_Setpoints:
         self._save("water_flow", value)
         _CUSTOM_PRINT_FUNC(f"[Setpoints] Water flow → {value} L/h")
 
+    def set_fertilizer_flow_setpoint(self, value: float) -> None:
+        self.__fertilizer_flow_setpoint = float(value)
+        self._save("fertilizer_flow", value)
+        _CUSTOM_PRINT_FUNC(f"[Setpoints] Fertilizer flow → {value} L/h")
+
     # ── Getters ────────────────────────────────────────────────────────────────
 
     def get_temperature_setpoint(self) -> float:
@@ -170,6 +177,9 @@ class GH_Setpoints:
     def get_water_flow_setpoint(self) -> float:
         return self.__water_flow_setpoint
 
+    def get_fertilizer_flow_setpoint(self) -> float:
+        return self.__fertilizer_flow_setpoint
+
     def get_all_setpoints(self) -> dict:
         return {
             "temperature":      self.__temperature_setpoint,
@@ -181,5 +191,6 @@ class GH_Setpoints:
             "soil_moisture":    self.__soil_humidity_setpoint,
             "soil_hysteresis":  self.__soil_humidity_hysteresis,
             "water_flow":       self.__water_flow_setpoint,
+            "fertilizer_flow":  self.__fertilizer_flow_setpoint,
             "operation_mode":   self.operation_mode,
         }

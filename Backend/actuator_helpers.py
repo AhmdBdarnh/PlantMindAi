@@ -12,6 +12,7 @@ _env_actuators = None
 _prev_light_dc_value     = 0
 _prev_heater_dc_value    = 0
 _prev_water_pump_dc_value = 0
+_prev_fertilizer_pump_dc_value = 0
 _prev_fan_dc_value       = 0
 
 
@@ -48,7 +49,7 @@ def set_all_heater_dc(duty_cycle=0):
 
 def set_actuators_manual_values():
     """Apply any MQTT-commanded duty-cycle changes that have not yet been sent to hardware."""
-    global _prev_light_dc_value, _prev_heater_dc_value, _prev_water_pump_dc_value, _prev_fan_dc_value
+    global _prev_light_dc_value, _prev_heater_dc_value, _prev_water_pump_dc_value, _prev_fertilizer_pump_dc_value, _prev_fan_dc_value
 
     if _prev_fan_dc_value != _env_actuators.get_mqtt_dc_value_fan():
         if not _env_actuators.set_fan_duty_cycle(_env_actuators.get_mqtt_dc_value_fan()):
@@ -73,3 +74,9 @@ def set_actuators_manual_values():
             _CUSTOM_PRINT_FUNC("Failed to set water pump duty cycle, retrying...")
             time.sleep(0.1)
         _prev_water_pump_dc_value = _env_actuators.get_mqtt_dc_value_water_pump()
+
+    if _prev_fertilizer_pump_dc_value != _env_actuators.get_mqtt_dc_value_fertilizer_pump():
+        if not _env_actuators.set_fertilizer_pump_duty_cycle(_env_actuators.get_mqtt_dc_value_fertilizer_pump()):
+            _CUSTOM_PRINT_FUNC("Failed to set fertilizer pump duty cycle, retrying...")
+            time.sleep(0.1)
+        _prev_fertilizer_pump_dc_value = _env_actuators.get_mqtt_dc_value_fertilizer_pump()

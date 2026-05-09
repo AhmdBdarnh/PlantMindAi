@@ -67,8 +67,10 @@ def init_routes(
 
             water_flow_semaphore.acquire()
             try:
-                water_flow   = env_sensors.get_water_flow_rate()
-                water_amount = env_sensors.get_total_water_amount()
+                water_flow        = env_sensors.get_water_flow_rate()
+                water_amount      = env_sensors.get_total_water_amount()
+                fertilizer_flow   = env_sensors.get_fertilizer_flow_rate()
+                fertilizer_amount = env_sensors.get_total_fertilizer_amount()
             finally:
                 water_flow_semaphore.release()
 
@@ -82,8 +84,10 @@ def init_routes(
                     'soil_ec':         round(soil_ec, 2),
                     'soil_humidity':   round(soil_humidity, 2),
                     'soil_temperature':round(soil_temp, 2),
-                    'water_flow':      round(water_flow, 2),
-                    'water_amount':    round(water_amount, 2),
+                    'water_flow':        round(water_flow, 2),
+                    'water_amount':      round(water_amount, 2),
+                    'fertilizer_flow':   round(fertilizer_flow, 2),
+                    'fertilizer_amount': round(fertilizer_amount, 2),
                     'voltage':         round(voltage, 2),
                     'current':         round(current, 2),
                     'power':           round(power, 2),
@@ -105,6 +109,7 @@ def init_routes(
             light_dc  = env_actuators.get_light_strip_1_duty_cycle()
             fan_dc    = env_actuators.get_fan_duty_cycle()
             pump_dc   = env_actuators.get_water_pump_duty_cycle()
+            fert_dc   = env_actuators.get_fertilizer_pump_duty_cycle()
 
             return jsonify({
                 'success': True,
@@ -128,6 +133,11 @@ def init_routes(
                         'duty_cycle': pump_dc,
                         'percentage': round((pump_dc / 4095) * 100, 2),
                         'state':      'on' if pump_dc > 0 else 'off',
+                    },
+                    'fertilizer_pump': {
+                        'duty_cycle': fert_dc,
+                        'percentage': round((fert_dc / 4095) * 100, 2),
+                        'state':      'on' if fert_dc > 0 else 'off',
                     },
                 },
             })
@@ -218,6 +228,28 @@ def init_routes(
                 return jsonify({'success': False, 'error': 'Failed to set water pump'}), 500
 
             env_actuators.set_mqtt_dc_value_water_pump(duty_cycle)
+            return jsonify({'success': True, 'duty_cycle': duty_cycle})
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @bp.route('/api/actuators/fertilizer_pump', methods=['POST'])
+    def control_fertilizer_pump():
+        """Control fertilizer pump — expects {state: 'on'/'off'} or {duty_cycle: 0-4095}."""
+        try:
+            data = request.get_json()
+            if 'state' in data:
+                duty_cycle = 2048 if data['state'] == 'on' else 0
+            elif 'duty_cycle' in data:
+                duty_cycle = int(data['duty_cycle'])
+            else:
+                return jsonify({'success': False, 'error': 'Missing state or duty_cycle'}), 400
+
+            duty_cycle = max(0, min(4095, duty_cycle))
+
+            if not env_actuators.set_fertilizer_pump_duty_cycle(duty_cycle):
+                return jsonify({'success': False, 'error': 'Failed to set fertilizer pump'}), 500
+
+            env_actuators.set_mqtt_dc_value_fertilizer_pump(duty_cycle)
             return jsonify({'success': True, 'duty_cycle': duty_cycle})
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
@@ -424,7 +456,7 @@ def init_routes(
         os.makedirs(save_dir, exist_ok=True)
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         saved = []
-        for cam_id in (1, 2, 3):
+        for cam_id in (1, 2, 4):
             jpeg = camera.get_frame_jpeg(cam_id)
             if jpeg:
                 filename = f'cam{cam_id}_{timestamp}.jpg'
@@ -436,6 +468,30 @@ def init_routes(
                 saved.append({'camera_id': cam_id, 'file': None, 'success': False, 'error': 'No frame available'})
         return jsonify({'success': True, 'timestamp': timestamp, 'captures': saved})
 
+    @bp.route('/api/capture_local/<int:cam_id>', methods=['POST'])
+    def capture_local_single(cam_id):
+        """Capture one frame from a single camera, save locally, and return the JPEG."""
+        import os, datetime
+        if cam_id not in (1, 2, 4):
+            return jsonify({'success': False, 'error': 'Invalid camera id'}), 400
+        jpeg = camera.get_frame_jpeg(cam_id)
+        if not jpeg:
+            return jsonify({'success': False, 'error': 'No frame available'}), 503
+        save_dir = os.path.join(os.path.dirname(__file__), 'captures')
+        os.makedirs(save_dir, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'cam{cam_id}_{timestamp}.jpg'
+        filepath = os.path.join(save_dir, filename)
+        with open(filepath, 'wb') as f:
+            f.write(jpeg)
+        from flask import send_file
+        return send_file(
+            filepath,
+            mimetype='image/jpeg',
+            as_attachment=True,
+            download_name=filename,
+        )
+
     # ── Web / camera stream routes ────────────────────────────────────────────
 
     @bp.route('/')
@@ -444,23 +500,29 @@ def init_routes(
 
     @bp.route('/video_c1')
     def stream_c1():
+        if not camera.is_camera_available(1):
+            return Response(status=503)
         return Response(camera.stream_camera_1(),
                         mimetype='multipart/x-mixed-replace; boundary=frame')
 
     @bp.route('/video_c2')
     def stream_c2():
+        if not camera.is_camera_available(2):
+            return Response(status=503)
         return Response(camera.stream_camera_2(),
                         mimetype='multipart/x-mixed-replace; boundary=frame')
 
-    @bp.route('/video_c3')
-    def stream_c3():
-        return Response(camera.stream_camera_3(),
+    @bp.route('/video_c4')
+    def stream_c4():
+        if not camera.is_camera_available(4):
+            return Response(status=503)
+        return Response(camera.stream_camera_4(),
                         mimetype='multipart/x-mixed-replace; boundary=frame')
 
     @bp.route('/api/frame/<int:cam_id>')
     def get_frame(cam_id):
         """Return a single JPEG frame for polling-based live view."""
-        if cam_id not in (1, 2, 3):
+        if cam_id not in (1, 2, 4):
             return jsonify({'error': 'Invalid camera id'}), 400
         jpeg = camera.get_frame_jpeg(cam_id)
         if jpeg is None:

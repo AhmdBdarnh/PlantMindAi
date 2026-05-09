@@ -141,3 +141,66 @@ Backend/
 | `tests/test_water_pump_and_sensor.py` | ESP32 pump init + flow sensor read together | `venv/bin/python3 tests/test_water_pump_and_sensor.py` |
 
 > Stop the backend before running standalone tests (both need GPIO 12 and I2C).
+
+---
+
+## MQTT — fertilizer topics
+
+Broker: `MQTT_HOST:MQTT_PORT` from `config.py` (HiveMQ cloud, TLS on 8883).
+Replace `<USER>` / `<PASS>` with the credentials in your `.env`.
+
+### Topics
+
+| Direction | Topic | Payload | Source |
+|---|---|---|---|
+| Subscribe (command) | `env_monitoring_system/actuators/fertilizer_pump/dc` | int duty cycle `0–4095` | `app.py:130` → `set_mqtt_dc_value_fertilizer_pump` |
+| Subscribe (setpoint) | `loops/setpoints/fertilizer_flow` | float L/h | `app.py:135` → `set_fertilizer_flow_setpoint` |
+| Publish (sensor) | `env_monitoring_system/sensors/fertilizer_flow` | float L/min | `app.py:146` |
+| Publish (resource) | `env_monitoring_system/resources/fertilizer_amount` | float L (cumulative) | `app.py:151` |
+| Publish (state) | `env_monitoring_system/actuators/fertilizer_pump/state` | int duty cycle | `app.py:156` |
+
+### `mosquitto_pub` — send commands to the backend
+
+```bash
+# Set fertilizer pump duty cycle (0–4095)
+mosquitto_pub -h "$MQTT_HOST" -p 8883 --capath /etc/ssl/certs \
+  -u "<USER>" -P "<PASS>" \
+  -t "env_monitoring_system/actuators/fertilizer_pump/dc" -m "2048"
+
+# Stop the fertilizer pump
+mosquitto_pub -h "$MQTT_HOST" -p 8883 --capath /etc/ssl/certs \
+  -u "<USER>" -P "<PASS>" \
+  -t "env_monitoring_system/actuators/fertilizer_pump/dc" -m "0"
+
+# Update the fertilizer flow setpoint (L/h)
+mosquitto_pub -h "$MQTT_HOST" -p 8883 --capath /etc/ssl/certs \
+  -u "<USER>" -P "<PASS>" \
+  -t "loops/setpoints/fertilizer_flow" -m "0.5"
+```
+
+### `mosquitto_sub` — listen to backend telemetry
+
+```bash
+# Live fertilizer flow rate (L/min)
+mosquitto_sub -h "$MQTT_HOST" -p 8883 --capath /etc/ssl/certs \
+  -u "<USER>" -P "<PASS>" \
+  -t "env_monitoring_system/sensors/fertilizer_flow"
+
+# Cumulative fertilizer dispensed (L)
+mosquitto_sub -h "$MQTT_HOST" -p 8883 --capath /etc/ssl/certs \
+  -u "<USER>" -P "<PASS>" \
+  -t "env_monitoring_system/resources/fertilizer_amount"
+
+# Fertilizer pump duty cycle (state)
+mosquitto_sub -h "$MQTT_HOST" -p 8883 --capath /etc/ssl/certs \
+  -u "<USER>" -P "<PASS>" \
+  -t "env_monitoring_system/actuators/fertilizer_pump/state"
+
+# All fertilizer topics at once
+mosquitto_sub -h "$MQTT_HOST" -p 8883 --capath /etc/ssl/certs \
+  -u "<USER>" -P "<PASS>" \
+  -t "env_monitoring_system/+/fertilizer_pump/+" \
+  -t "env_monitoring_system/sensors/fertilizer_flow" \
+  -t "env_monitoring_system/resources/fertilizer_amount" \
+  -t "loops/setpoints/fertilizer_flow" -v
+```

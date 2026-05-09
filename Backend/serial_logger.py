@@ -10,18 +10,19 @@ latest_data = {
     "timestamp": "N/A",
     "temperature": "N/A", "humidity": "N/A",
     "soil_ph": "N/A", "soil_ec": "N/A", "soil_temp": "N/A", "soil_humidity": "N/A",
-    "water_flow": "N/A", 
+    "water_flow": "N/A", "fertilizer_flow": "N/A",
     "electricity_voltage": "N/A", "electricity_current": "N/A", "electricity_power": "N/A",
     "electricity_energy": "N/A", "electricity_frequency": "N/A", "electricity_pf": "N/A",
     "electricity_alarm": "N/A",
     "light_intensity": "N/A",
     "heater_dc": "N/A", "heater_fan_dc": "N/A", "light_strip_1_dc": "N/A",
-    "light_strip_2_dc": "N/A", "water_pump_dc": "N/A", "fan_dc": "N/A",
+    "light_strip_2_dc": "N/A", "water_pump_dc": "N/A", "fertilizer_pump_dc": "N/A", "fan_dc": "N/A",
     "mode": "N/A",
     "temp_sp": "N/A", "hum_sp": "N/A", "light_sp": "N/A",
     "soil_ph_sp": "N/A", "soil_ec_sp": "N/A", "soil_temp_sp": "N/A",
     "soil_hum_sp": "N/A", "flow_sp": "N/A",
     "water_consumed": 0.0, # Initialize cumulative water
+    "fertilizer_consumed": 0.0, # Initialize cumulative fertilizer
     "last_resource_reset": "Never", # Store last resource reset time
     "last_update_readings": "Never" # Store last update time for readings
 }
@@ -35,6 +36,7 @@ def serial_logger_task(sensors, get_last_sensor_update_fun, actuators, setpoints
     
     # Initialize cumulative water consumption within the task scope
     cumulative_water_liters = 0.0
+    cumulative_fertilizer_liters = 0.0
     
     last_read_datetimes = {
         "temp_humidity": datetime.datetime.min,
@@ -116,19 +118,26 @@ def serial_logger_task(sensors, get_last_sensor_update_fun, actuators, setpoints
                     if isinstance(flow, (int, float)):
                         current_state["water_flow"] = flow
                         # Add water consumed in the last second (flow L/min * 1 min/60 sec * 1 sec)
-                        cumulative_water_liters = sensors.get_total_water_amount() 
+                        cumulative_water_liters = sensors.get_total_water_amount()
                     else:
                         current_state["water_flow"] = "Read Error"
-                except Exception as e: print(f"Logger Error reading Flow: {e}"); current_state["water_flow"] = "Exception"
-                finally: 
+                    fert_flow = sensors.get_fertilizer_flow_rate() # L/min
+                    if isinstance(fert_flow, (int, float)):
+                        current_state["fertilizer_flow"] = fert_flow
+                        cumulative_fertilizer_liters = sensors.get_total_fertilizer_amount()
+                    else:
+                        current_state["fertilizer_flow"] = "Read Error"
+                except Exception as e: print(f"Logger Error reading Flow: {e}"); current_state["water_flow"] = "Exception"; current_state["fertilizer_flow"] = "Exception"
+                finally:
                     if acquired: flow_sem.release()
                 last_read_datetimes["flow"] = now
-            else: 
-                with data_lock: current_state["water_flow"] = latest_data["water_flow"]
+            else:
+                with data_lock: current_state["water_flow"] = latest_data["water_flow"]; current_state["fertilizer_flow"] = latest_data["fertilizer_flow"]
         else:
-            with data_lock: current_state["water_flow"] = latest_data["water_flow"]
-        # Store cumulative water in state for display
-        current_state["water_consumed"] = cumulative_water_liters 
+            with data_lock: current_state["water_flow"] = latest_data["water_flow"]; current_state["fertilizer_flow"] = latest_data["fertilizer_flow"]
+        # Store cumulative water/fertilizer in state for display
+        current_state["water_consumed"] = cumulative_water_liters
+        current_state["fertilizer_consumed"] = cumulative_fertilizer_liters
         # Store last resource reset time
         current_state["last_resource_reset"] = sensors.get_last_resource_reset_time()
         # Store last update time for readings
@@ -192,12 +201,15 @@ def serial_logger_task(sensors, get_last_sensor_update_fun, actuators, setpoints
             try: current_state["water_pump_dc"] = actuators.get_water_pump_duty_cycle()
             except AttributeError: current_state["water_pump_dc"] = "Not Impl."
             except Exception as e: print(f"Logger Error reading Pump DC: {e}"); current_state["water_pump_dc"] = "Error"
+            try: current_state["fertilizer_pump_dc"] = actuators.get_fertilizer_pump_duty_cycle()
+            except AttributeError: current_state["fertilizer_pump_dc"] = "Not Impl."
+            except Exception as e: print(f"Logger Error reading Fertilizer Pump DC: {e}"); current_state["fertilizer_pump_dc"] = "Error"
             try: current_state["fan_dc"] = actuators.get_fan_duty_cycle()
             except AttributeError: current_state["fan_dc"] = "Not Impl."
             except Exception as e: print(f"Logger Error reading Fan DC: {e}"); current_state["fan_dc"] = "Error"
             last_read_datetimes["actuators"] = now
         else:
-            with data_lock: current_state["heater_dc"] = latest_data["heater_dc"]; current_state["heater_fan_dc"] = latest_data["heater_fan_dc"]; current_state["light_strip_1_dc"] = latest_data["light_strip_1_dc"]; current_state["light_strip_2_dc"] = latest_data["light_strip_2_dc"]; current_state["water_pump_dc"] = latest_data["water_pump_dc"]; current_state["fan_dc"] = latest_data["fan_dc"]
+            with data_lock: current_state["heater_dc"] = latest_data["heater_dc"]; current_state["heater_fan_dc"] = latest_data["heater_fan_dc"]; current_state["light_strip_1_dc"] = latest_data["light_strip_1_dc"]; current_state["light_strip_2_dc"] = latest_data["light_strip_2_dc"]; current_state["water_pump_dc"] = latest_data["water_pump_dc"]; current_state["fertilizer_pump_dc"] = latest_data["fertilizer_pump_dc"]; current_state["fan_dc"] = latest_data["fan_dc"]
 
         # --- Read Mode and Setpoints (1s) --- 
         if now >= last_read_datetimes["setpoints"] + intervals["setpoints"]:
@@ -254,6 +266,7 @@ def serial_logger_task(sensors, get_last_sensor_update_fun, actuators, setpoints
             ("Light Intensity", "light_intensity", "Lux"), ("Soil pH", "soil_ph", "pH"),
             ("Soil EC", "soil_ec", "uS/cm"), ("Soil Temp", "soil_temp", "C"),
             ("Soil Humidity", "soil_humidity", "%"), ("Water Flow", "water_flow", "L/min"),
+            ("Fertilizer Flow", "fertilizer_flow", "L/min"),
             ("Voltage", "electricity_voltage", "V"), ("Current", "electricity_current", "A"),
             ("Power", "electricity_power", "W"), ("Energy", "electricity_energy", "Wh"), # Display instantaneous energy here
             ("Frequency", "electricity_frequency", "Hz"), ("Power Factor", "electricity_pf", "PF"),
@@ -269,7 +282,8 @@ def serial_logger_task(sensors, get_last_sensor_update_fun, actuators, setpoints
         actuators_to_print = [
             ("Heater", "heater_dc"), ("Heater Fan", "heater_fan_dc"),
             ("Light Strip 1", "light_strip_1_dc"), ("Light Strip 2", "light_strip_2_dc"),
-            ("Water Pump", "water_pump_dc"), ("Cooling Fan", "fan_dc")
+            ("Water Pump", "water_pump_dc"), ("Fertilizer Pump", "fertilizer_pump_dc"),
+            ("Cooling Fan", "fan_dc")
         ]
         for name, key in actuators_to_print:
             dc = current_state.get(key, "N/A")
@@ -313,6 +327,7 @@ def serial_logger_task(sensors, get_last_sensor_update_fun, actuators, setpoints
         right_bottom_lines.append(right_sep)
         resources_to_print = [
             ("Water Consumed", "water_consumed", "L"),
+            ("Fertilizer Consumed", "fertilizer_consumed", "L"),
             ("Energy Consumed", "electricity_energy", "Wh"), # Get latest cumulative energy reading
             ("Last Resource Reset", "last_resource_reset", ""), # Not printing this as it is a datetime
             ("Last Update Readings", "last_update_readings", "") # Not printing this as it is a datetime

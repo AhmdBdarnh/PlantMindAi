@@ -137,6 +137,39 @@ export default function ResourceConsumption({ sensors, sensorHistory }) {
           <LineChart data={sensorHistory} dataKey="water_amount" color="#06b6d4" height={100} />
         </div>
       </div>
+
+      {/* ── Fertilizer ── */}
+      <div className="resource-big-card page-section">
+        <div className="resource-section-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/>
+            <path d="M8 12h8M12 8v8"/>
+          </svg>
+          Fertilizer Consumption
+          <span className="status-badge status-badge-green" style={{ marginLeft: 'auto', fontWeight: 600 }}>
+            Live
+          </span>
+        </div>
+
+        <div className="resource-metrics">
+          <MetricBox label="Flow Rate"    value={fmtN(s.fertilizer_flow)}   unit="L/min" big />
+          <MetricBox label="Total Volume" value={fmtN(s.fertilizer_amount)} unit="L"     />
+        </div>
+
+        <div>
+          <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 4 }}>
+            Flow rate (L/min) over time
+          </div>
+          <LineChart data={sensorHistory} dataKey="fertilizer_flow" color="#16a34a" height={110} />
+        </div>
+
+        <div style={{ marginTop: 16 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 4 }}>
+            Fertilizer amount accumulated (L)
+          </div>
+          <LineChart data={sensorHistory} dataKey="fertilizer_amount" color="#84cc16" height={100} />
+        </div>
+      </div>
     </div>
   );
 }

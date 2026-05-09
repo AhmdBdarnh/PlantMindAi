@@ -14,6 +14,15 @@ const ACTUATORS = [
     icon:       'M12 2.69l5.66 5.66a8 8 0 11-11.31 0L12 2.69z',
   },
   {
+    key:        'fertilizer_pump',
+    label:      'Fertilizer Pump',
+    sliderLabel:'Flow Rate',
+    iconBg:     '#f0fdf4',
+    iconColor:  '#16a34a',
+    accentColor:'#16a34a',
+    icon:       'M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18m0 0h10a2 2 0 002-2v-4M9 21H5a2 2 0 01-2-2v-4m0 0h18',
+  },
+  {
     key:        'fan',
     label:      'Ventilator',
     sliderLabel:'Fan Speed',

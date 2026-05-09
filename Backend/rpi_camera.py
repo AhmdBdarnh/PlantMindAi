@@ -5,6 +5,20 @@ except Exception:
     PICAMERA2_AVAILABLE = False
     print("Warning: picamera2 not available. RPi CSI camera will not work.")
 
+
+def _detect_csi_camera() -> bool:
+    """Return True only if a native CSI camera (not USB) is detected by libcamera."""
+    if not PICAMERA2_AVAILABLE:
+        return False
+    try:
+        cameras = Picamera2.global_camera_info()
+        return any('usb' not in c.get('Id', '').lower() for c in cameras)
+    except Exception:
+        return False
+
+
+CSI_CAMERA_AVAILABLE = _detect_csi_camera()
+
 import time
 import datetime
 import os
@@ -50,8 +64,11 @@ class _USBGrabber:
     cameras that are not connected.
     """
 
-    def __init__(self, dev_idx):
+    def __init__(self, dev_idx, resolution=(640, 480), quality=75, fps=30):
         self._dev = dev_idx       # None means camera not found/connected
+        self._resolution = resolution
+        self._quality = quality
+        self._fps = fps
         self._jpeg = None
         self._lock = threading.Lock()
         if dev_idx is not None:
@@ -61,8 +78,9 @@ class _USBGrabber:
         while True:
             cap = cv2.VideoCapture(self._dev, cv2.CAP_V4L2)
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._resolution[0])
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._resolution[1])
+            cap.set(cv2.CAP_PROP_FPS, self._fps)
             if not cap.isOpened():
                 cap.release()
                 time.sleep(5)
@@ -75,17 +93,68 @@ class _USBGrabber:
                     time.sleep(0.1)
                     continue
                 consecutive_failures = 0
-                _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, self._quality])
                 with self._lock:
                     self._jpeg = buf.tobytes()
             cap.release()
             time.sleep(2)
+
+    def is_available(self) -> bool:
+        return self._dev is not None
 
     def get_jpeg(self) -> "bytes | None":
         with self._lock:
             return self._jpeg
 
 
+
+
+class _PiCameraGrabber:
+    """
+    Background thread: keeps the RPi CSI camera open via picamera2 and
+    continuously stores the latest frame as JPEG.
+    """
+
+    def __init__(self, cam_id=0):
+        self._cam_id = cam_id
+        self._jpeg = None
+        self._lock = threading.Lock()
+        if CSI_CAMERA_AVAILABLE:
+            threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while True:
+            cam = None
+            try:
+                cam = Picamera2(self._cam_id)
+                config = cam.create_video_configuration(
+                    main={"size": (640, 480), "format": "RGB888"}
+                )
+                cam.configure(config)
+                cam.start()
+                while True:
+                    frame = cam.capture_array()
+                    if frame is not None and frame.size > 0:
+                        _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                        with self._lock:
+                            self._jpeg = buf.tobytes()
+                    time.sleep(1.0 / 30)
+            except Exception as e:
+                _CUSTOM_PRINT_FUNC(f"[PiCamera] grabber error: {e}")
+            finally:
+                if cam is not None:
+                    try: cam.stop()
+                    except Exception: pass
+                    try: cam.close()
+                    except Exception: pass
+            time.sleep(5)
+
+    def is_available(self) -> bool:
+        return CSI_CAMERA_AVAILABLE
+
+    def get_jpeg(self) -> "bytes | None":
+        with self._lock:
+            return self._jpeg
 
 
 # ==================== MAIN CAMERA CLASS ====================
@@ -106,18 +175,23 @@ class GH_Camera:
         # Returns None if the camera is not connected — grabber will be a no-op.
         dev_2k  = _find_camera_device('2k usb')
         dev_4k  = _find_camera_device('4k usb')
-        dev_int = _find_camera_device('integrated')
+        dev_web = _find_camera_device('usb-webcam')
 
         _CUSTOM_PRINT_FUNC(
             f"[Camera] Devices — "
             f"2K:/dev/video{dev_2k if dev_2k is not None else 'N/A'}  "
             f"4K:/dev/video{dev_4k if dev_4k is not None else 'N/A'}  "
-            f"Integrated:/dev/video{dev_int if dev_int is not None else 'N/A'}"
+            f"Webcam:/dev/video{dev_web if dev_web is not None else 'N/A'}"
         )
 
-        self._grabber1 = _USBGrabber(dev_2k)   # Camera 1: 2K USB
-        self._grabber2 = _USBGrabber(dev_4k)   # Camera 2: 4K USB
-        self._grabber3 = _USBGrabber(dev_int)  # Camera 3: Integrated
+        self._grabber1 = _USBGrabber(dev_2k, resolution=(2560, 1440), quality=90, fps=30)  # Camera 1: 2K USB
+        self._grabber2 = _USBGrabber(dev_4k, resolution=(1280,  720), quality=80, fps=15)  # Camera 2: 4K USB
+        self._grabber4 = _USBGrabber(dev_web, resolution=(1280,  720), quality=80, fps=30)  # Camera 4: USB Webcam
+
+    def is_camera_available(self, cam_id: int) -> bool:
+        grabbers = {1: self._grabber1, 2: self._grabber2, 4: self._grabber4}
+        g = grabbers.get(cam_id)
+        return g is not None and g.is_available()
 
     def remove_image(self, path=None):
         try:
@@ -222,7 +296,7 @@ class GH_Camera:
         configs = [
             (1, self._grabber1, '2K USB Camera'),
             (2, self._grabber2, '4K USB Camera'),
-            (3, self._grabber3, 'Integrated Camera'),
+            (4, self._grabber4, 'USB Webcam'),
         ]
         results = []
         for cam_id, grabber, name in configs:
@@ -262,15 +336,15 @@ class GH_Camera:
                 return self._grabber1.get_jpeg()
             elif cam_id == 2:
                 return self._grabber2.get_jpeg()
-            elif cam_id == 3:
-                return self._grabber3.get_jpeg()
+            elif cam_id == 4:
+                return self._grabber4.get_jpeg()
         except Exception as e:
             _CUSTOM_PRINT_FUNC(f"[Camera {cam_id}] get_frame_jpeg error: {e}")
         return None
 
     # ==================== MJPEG LIVE STREAM GENERATORS ====================
 
-    def _mjpeg_from_grabber(self, grabber, target_fps=15):
+    def _mjpeg_from_grabber(self, grabber, target_fps=30):
         """
         Serve MJPEG frames from a persistent grabber thread.
         No second VideoCapture open — reuses the grabber's shared JPEG buffer.
@@ -293,5 +367,5 @@ class GH_Camera:
     def stream_camera_2(self):
         return self._mjpeg_from_grabber(self._grabber2)
 
-    def stream_camera_3(self):
-        return self._mjpeg_from_grabber(self._grabber3)
+    def stream_camera_4(self):
+        return self._mjpeg_from_grabber(self._grabber4)

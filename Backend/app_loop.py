@@ -89,6 +89,7 @@ def app_task():
     prev_heater_fan_duty_cycle = 0.0
     prev_fan_duty_cycle        = 0.0
     prev_water_pump_duty_cycle = 0.0
+    prev_fertilizer_pump_duty_cycle = 0.0
 
     while True:
         # ── Sensor reads every 10 s ───────────────────────────────────────────
@@ -155,26 +156,33 @@ def app_task():
             try:
                 _wf = _env_sensors.get_water_flow_rate()
                 _wa = _env_sensors.get_total_water_amount()
+                _ff = _env_sensors.get_fertilizer_flow_rate()
+                _fa = _env_sensors.get_total_fertilizer_amount()
             finally:
                 _wf_sem.release()
 
+            _mqtt_handler.publish("env_monitoring_system/sensors/fertilizer_flow",     _ff)
+            _mqtt_handler.publish("env_monitoring_system/resources/fertilizer_amount", _fa)
+
             with _sensor_cache_lock:
                 _sensor_cache.update({
-                    'air_temperature':  air_temp_c,
-                    'air_humidity':     air_humidity,
-                    'light_intensity':  light_intensity,
-                    'soil_ph':          soil_ph,
-                    'soil_ec':          soil_ec,
-                    'soil_humidity':    soil_humidity,
-                    'soil_temperature': soil_temp,
-                    'water_flow':       _wf,
-                    'water_amount':     _wa,
-                    'voltage':          voltage,
-                    'current':          current,
-                    'power':            power,
-                    'energy':           energy,
-                    'frequency':        frequency,
-                    'power_factor':     power_factor,
+                    'air_temperature':   air_temp_c,
+                    'air_humidity':      air_humidity,
+                    'light_intensity':   light_intensity,
+                    'soil_ph':           soil_ph,
+                    'soil_ec':           soil_ec,
+                    'soil_humidity':     soil_humidity,
+                    'soil_temperature':  soil_temp,
+                    'water_flow':        _wf,
+                    'water_amount':      _wa,
+                    'fertilizer_flow':   _ff,
+                    'fertilizer_amount': _fa,
+                    'voltage':           voltage,
+                    'current':           current,
+                    'power':             power,
+                    'energy':            energy,
+                    'frequency':         frequency,
+                    'power_factor':      power_factor,
                 })
 
         # ── Resource log & reset every N hours ───────────────────────────────
@@ -221,7 +229,8 @@ def app_task():
         if (datetime.datetime.now() - last_actuators_update).total_seconds() > 1:
             last_actuators_update = datetime.datetime.now()
 
-            actuator_helpers.set_actuators_manual_values()
+            if _setpoints.get_operation_mode() == 'manual':
+                actuator_helpers.set_actuators_manual_values()
 
             _wf_sem.acquire()
             try:
@@ -236,6 +245,7 @@ def app_task():
             heater_duty_cycle      = _env_actuators.get_heater_duty_cycle()
             light_duty_cycle       = _env_actuators.get_light_strip_1_duty_cycle()
             water_pump_duty_cycle  = _env_actuators.get_water_pump_duty_cycle()
+            fertilizer_pump_duty_cycle = _env_actuators.get_fertilizer_pump_duty_cycle()
             fan_duty_cycle         = _env_actuators.get_fan_duty_cycle()
 
             if heater_duty_cycle != prev_heater_duty_cycle:
@@ -276,6 +286,19 @@ def app_task():
                         f'On at {water_pump_duty_cycle * 100 / 4095:.2f}%',
                     )
                 _mongo_db.insert_actuator_data("water pump", water_pump_duty_cycle)
+
+            if fertilizer_pump_duty_cycle != prev_fertilizer_pump_duty_cycle:
+                prev_fertilizer_pump_duty_cycle = fertilizer_pump_duty_cycle
+                if fertilizer_pump_duty_cycle == 0:
+                    _mqtt_handler.publish(
+                        "env_monitoring_system/actuators/fertilizer_pump/state", 'Off'
+                    )
+                else:
+                    _mqtt_handler.publish(
+                        "env_monitoring_system/actuators/fertilizer_pump/state",
+                        f'On at {fertilizer_pump_duty_cycle * 100 / 4095:.2f}%',
+                    )
+                _mongo_db.insert_actuator_data("fertilizer pump", fertilizer_pump_duty_cycle)
 
             if fan_duty_cycle != prev_fan_duty_cycle:
                 prev_fan_duty_cycle = fan_duty_cycle
