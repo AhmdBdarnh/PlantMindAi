@@ -26,7 +26,6 @@ from rpi_camera         import GH_Camera
 from setpoints          import GH_Setpoints
 from plant_health       import PlantHealthChecker
 from serial_logger      import serial_logger_task
-from ph_pump_handler    import PHPumpHandler
 
 import actuator_helpers
 import capture_manager
@@ -180,7 +179,6 @@ mongo_db_handler.create_collection("plant_images",   "plant image",  {"_id": "",
 # ── Other singletons ──────────────────────────────────────────────────────────
 
 s3_handler          = S3Handler(AWS_S3_BUCKET, AWS_REGION)
-ph_pump             = PHPumpHandler()
 plant_health_checker = PlantHealthChecker()
 camera              = GH_Camera()
 
@@ -197,6 +195,9 @@ light_pause_event.set()
 soil_semaphore   = threading.Semaphore(1)
 soil_pause_event = threading.Event()
 soil_pause_event.set()
+
+fertilizer_pause_event = threading.Event()
+fertilizer_pause_event.set()
 
 electricity_semaphore   = threading.Semaphore(1)
 electricity_pause_event = threading.Event()
@@ -227,7 +228,7 @@ CORS(app)
 
 routes.init_routes(
     app,
-    env_sensors, env_actuators, setpoints, ph_pump,
+    env_sensors, env_actuators, setpoints,
     camera, s3_handler, mongo_db_handler,
     temperature_semaphore, light_semaphore, soil_semaphore,
     electricity_semaphore, water_flow_semaphore,
@@ -245,10 +246,12 @@ if __name__ == "__main__":
     setpoints.set_control_thread_event("temperature", temperature_pause_event)
     setpoints.set_control_thread_event("light",       light_pause_event)
     setpoints.set_control_thread_event("moisture",    soil_pause_event)
-    setpoints.set_soil_humidity_hysteresis(20.0)
+    setpoints.set_control_thread_event("fertilizer",  fertilizer_pause_event)
     # Restore saved mode from MongoDB; fall back to autonomous if nothing was saved
     saved_mode = setpoints.get_operation_mode()
     setpoints.set_operation_mode(saved_mode if saved_mode in ("manual", "autonomous") else "autonomous")
+    # Clear old DB records and write all current setpoints fresh
+    setpoints.save_all_setpoints()
 
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
@@ -273,14 +276,27 @@ if __name__ == "__main__":
     )
     soil_thread = threading.Thread(
         target=control_loops.set_soil_moisture_setpoint_task,
-        args=(env_sensors, env_actuators, setpoints, soil_semaphore, soil_pause_event),
+        args=(env_sensors, env_actuators, setpoints, soil_semaphore, soil_pause_event, mongo_db_handler, light_pause_event),
+    )
+    fertilizer_thread = threading.Thread(
+        target=control_loops.fertilizer_pump_control_task,
+        args=(env_sensors, env_actuators, setpoints, soil_semaphore, fertilizer_pause_event, mongo_db_handler),
+        kwargs={'light_pause_event': light_pause_event},
     )
     app_thread = threading.Thread(target=app_loop.app_task)
+
+    daily_capture_thread = threading.Thread(
+        target=capture_manager.daily_capture_task,
+        kwargs={'hour': 14, 'minute': 0},
+        daemon=True,
+    )
 
     temperature_thread.start()
     light_thread.start()
     soil_thread.start()
+    fertilizer_thread.start()
     app_thread.start()
+    daily_capture_thread.start()
 
     _CUSTOM_PRINT_FUNC("Starting serial logger thread...")
     set_serial_log_enabled(True)
@@ -290,4 +306,5 @@ if __name__ == "__main__":
     temperature_thread.join()
     light_thread.join()
     soil_thread.join()
+    fertilizer_thread.join()
     app_thread.join()

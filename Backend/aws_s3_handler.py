@@ -109,6 +109,36 @@ class S3Handler:
         except Exception as e:
             _CUSTOM_PRINT_FUNC(f"❌ Error downloading last {x} images: {e}")
     
+    def list_objects(self, prefix: str = None) -> list:
+        """
+        Return a list of all objects in the bucket (optionally filtered by prefix).
+        Each entry: { key, size_kb, last_modified (ISO string), url }
+        """
+        try:
+            kwargs = {'Bucket': self.__bucket_name}
+            if prefix:
+                kwargs['Prefix'] = prefix
+            results = []
+            paginator = self.__s3_client.get_paginator('list_objects_v2')
+            for page in paginator.paginate(**kwargs):
+                for obj in page.get('Contents', []):
+                    results.append({
+                        'key':           obj['Key'],
+                        'size_kb':       round(obj['Size'] / 1024, 1),
+                        'last_modified': obj['LastModified'].isoformat(),
+                        'url':           self.generate_presigned_url(obj['Key'], expiry_seconds=3600),
+                    })
+            return results
+        except botocore.exceptions.NoCredentialsError:
+            _CUSTOM_PRINT_FUNC("❌ AWS credentials not found.")
+            return []
+        except botocore.exceptions.ClientError as e:
+            _CUSTOM_PRINT_FUNC(f"❌ AWS Client Error: {e}")
+            return []
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"❌ Error listing objects: {e}")
+            return []
+
     def get_num_of_files(self, prefix: str = None) -> int:
         try:
             if prefix is not None:

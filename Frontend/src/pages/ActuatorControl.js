@@ -1,6 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 
-const API_BASE_URL = 'http://localhost:5000/api';
 const dutyToPercent = dc => Math.round((dc / 4095) * 100);
 
 const ACTUATORS = [
@@ -171,75 +170,6 @@ function ActuatorCard({ config, data, operationMode, onControlState, onControlPo
   );
 }
 
-function PHPumpCard({ operationMode }) {
-  const [state, setState]     = useState('off');
-  const [busy, setBusy]       = useState(false);
-  const isAuto = operationMode === 'autonomous';
-  const isOn   = state === 'on';
-
-  useEffect(() => {
-    fetch(`${API_BASE_URL}/actuators/ph_pump`)
-      .then(r => r.json())
-      .then(d => { if (d.success) setState(d.state); })
-      .catch(() => {});
-  }, []);
-
-  const toggle = async (newState) => {
-    setBusy(true);
-    try {
-      const res  = await fetch(`${API_BASE_URL}/actuators/ph_pump`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ state: newState }),
-      });
-      const data = await res.json();
-      if (data.success) setState(newState);
-    } catch {}
-    setBusy(false);
-  };
-
-  return (
-    <div className="actuator-card">
-      <div className="actuator-card-header">
-        <div className="actuator-card-name">
-          <div className="actuator-icon-wrap" style={{ background: '#f0fdf4' }}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="#22c55e" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/>
-              <text x="6" y="16" fontSize="9" fill="#22c55e" stroke="none" fontWeight="bold">pH</text>
-            </svg>
-          </div>
-          pH Pump
-        </div>
-        <div className={`actuator-state-badge ${state}`}>
-          <span className="actuator-state-dot" />
-          {state.toUpperCase()}
-        </div>
-      </div>
-
-      <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 12 }}>
-        USB mini pump · GPIO relay · ON/OFF only
-      </div>
-
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
-        <div style={{ flex: 1, height: 6, background: 'var(--border)', borderRadius: 3, overflow: 'hidden' }}>
-          <div style={{ width: isOn ? '100%' : '0%', height: '100%', background: isOn ? '#22c55e' : 'var(--text-light)', borderRadius: 3, transition: 'width .3s ease' }} />
-        </div>
-        <span style={{ fontSize: 13, fontWeight: 700, color: isOn ? '#22c55e' : 'var(--text-muted)', minWidth: 36, textAlign: 'right' }}>
-          {isOn ? '100%' : '0%'}
-        </span>
-      </div>
-
-      <div className="actuator-buttons">
-        <button className="btn-actuator-on" onClick={() => toggle('on')} disabled={isAuto || busy}>
-          Turn ON
-        </button>
-        <button className="btn-actuator-off" onClick={() => toggle('off')} disabled={isAuto || busy}>
-          Turn OFF
-        </button>
-      </div>
-    </div>
-  );
-}
 
 export default function ActuatorControl({
   actuators,
@@ -325,7 +255,6 @@ export default function ActuatorControl({
               onControlPower={onControlPower}
             />
           ))}
-          <PHPumpCard operationMode={operationMode} />
         </div>
       ) : (
         <div className="empty-state">

@@ -79,6 +79,26 @@ class MongoDBHandler:
             _CUSTOM_PRINT_FUNC(f"Error inserting actuator data: {e}")
             return False
 
+    def upsert_actuator_data(self, key, actuator_value):
+        """Update the single actuator document for this key (upsert — never duplicates)."""
+        try:
+            actuator_id   = self.__pi_data_map[key]['fields']['actuator_id']
+            actuator_type = self.__pi_data_map[key]['fields']['actuator_type']
+            self.__pi_data_map[key]['collection'].update_one(
+                {'actuator_id': actuator_id},
+                {'$set': {
+                    'actuator_id':    actuator_id,
+                    'actuator_type':  actuator_type,
+                    'actuator_value': actuator_value,
+                    'timestamp':      datetime.datetime.now(),
+                }},
+                upsert=True,
+            )
+            return True
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error upserting actuator data: {e}")
+            return False
+
     def insert_image_data(self, key, image_path, cam_id = 0):
         try:
             timestamp_val = datetime.datetime.now()
@@ -103,6 +123,31 @@ class MongoDBHandler:
             return True
         except Exception as e:
             _CUSTOM_PRINT_FUNC(f"Error inserting resource data: {e}")
+            return False
+
+    def upsert_resource_data(self, key, resource_value, cost_nis=None):
+        """Update the single resource document for this key (upsert — never duplicates)."""
+        try:
+            resource_id   = self.__pi_data_map[key]['fields']['resource_id']
+            resource_type = self.__pi_data_map[key]['fields']['resource_type']
+            resource_unit = self.__pi_data_map[key]['fields'].get('resource_unit', '')
+            update_fields = {
+                'resource_id':    resource_id,
+                'resource_type':  resource_type,
+                'resource_value': resource_value,
+                'resource_unit':  resource_unit,
+                'timestamp':      datetime.datetime.now(),
+            }
+            if cost_nis is not None:
+                update_fields['cost_nis'] = round(cost_nis, 4)
+            self.__pi_data_map[key]['collection'].update_one(
+                {'resource_id': resource_id},
+                {'$set': update_fields},
+                upsert=True,
+            )
+            return True
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error upserting resource data: {e}")
             return False
 
     def get_data(self, key):
@@ -208,6 +253,35 @@ class MongoDBHandler:
         except Exception as e:
             _CUSTOM_PRINT_FUNC(f"Error getting state '{key}': {e}")
             return None
+
+    def insert_pump_log(self, pump_type: str, pulse_sec: float, duty_cycle: int, flow_rate_l_min: float = 0.0) -> bool:
+        """Log a single pump pulse event to the pump_logs collection."""
+        try:
+            self.__db['pump_logs'].insert_one({
+                'pump':            pump_type,
+                'timestamp':       datetime.datetime.now(),
+                'pulse_sec':       pulse_sec,
+                'duty_cycle':      duty_cycle,
+                'flow_rate_l_min': round(flow_rate_l_min, 4),
+            })
+            return True
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error inserting pump log: {e}")
+            return False
+
+    def get_pump_logs(self, limit: int = 50) -> list:
+        """Return the most recent pump pulse events, newest first."""
+        try:
+            cursor = (
+                self.__db['pump_logs']
+                .find({}, {'_id': 0})
+                .sort('timestamp', pymongo.DESCENDING)
+                .limit(limit)
+            )
+            return list(cursor)
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error fetching pump logs: {e}")
+            return []
 
     def close_connection(self):
         try:

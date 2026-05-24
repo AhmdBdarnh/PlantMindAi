@@ -25,6 +25,7 @@ _plant_health      = None
 _env_actuators     = None
 _setpoints         = None
 _light_pause_event = None
+_prev_light_dc     = 0   # saved before flash so we can restore after
 
 
 def init(camera, s3_handler, mongo_db_handler, plant_health_checker,
@@ -43,18 +44,34 @@ def init(camera, s3_handler, mongo_db_handler, plant_health_checker,
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _toggle_flash_light(state=1):
+    global _prev_light_dc
     if state == 1:
-        if _setpoints.get_operation_mode() == "autonomous":
-            _light_pause_event.clear()  # Pause light PID thread
-        while not _env_actuators.set_light_strip_1_duty_cycle(4095):
-            _CUSTOM_PRINT_FUNC("Turning on light strip 1 for camera flash...")
-            time.sleep(0.1)
-        while not _env_actuators.set_light_strip_2_duty_cycle(4095):
-            _CUSTOM_PRINT_FUNC("Turning on light strip 2 for camera flash...")
-            time.sleep(0.1)
+        # Save current duty cycle so we can restore it after capture
+        _prev_light_dc = _env_actuators.get_light_strip_1_duty_cycle()
+        # If light is currently ON, turn it OFF for the capture
+        if _prev_light_dc > 0:
+            if _setpoints.get_operation_mode() == "autonomous":
+                _light_pause_event.clear()  # Pause light PID thread
+            while not _env_actuators.set_light_strip_1_duty_cycle(0):
+                _CUSTOM_PRINT_FUNC("Turning off light strip 1 for capture...")
+                time.sleep(0.1)
+            while not _env_actuators.set_light_strip_2_duty_cycle(0):
+                _CUSTOM_PRINT_FUNC("Turning off light strip 2 for capture...")
+                time.sleep(0.1)
+            _CUSTOM_PRINT_FUNC(f"[Capture] Light was at {_prev_light_dc} → turned OFF for capture")
+        else:
+            _CUSTOM_PRINT_FUNC("[Capture] Light already off — no change before capture")
     else:
+        # Restore light to exactly what it was before the capture
+        while not _env_actuators.set_light_strip_1_duty_cycle(_prev_light_dc):
+            _CUSTOM_PRINT_FUNC("Restoring light strip 1 to previous state...")
+            time.sleep(0.1)
+        while not _env_actuators.set_light_strip_2_duty_cycle(_prev_light_dc):
+            _CUSTOM_PRINT_FUNC("Restoring light strip 2 to previous state...")
+            time.sleep(0.1)
         if _setpoints.get_operation_mode() == "autonomous":
             _light_pause_event.set()  # Resume light PID thread
+        _CUSTOM_PRINT_FUNC(f"[Capture] Light restored to {_prev_light_dc}")
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -187,20 +204,23 @@ def run_full_capture_cycle(triggered_by: str = 'scheduler', run_health_check: bo
         _capture_running_lock.release()
 
 
-def camera_capture_task(capture_interval: int, health_check_interval: int):
+def daily_capture_task(hour: int = 14, minute: int = 0):
     """
-    Background thread: captures images every capture_interval seconds but only
-    calls the Plant.id health API every health_check_interval seconds to preserve credits.
+    Background thread: fires one capture cycle every day at the specified time (default 14:00).
+    Sleeps until the next occurrence on startup, then repeats every 24 hours.
     """
-    last_health_check_time = datetime.datetime.min  # force check on first run
     while True:
+        now    = datetime.datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if now >= target:
+            target += datetime.timedelta(days=1)
+        sleep_seconds = (target - now).total_seconds()
+        _CUSTOM_PRINT_FUNC(
+            f"[DailyCapture] Next capture scheduled at {target.strftime('%Y-%m-%d %H:%M')} "
+            f"(in {sleep_seconds / 3600:.1f}h)"
+        )
+        time.sleep(sleep_seconds)
         try:
-            now = datetime.datetime.now()
-            seconds_since_health = (now - last_health_check_time).total_seconds()
-            run_health = seconds_since_health >= health_check_interval
-            run_full_capture_cycle(triggered_by="scheduler", run_health_check=run_health)
-            if run_health:
-                last_health_check_time = datetime.datetime.now()
+            run_full_capture_cycle(triggered_by='daily_schedule')
         except Exception as e:
-            _CUSTOM_PRINT_FUNC(f"[CaptureTask] Cycle error: {e}")
-        time.sleep(capture_interval)
+            _CUSTOM_PRINT_FUNC(f"[DailyCapture] Cycle error: {e}")

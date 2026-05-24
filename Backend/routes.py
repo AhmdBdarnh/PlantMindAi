@@ -9,8 +9,14 @@ import threading
 
 import capture_manager
 import actuator_helpers
+import app_loop
 from flask import Blueprint, Response, jsonify, render_template, request
 from utils.utils import _CUSTOM_PRINT_FUNC
+from config import (
+    WATER_PRICE_PER_LITER_NIS,
+    ELECTRICITY_PRICE_PER_KWH_NIS,
+    FERTILIZER_PRICE_PER_3_LITERS_NIS,
+)
 
 
 def init_routes(
@@ -18,7 +24,6 @@ def init_routes(
     env_sensors,
     env_actuators,
     setpoints,
-    ph_pump,
     camera,
     s3_handler,
     mongo_db_handler,
@@ -67,12 +72,20 @@ def init_routes(
 
             water_flow_semaphore.acquire()
             try:
-                water_flow        = env_sensors.get_water_flow_rate()
-                water_amount      = env_sensors.get_total_water_amount()
-                fertilizer_flow   = env_sensors.get_fertilizer_flow_rate()
-                fertilizer_amount = env_sensors.get_total_fertilizer_amount()
+                water_flow      = env_sensors.get_water_flow_rate()
+                fertilizer_flow = env_sensors.get_fertilizer_flow_rate()
             finally:
                 water_flow_semaphore.release()
+
+            # Use accumulated totals from app_loop — these persist across sensor resets and restarts
+            water_amount      = app_loop.get_total_water_liters()
+            fertilizer_amount = app_loop.get_total_fertilizer_liters()
+            total_energy_wh   = app_loop.get_total_energy_wh()
+
+            water_cost = round(water_amount * WATER_PRICE_PER_LITER_NIS, 4)
+            elec_cost  = round(total_energy_wh * ELECTRICITY_PRICE_PER_KWH_NIS / 1000.0, 4)
+            fert_cost  = round(fertilizer_amount * (FERTILIZER_PRICE_PER_3_LITERS_NIS / 3.0), 4)
+            total_cost = round(water_cost + elec_cost + fert_cost, 4)
 
             return jsonify({
                 'success': True,
@@ -91,9 +104,13 @@ def init_routes(
                     'voltage':         round(voltage, 2),
                     'current':         round(current, 2),
                     'power':           round(power, 2),
-                    'energy':          round(energy, 2),
+                    'energy':          round(total_energy_wh, 2),
                     'frequency':       round(frequency, 2),
                     'power_factor':    round(power_factor, 2),
+                    'water_cost_nis':       water_cost,
+                    'electricity_cost_nis': elec_cost,
+                    'fertilizer_cost_nis':  fert_cost,
+                    'total_cost_nis':       total_cost,
                 },
             })
         except Exception as e:
@@ -254,26 +271,6 @@ def init_routes(
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
 
-    @bp.route('/api/actuators/ph_pump', methods=['POST'])
-    def control_ph_pump():
-        """Control pH pump relay — expects {state: 'on'/'off'}."""
-        try:
-            data  = request.get_json()
-            state = data.get('state')
-            if state not in ('on', 'off'):
-                return jsonify({'success': False, 'error': 'state must be on or off'}), 400
-            ok = ph_pump.turn_on() if state == 'on' else ph_pump.turn_off()
-            if not ok:
-                return jsonify({'success': False, 'error': 'Failed to control pH pump'}), 500
-            return jsonify({'success': True, 'state': state})
-        except Exception as e:
-            return jsonify({'success': False, 'error': str(e)}), 500
-
-    @bp.route('/api/actuators/ph_pump', methods=['GET'])
-    def get_ph_pump():
-        """Get pH pump state."""
-        return jsonify({'success': True, 'state': 'on' if ph_pump.get_state() else 'off'})
-
     # ── Operation mode ────────────────────────────────────────────────────────
 
     @bp.route('/api/operation_mode', methods=['GET', 'POST'])
@@ -330,8 +327,8 @@ def init_routes(
         if capture_manager.last_health_result is None:
             return jsonify({
                 'success': False,
-                'error': 'No health check has run yet. Please wait up to 1 minute.',
-            }), 404
+                'error': 'No health check has run yet.',
+            }), 200
         return jsonify(capture_manager.last_health_result), 200
 
     @bp.route('/api/plant_health', methods=['POST'])
@@ -395,6 +392,22 @@ def init_routes(
 
         threading.Thread(target=_run, daemon=True).start()
         return jsonify({'success': True, 'pending': True}), 202
+
+    # ── Pump activity logs ────────────────────────────────────────────────────
+
+    @bp.route('/api/pump-logs', methods=['GET'])
+    def get_pump_logs():
+        """Return recent pump pulse events. Query param: ?limit=50"""
+        try:
+            limit = min(int(request.args.get('limit', 50)), 200)
+            logs  = mongo_db_handler.get_pump_logs(limit)
+            for log in logs:
+                ts = log.get('timestamp')
+                if hasattr(ts, 'isoformat'):
+                    log['timestamp'] = ts.isoformat()
+            return jsonify({'success': True, 'logs': logs}), 200
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
 
     # ── Legacy capture endpoints ──────────────────────────────────────────────
 
@@ -491,6 +504,22 @@ def init_routes(
             as_attachment=True,
             download_name=filename,
         )
+
+    # ── S3 browser ───────────────────────────────────────────────────────────
+
+    @bp.route('/api/s3/files', methods=['GET'])
+    def list_s3_files():
+        """
+        List all objects in the S3 bucket, newest first.
+        Optional query param: ?prefix=captures/ to filter by folder.
+        """
+        try:
+            prefix  = request.args.get('prefix', None)
+            objects = s3_handler.list_objects(prefix=prefix)
+            objects.sort(key=lambda o: o['last_modified'], reverse=True)
+            return jsonify({'success': True, 'count': len(objects), 'files': objects})
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
 
     # ── Web / camera stream routes ────────────────────────────────────────────
 

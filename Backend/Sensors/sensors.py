@@ -37,8 +37,8 @@ class GH_Sensors:
         self.air_sensor = AirSensor()
         self.electricity_sensor = ElectricitySensor()
         self.light_sensor = LightSensor(ads_sensor=self.__ads_sensor, ads_channels=self.__ads_channels, I2C=self.__general_i2c)
-        self.water_flow_sensor = WaterFlowSensor(mongo_db_handler=mongo_db_handler)
-        self.fertilizer_flow_sensor = WaterFlowSensor(mongo_db_handler=mongo_db_handler) # Assuming similar flow sensor for fertilizer
+        self.water_flow_sensor      = WaterFlowSensor(mongo_db_handler=mongo_db_handler, state_key="water_amount")
+        self.fertilizer_flow_sensor = WaterFlowSensor(mongo_db_handler=mongo_db_handler, state_key="fertilizer_amount")
 
 
     def set_water_flow_sensor_pin(self, pin):

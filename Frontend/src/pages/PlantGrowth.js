@@ -34,7 +34,7 @@ function getLatestImagePerCamera(sessions) {
     }
   });
 
-  return [1, 2, 3].map(camId => {
+  return [1, 2, 4].map(camId => {
     const img = byCamera[camId];
     if (img) return { ...img, camera_id: camId, sessionTs: latest.timestamp };
     return { camera_id: camId, success: false, sessionTs: latest.timestamp };

@@ -10,6 +10,11 @@ import threading
 
 import actuator_helpers
 from utils.utils import _CUSTOM_PRINT_FUNC
+from config import (
+    WATER_PRICE_PER_LITER_NIS,
+    ELECTRICITY_PRICE_PER_KWH_NIS,
+    FERTILIZER_PRICE_PER_3_LITERS_NIS,
+)
 
 # ── Module-level state ────────────────────────────────────────────────────────
 last_sensor_update = datetime.datetime.now() - datetime.timedelta(seconds=10)
@@ -28,6 +33,16 @@ _soil_sem       = None
 _elec_sem       = None
 _wf_sem         = None
 _resources_interval_hours = 1
+
+# Running resource totals — always growing, saved every 10s, survive restarts
+_total_water_liters      = 0.0
+_total_energy_wh         = 0.0
+_total_fertilizer_liters = 0.0
+
+# Previous sensor readings — used to compute deltas (handles hourly resets cleanly)
+_prev_water_sensor      = 0.0
+_prev_energy_sensor     = 0.0
+_prev_fertilizer_sensor = 0.0
 
 
 def init(env_sensors, env_actuators, setpoints, mqtt_handler, mongo_db_handler,
@@ -55,11 +70,51 @@ def get_last_sensor_update():
     return last_sensor_update.strftime('%Y-%m-%d %H:%M:%S')
 
 
+def get_total_water_liters() -> float:
+    return _total_water_liters
+
+def get_total_fertilizer_liters() -> float:
+    return _total_fertilizer_liters
+
+def get_total_energy_wh() -> float:
+    return _total_energy_wh
+
+
 def app_task():
     global last_sensor_update
+    global _total_water_liters, _total_energy_wh, _total_fertilizer_liters
+    global _prev_water_sensor, _prev_energy_sensor, _prev_fertilizer_sensor
 
-    last_sensor_update   = datetime.datetime.now() - datetime.timedelta(seconds=10)
+    last_sensor_update    = datetime.datetime.now() - datetime.timedelta(seconds=10)
     last_actuators_update = datetime.datetime.now() - datetime.timedelta(seconds=1)
+
+    # Load last-saved running totals so restarts never lose data
+    saved = _mongo_db.get_state('total_water_liters')
+    if saved is not None:
+        _total_water_liters = float(saved)
+    saved = _mongo_db.get_state('total_energy_wh')
+    if saved is not None:
+        _total_energy_wh = float(saved)
+    saved = _mongo_db.get_state('total_fertilizer_liters')
+    if saved is not None:
+        _total_fertilizer_liters = float(saved)
+
+    # Snapshot sensor values at startup — used to avoid double-counting
+    # (sensors may have resumed from their own saved state)
+    _prev_water_sensor      = _env_sensors.get_total_water_amount()
+    _prev_fertilizer_sensor = _env_sensors.get_total_fertilizer_amount()
+    try:
+        _, _, _, _e, _, _, _ = _env_sensors.get_electricity_values()
+        _prev_energy_sensor = _e
+    except Exception:
+        _prev_energy_sensor = 0.0
+
+    _CUSTOM_PRINT_FUNC(
+        f"[Resources] Loaded totals — "
+        f"water={_total_water_liters:.3f}L  "
+        f"energy={_total_energy_wh:.3f}Wh  "
+        f"fertilizer={_total_fertilizer_liters:.3f}L"
+    )
 
     # Retrieve last resource-reset time from local file
     try:
@@ -92,25 +147,39 @@ def app_task():
     prev_fertilizer_pump_duty_cycle = 0.0
 
     while True:
+      try:
         # ── Sensor reads every 10 s ───────────────────────────────────────────
         if (datetime.datetime.now() - last_sensor_update).total_seconds() > 10:
+            # Defaults so cache update never fails on a partial read
+            air_temp_c = air_temp_f = air_humidity = 0.0
+            light_intensity = 0.0
+            soil_ph = soil_ec = soil_humidity = soil_temp = 0.0
+            voltage = current = power = energy = frequency = power_factor = 0.0
+            alarm = False
+
             _temp_sem.acquire()
             try:
-                air_temp_c  = _env_sensors.get_air_temperature_C()
-                air_temp_f  = _env_sensors.get_air_temperature_F()
+                air_temp_c   = _env_sensors.get_air_temperature_C()
+                air_temp_f   = _env_sensors.get_air_temperature_F()
                 air_humidity = _env_sensors.get_air_humidity()
+            except Exception as e:
+                _CUSTOM_PRINT_FUNC(f"[AppLoop] Error reading temperature: {e}")
             finally:
                 _temp_sem.release()
 
             _light_sem.acquire()
             try:
                 light_intensity = _env_sensors.get_light_intensity()
+            except Exception as e:
+                _CUSTOM_PRINT_FUNC(f"[AppLoop] Error reading light: {e}")
             finally:
                 _light_sem.release()
 
             _soil_sem.acquire()
             try:
                 soil_ph, soil_ec, soil_humidity, soil_temp = _env_sensors.get_soil_values()
+            except Exception as e:
+                _CUSTOM_PRINT_FUNC(f"[AppLoop] Error reading soil: {e}")
             finally:
                 _soil_sem.release()
 
@@ -120,7 +189,7 @@ def app_task():
                     _env_sensors.get_electricity_values()
                 )
             except Exception as e:
-                _CUSTOM_PRINT_FUNC(f"Error reading electricity sensor: {e}")
+                _CUSTOM_PRINT_FUNC(f"[AppLoop] Error reading electricity: {e}")
             finally:
                 _elec_sem.release()
 
@@ -151,68 +220,96 @@ def app_task():
 
             last_sensor_update = datetime.datetime.now()
 
-            # Update sensor cache so Flask routes can respond instantly
+            # Water flow / fertilizer flow reads
+            _wf = _ff = _wa = _fa = 0.0
             _wf_sem.acquire()
             try:
                 _wf = _env_sensors.get_water_flow_rate()
                 _wa = _env_sensors.get_total_water_amount()
                 _ff = _env_sensors.get_fertilizer_flow_rate()
                 _fa = _env_sensors.get_total_fertilizer_amount()
+            except Exception as e:
+                _CUSTOM_PRINT_FUNC(f"[AppLoop] Error reading flow sensors: {e}")
             finally:
                 _wf_sem.release()
+
+            # Delta-based accumulation
+            delta_water      = max(0.0, _wa  - _prev_water_sensor)
+            delta_energy     = max(0.0, energy - _prev_energy_sensor)
+            delta_fertilizer = max(0.0, _fa  - _prev_fertilizer_sensor)
+
+            _total_water_liters      = round(_total_water_liters      + delta_water,      4)
+            _total_energy_wh         = round(_total_energy_wh         + delta_energy,     4)
+            _total_fertilizer_liters = round(_total_fertilizer_liters + delta_fertilizer, 4)
+
+            _prev_water_sensor      = _wa
+            _prev_energy_sensor     = energy
+            _prev_fertilizer_sensor = _fa
+
+            water_cost_nis = round(_total_water_liters      * WATER_PRICE_PER_LITER_NIS,                4)
+            elec_cost_nis  = round((_total_energy_wh / 1000.0) * ELECTRICITY_PRICE_PER_KWH_NIS,         4)
+            fert_cost_nis  = round((_total_fertilizer_liters / 3.0) * FERTILIZER_PRICE_PER_3_LITERS_NIS, 4)
+            total_cost_nis = round(water_cost_nis + elec_cost_nis + fert_cost_nis,                      4)
+
+            # Update sensor cache FIRST — before any MQTT/MongoDB that could fail
+            with _sensor_cache_lock:
+                _sensor_cache.update({
+                    'air_temperature':      air_temp_c,
+                    'air_humidity':         air_humidity,
+                    'light_intensity':      light_intensity,
+                    'soil_ph':              soil_ph,
+                    'soil_ec':              soil_ec,
+                    'soil_humidity':        soil_humidity,
+                    'soil_temperature':     soil_temp,
+                    'water_flow':           _wf,
+                    'water_amount':         _total_water_liters,
+                    'fertilizer_flow':      _ff,
+                    'fertilizer_amount':    _total_fertilizer_liters,
+                    'voltage':              voltage,
+                    'current':              current,
+                    'power':                power,
+                    'energy':               _total_energy_wh,
+                    'frequency':            frequency,
+                    'power_factor':         power_factor,
+                    'water_cost_nis':       water_cost_nis,
+                    'electricity_cost_nis': elec_cost_nis,
+                    'fertilizer_cost_nis':  fert_cost_nis,
+                    'total_cost_nis':       total_cost_nis,
+                })
 
             _mqtt_handler.publish("env_monitoring_system/sensors/fertilizer_flow",     _ff)
             _mqtt_handler.publish("env_monitoring_system/resources/fertilizer_amount", _fa)
 
-            with _sensor_cache_lock:
-                _sensor_cache.update({
-                    'air_temperature':   air_temp_c,
-                    'air_humidity':      air_humidity,
-                    'light_intensity':   light_intensity,
-                    'soil_ph':           soil_ph,
-                    'soil_ec':           soil_ec,
-                    'soil_humidity':     soil_humidity,
-                    'soil_temperature':  soil_temp,
-                    'water_flow':        _wf,
-                    'water_amount':      _wa,
-                    'fertilizer_flow':   _ff,
-                    'fertilizer_amount': _fa,
-                    'voltage':           voltage,
-                    'current':           current,
-                    'power':             power,
-                    'energy':            energy,
-                    'frequency':         frequency,
-                    'power_factor':      power_factor,
-                })
+            # Save totals to system_state every 10s — survives any restart
+            _mongo_db.upsert_state('total_water_liters',      _total_water_liters)
+            _mongo_db.upsert_state('total_energy_wh',         _total_energy_wh)
+            _mongo_db.upsert_state('total_fertilizer_liters', _total_fertilizer_liters)
 
-        # ── Resource log & reset every N hours ───────────────────────────────
+            # Upsert resources collection (1 doc per resource, updated live)
+            _mongo_db.upsert_resource_data("water consumption",      _total_water_liters,      cost_nis=water_cost_nis)
+            _mongo_db.upsert_resource_data("energy consumption",     _total_energy_wh,         cost_nis=elec_cost_nis)
+            _mongo_db.upsert_resource_data("fertilizer consumption", _total_fertilizer_liters, cost_nis=fert_cost_nis)
+
+        # ── Sensor reset every N hours ────────────────────────────────────────
+        # Totals are already saved every 10s, so just reset the hardware counters.
+        # The delta logic in the sensor loop handles the reset seamlessly.
         if (datetime.datetime.now() - last_resources_reset_and_log).total_seconds() > (
             _resources_interval_hours * 3600
         ):
             _elec_sem.acquire()
             try:
-                _, _, _, energy_cons, _, _, _ = _env_sensors.get_electricity_values()
-                _mqtt_handler.publish("env_monitoring_system/resources/energy", energy_cons)
-                _mongo_db.insert_resource_data("energy consumption", energy_cons)
-                _mongo_db.resource_field_doc_temp(
-                    "pzem-004t.energy", "energy_consumption", energy_cons, "Wh"
-                )
                 _env_sensors.reset_energy()
             except Exception as e:
-                _CUSTOM_PRINT_FUNC(f"Error reading electricity sensor: {e}")
+                _CUSTOM_PRINT_FUNC(f"[Resources] Error resetting electricity sensor: {e}")
             finally:
                 _elec_sem.release()
 
             _wf_sem.acquire()
             try:
-                water_amount = _env_sensors.get_total_water_amount()
-                _mqtt_handler.publish(
-                    "env_monitoring_system/resources/water_amount", water_amount
-                )
-                _mongo_db.insert_resource_data("water consumption", water_amount)
                 _env_sensors.reset_water_amount()
+                _env_sensors.reset_fertilizer_amount()
             except Exception as e:
-                _CUSTOM_PRINT_FUNC(f"Error reading water flow sensor: {e}")
+                _CUSTOM_PRINT_FUNC(f"[Resources] Error resetting water/fertilizer sensor: {e}")
             finally:
                 _wf_sem.release()
 
@@ -221,9 +318,7 @@ def app_task():
             with open('consumption/last_resources_reset.txt', 'w') as file:
                 file.write(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 
-            _CUSTOM_PRINT_FUNC(
-                f"Last resources reset and log time updated to: {last_resources_reset_and_log}"
-            )
+            _CUSTOM_PRINT_FUNC("[Resources] Sensor reset done — totals preserved in system_state")
 
         # ── Actuator state publish every 1 s ─────────────────────────────────
         if (datetime.datetime.now() - last_actuators_update).total_seconds() > 1:
@@ -259,7 +354,7 @@ def app_task():
                         "env_monitoring_system/actuators/heater/state",
                         f'On at {heater_duty_cycle * 100 / 4095:.2f}%',
                     )
-                _mongo_db.insert_actuator_data("heater", heater_duty_cycle)
+                _mongo_db.upsert_actuator_data("heater", heater_duty_cycle)
 
             if light_duty_cycle != prev_light_duty_cycle:
                 prev_light_duty_cycle = light_duty_cycle
@@ -272,7 +367,7 @@ def app_task():
                         "env_monitoring_system/actuators/light/state",
                         f'On at {light_duty_cycle * 100 / 4095:.2f}%',
                     )
-                _mongo_db.insert_actuator_data("light", light_duty_cycle)
+                _mongo_db.upsert_actuator_data("light", light_duty_cycle)
 
             if water_pump_duty_cycle != prev_water_pump_duty_cycle:
                 prev_water_pump_duty_cycle = water_pump_duty_cycle
@@ -285,7 +380,7 @@ def app_task():
                         "env_monitoring_system/actuators/water_pump/state",
                         f'On at {water_pump_duty_cycle * 100 / 4095:.2f}%',
                     )
-                _mongo_db.insert_actuator_data("water pump", water_pump_duty_cycle)
+                _mongo_db.upsert_actuator_data("water pump", water_pump_duty_cycle)
 
             if fertilizer_pump_duty_cycle != prev_fertilizer_pump_duty_cycle:
                 prev_fertilizer_pump_duty_cycle = fertilizer_pump_duty_cycle
@@ -298,7 +393,7 @@ def app_task():
                         "env_monitoring_system/actuators/fertilizer_pump/state",
                         f'On at {fertilizer_pump_duty_cycle * 100 / 4095:.2f}%',
                     )
-                _mongo_db.insert_actuator_data("fertilizer pump", fertilizer_pump_duty_cycle)
+                _mongo_db.upsert_actuator_data("fertilizer pump", fertilizer_pump_duty_cycle)
 
             if fan_duty_cycle != prev_fan_duty_cycle:
                 prev_fan_duty_cycle = fan_duty_cycle
@@ -311,4 +406,7 @@ def app_task():
                         "env_monitoring_system/actuators/fan/state",
                         f'On at {fan_duty_cycle * 100 / 4095:.2f}%',
                     )
-                _mongo_db.insert_actuator_data("fan", fan_duty_cycle)
+                _mongo_db.upsert_actuator_data("fan", fan_duty_cycle)
+
+      except Exception as e:
+          _CUSTOM_PRINT_FUNC(f"[AppLoop] Cycle error (will retry): {e}")

@@ -22,18 +22,19 @@ def _load_system_gpiod():
 
 _gpiod = _load_system_gpiod()
 
-_SAVE_INTERVAL_SEC = 10   # save water_amount to MongoDB every N seconds
+_SAVE_INTERVAL_SEC = 1   # save water_amount to MongoDB every N seconds
 
 
 class WaterFlowSensor:
     """
     Water flow sensor (YF-S201) — pulse counting, flow rate, total volume.
-    Persists water_amount to MongoDB (system_state collection) every 10 seconds.
+    Persists water_amount to MongoDB (system_state collection) every second.
     """
     PULSES_PER_LITRE = 450.0
 
-    def __init__(self, mongo_db_handler=None):
-        self.__mongo   = mongo_db_handler
+    def __init__(self, mongo_db_handler=None, state_key="water_amount"):
+        self.__mongo      = mongo_db_handler
+        self.__state_key  = state_key
         self.__water_flow_running = False
         self.__flow_rate   = 0.0
         self.__water_amount = 0.0
@@ -43,12 +44,12 @@ class WaterFlowSensor:
         # Load saved total from MongoDB
         if self.__mongo is not None:
             try:
-                saved = self.__mongo.get_state("water_amount")
+                saved = self.__mongo.get_state(self.__state_key)
                 if saved is not None:
                     self.__water_amount = float(saved)
-                    _CUSTOM_PRINT_FUNC(f"[WaterFlow] Loaded water_amount={self.__water_amount:.4f} L from MongoDB")
+                    _CUSTOM_PRINT_FUNC(f"[WaterFlow] Loaded {self.__state_key}={self.__water_amount:.4f} L from MongoDB")
             except Exception as e:
-                _CUSTOM_PRINT_FUNC(f"[WaterFlow] Could not load water_amount from MongoDB: {e}")
+                _CUSTOM_PRINT_FUNC(f"[WaterFlow] Could not load {self.__state_key} from MongoDB: {e}")
 
     def set_water_flow_sensor_pin(self, pin: int):
         chip = _gpiod.Chip('/dev/gpiochip4')
@@ -88,9 +89,9 @@ class WaterFlowSensor:
             time.sleep(_SAVE_INTERVAL_SEC)
             if self.__mongo is not None:
                 try:
-                    self.__mongo.upsert_state("water_amount", round(self.__water_amount, 4))
+                    self.__mongo.upsert_state(self.__state_key, round(self.__water_amount, 4))
                 except Exception as e:
-                    _CUSTOM_PRINT_FUNC(f"[WaterFlow] Could not save water_amount: {e}")
+                    _CUSTOM_PRINT_FUNC(f"[WaterFlow] Could not save {self.__state_key}: {e}")
 
     def get_water_flow_rate(self) -> float:
         return self.__flow_rate
@@ -101,7 +102,7 @@ class WaterFlowSensor:
     def stop(self):
         self.__water_flow_running = False
         if self.__mongo is not None:
-            self.__mongo.upsert_state("water_amount", round(self.__water_amount, 4))
+            self.__mongo.upsert_state(self.__state_key, round(self.__water_amount, 4))
         if self.__line:
             try:
                 self.__line.release()
@@ -111,5 +112,5 @@ class WaterFlowSensor:
     def reset_water_amount(self):
         self.__water_amount = 0.0
         if self.__mongo is not None:
-            self.__mongo.upsert_state("water_amount", 0.0)
-        _CUSTOM_PRINT_FUNC("[WaterFlow] Water amount reset to 0.")
+            self.__mongo.upsert_state(self.__state_key, 0.0)
+        _CUSTOM_PRINT_FUNC(f"[WaterFlow] {self.__state_key} reset to 0.")
