@@ -39,4 +39,4 @@ AWS_REGION    = os.environ.get('AWS_REGION', 'eu-west-1')
 # ── Resource cost constants (Israeli prices 2026) ─────────────────────────────
 WATER_PRICE_PER_LITER_NIS         = 0.00851  # 8.51 ₪/m³ low domestic tariff → ₪/L
 ELECTRICITY_PRICE_PER_KWH_NIS     = 0.6432   # ₪/kWh including VAT
-FERTILIZER_PRICE_PER_3_LITERS_NIS = 45.0     # ₪ per 3-litre bottle (adjust to your product)
+FERTILIZER_PRICE_PER_5_LITERS_NIS = 1.0      # ₪ per 5 litres of fertilizer solution

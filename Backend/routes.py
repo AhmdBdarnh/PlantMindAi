@@ -15,7 +15,7 @@ from utils.utils import _CUSTOM_PRINT_FUNC
 from config import (
     WATER_PRICE_PER_LITER_NIS,
     ELECTRICITY_PRICE_PER_KWH_NIS,
-    FERTILIZER_PRICE_PER_3_LITERS_NIS,
+    FERTILIZER_PRICE_PER_5_LITERS_NIS,
 )
 
 
@@ -84,7 +84,7 @@ def init_routes(
 
             water_cost = round(water_amount * WATER_PRICE_PER_LITER_NIS, 4)
             elec_cost  = round(total_energy_wh * ELECTRICITY_PRICE_PER_KWH_NIS / 1000.0, 4)
-            fert_cost  = round(fertilizer_amount * (FERTILIZER_PRICE_PER_3_LITERS_NIS / 3.0), 4)
+            fert_cost  = round((fertilizer_amount / 5.0) * FERTILIZER_PRICE_PER_5_LITERS_NIS, 4)
             total_cost = round(water_cost + elec_cost + fert_cost, 4)
 
             return jsonify({
@@ -286,6 +286,17 @@ def init_routes(
                 return jsonify({'success': False, 'error': 'Invalid mode'}), 400
             setpoints.set_operation_mode(mode)
             return jsonify({'success': True, 'mode': mode})
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    # ── Resource reset ────────────────────────────────────────────────────────
+
+    @bp.route('/api/reset_resources', methods=['POST'])
+    def reset_resources():
+        """Reset all resource counters to zero for a new plant cycle."""
+        try:
+            app_loop.reset_resources()
+            return jsonify({'success': True, 'message': 'All resource counters reset to zero.'})
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
 

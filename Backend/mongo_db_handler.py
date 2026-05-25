@@ -173,11 +173,21 @@ class MongoDBHandler:
             return False
 
     def delete_all_data(self):
-        try:            
+        try:
             self.__db.drop()
             return True
         except Exception as e:
             _CUSTOM_PRINT_FUNC(f"Error deleting all data: {e}")
+            return False
+
+    def clear_collection(self, collection_name: str):
+        """Delete all documents from a collection by name."""
+        try:
+            self.__db[collection_name].delete_many({})
+            _CUSTOM_PRINT_FUNC(f"[MongoDB] Cleared collection: {collection_name}")
+            return True
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"[MongoDB] Error clearing {collection_name}: {e}")
             return False
 
     def get_latest_doc_where(self, collection: str, query: dict) -> dict:

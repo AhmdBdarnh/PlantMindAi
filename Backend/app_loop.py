@@ -13,7 +13,7 @@ from utils.utils import _CUSTOM_PRINT_FUNC
 from config import (
     WATER_PRICE_PER_LITER_NIS,
     ELECTRICITY_PRICE_PER_KWH_NIS,
-    FERTILIZER_PRICE_PER_3_LITERS_NIS,
+    FERTILIZER_PRICE_PER_5_LITERS_NIS,
 )
 
 # ── Module-level state ────────────────────────────────────────────────────────
@@ -78,6 +78,47 @@ def get_total_fertilizer_liters() -> float:
 
 def get_total_energy_wh() -> float:
     return _total_energy_wh
+
+def reset_resources():
+    """Reset all resource counters to zero — call when starting a new plant cycle."""
+    global _total_water_liters, _total_fertilizer_liters, _total_energy_wh
+    global _prev_water_sensor, _prev_fertilizer_sensor, _prev_energy_sensor
+    _total_water_liters      = 0.0
+    _total_fertilizer_liters = 0.0
+    _total_energy_wh         = 0.0
+    # Reset the flow sensor hardware counters (total volume) to zero
+    _env_sensors.reset_water_amount()
+    _env_sensors.reset_fertilizer_amount()
+    # Snapshot at zero so delta logic starts fresh
+    _prev_water_sensor      = 0.0
+    _prev_fertilizer_sensor = 0.0
+    try:
+        _, _, _, _e, _, _, _ = _env_sensors.get_electricity_values()
+        _prev_energy_sensor = _e
+    except Exception:
+        _prev_energy_sensor = 0.0
+    # Save zeros to MongoDB so restart doesn't reload old values
+    _mongo_db.upsert_state('total_water_liters',      0.0)
+    _mongo_db.upsert_state('total_fertilizer_liters', 0.0)
+    _mongo_db.upsert_state('total_energy_wh',         0.0)
+    # Clear all historical logs for the new plant cycle
+    _mongo_db.clear_collection('sensors_data')
+    _mongo_db.clear_collection('actuators_data')
+    _mongo_db.clear_collection('resources')
+    _mongo_db.clear_collection('pump_logs')
+    _mongo_db.clear_collection('plant_images')
+    # Update sensor cache immediately so frontend sees 0 right away
+    with _sensor_cache_lock:
+        _sensor_cache.update({
+            'water_amount':         0.0,
+            'fertilizer_amount':    0.0,
+            'energy':               0.0,
+            'water_cost_nis':       0.0,
+            'electricity_cost_nis': 0.0,
+            'fertilizer_cost_nis':  0.0,
+            'total_cost_nis':       0.0,
+        })
+    _CUSTOM_PRINT_FUNC("[Resources] All counters and logs reset — new plant cycle started.")
 
 
 def app_task():
@@ -248,7 +289,7 @@ def app_task():
 
             water_cost_nis = round(_total_water_liters      * WATER_PRICE_PER_LITER_NIS,                4)
             elec_cost_nis  = round((_total_energy_wh / 1000.0) * ELECTRICITY_PRICE_PER_KWH_NIS,         4)
-            fert_cost_nis  = round((_total_fertilizer_liters / 3.0) * FERTILIZER_PRICE_PER_3_LITERS_NIS, 4)
+            fert_cost_nis  = round((_total_fertilizer_liters / 5.0) * FERTILIZER_PRICE_PER_5_LITERS_NIS, 4)
             total_cost_nis = round(water_cost_nis + elec_cost_nis + fert_cost_nis,                      4)
 
             # Update sensor cache FIRST — before any MQTT/MongoDB that could fail

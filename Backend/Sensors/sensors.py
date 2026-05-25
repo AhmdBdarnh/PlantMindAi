@@ -25,18 +25,31 @@ class GH_Sensors:
     """
     def __init__(self, general_i2c, mongo_db_handler=None):
         self.__general_i2c = general_i2c
-        self.__Vref = 5.0 # ads source voltage
-        self.__ads_resolution = 65535.0 # maximum resolution for ads sensor (16-bit)
+        self.__Vref = 5.0
+        self.__ads_resolution = 65535.0
+        self._ads_ok = False
 
-        # ads channels
-        self.__ads_sensor = ADS.ADS1115(self.__general_i2c)
-        self.__ads_channels = [0, 1, 2, 3]
+        # ADS1115 init — light and ADS-based soil moisture depend on this
+        # Pumps use RS485 UART sensor, so they remain safe even if ADS1115 fails
+        try:
+            self.__ads_sensor = ADS.ADS1115(self.__general_i2c)
+            self.__ads_channels = [0, 1, 2, 3]
+            self._ads_ok = True
+            _CUSTOM_PRINT_FUNC("[Sensors] ADS1115 detected at 0x48 — OK")
+        except Exception as e:
+            self.__ads_sensor = None
+            self.__ads_channels = [0, 1, 2, 3]
+            _CUSTOM_PRINT_FUNC(
+                f"[Sensors] ERROR: ADS1115 not detected at 0x48 — {e}. "
+                f"Light control and ADS soil moisture disabled. "
+                f"RS485 soil/EC sensor and pumps are unaffected."
+            )
 
         # Initialize sensor drivers
-        self.soil_sensor = SoilSensor(self.__ads_sensor, self.__ads_channels)
-        self.air_sensor = AirSensor()
+        self.soil_sensor        = SoilSensor(self.__ads_sensor, self.__ads_channels)
+        self.air_sensor         = AirSensor()
         self.electricity_sensor = ElectricitySensor()
-        self.light_sensor = LightSensor(ads_sensor=self.__ads_sensor, ads_channels=self.__ads_channels, I2C=self.__general_i2c)
+        self.light_sensor       = LightSensor(ads_sensor=self.__ads_sensor, ads_channels=self.__ads_channels, I2C=self.__general_i2c)
         self.water_flow_sensor      = WaterFlowSensor(mongo_db_handler=mongo_db_handler, state_key="water_amount")
         self.fertilizer_flow_sensor = WaterFlowSensor(mongo_db_handler=mongo_db_handler, state_key="fertilizer_amount")
 

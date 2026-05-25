@@ -9,8 +9,37 @@ load_dotenv()
 
 import datetime
 import os
+import sys
 import time
 import threading
+
+# ── Process lockfile — prevent two instances running at the same time ─────────
+_LOCKFILE = '/tmp/plantmind_ai.lock'
+
+def _acquire_lockfile():
+    if os.path.exists(_LOCKFILE):
+        try:
+            with open(_LOCKFILE) as f:
+                old_pid = int(f.read().strip())
+            # Check if old PID is still alive
+            os.kill(old_pid, 0)
+            print(f"[STARTUP] ERROR: Another PlantMind AI process is already running (PID {old_pid}). Exiting.")
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            # Old PID is dead — stale lockfile, safe to overwrite
+            pass
+    with open(_LOCKFILE, 'w') as f:
+        f.write(str(os.getpid()))
+
+def _release_lockfile():
+    try:
+        os.remove(_LOCKFILE)
+    except FileNotFoundError:
+        pass
+
+import atexit
+_acquire_lockfile()
+atexit.register(_release_lockfile)
 
 import board
 import busio
@@ -58,7 +87,15 @@ mongo_db_handler = MongoDBHandler(MONGO_URI, MONGO_DB_NAME)
 
 i2c = busio.I2C(board.SCL, board.SDA)
 fertilizer_flow_sensor_pin = 16
+_CUSTOM_PRINT_FUNC("[STARTUP] Initializing sensors — checking ADS1115 at 0x48...")
 env_sensors = GH_Sensors(i2c, mongo_db_handler=mongo_db_handler)
+if env_sensors._ads_ok:
+    _CUSTOM_PRINT_FUNC("[STARTUP] ADS1115 OK — light sensor active.")
+else:
+    _CUSTOM_PRINT_FUNC(
+        "[STARTUP] WARNING: ADS1115 not detected. Light sensor disabled. "
+        "Water pump and fertilizer pump are NOT affected — they use the RS485 soil sensor."
+    )
 env_sensors.set_dht22_pin(DHT22_PIN)
 env_sensors.set_soil_moisture_ads1115_channel(ADS1115_SOIL_CH)
 env_sensors.set_light_intensity_ads1115_channel(ADS1115_LIGHT_CH)
@@ -119,6 +156,12 @@ _retry(lambda: env_actuators.setup_water_pump_esp32(pin=33, channel=4, timer_src
 time.sleep(5)
 _retry(lambda: env_actuators.setup_fertilizer_pump_esp32(pin=25, channel=6, timer_src=2, frequency=1000, duty_cycle=0), "fertilizer pump setup")
 time.sleep(5)
+
+# ── Explicit pump OFF — safety guarantee on every startup ────────────────────
+_CUSTOM_PRINT_FUNC("[STARTUP] Setting all pumps to OFF (safety init)...")
+env_actuators.set_water_pump_duty_cycle(0)
+env_actuators.set_fertilizer_pump_duty_cycle(0)
+_CUSTOM_PRINT_FUNC("[STARTUP] Water pump OFF. Fertilizer pump OFF.")
 
 # ── MQTT subscriptions / publications ─────────────────────────────────────────
 
@@ -250,6 +293,7 @@ if __name__ == "__main__":
     # Restore saved mode from MongoDB; fall back to autonomous if nothing was saved
     saved_mode = setpoints.get_operation_mode()
     setpoints.set_operation_mode(saved_mode if saved_mode in ("manual", "autonomous") else "autonomous")
+    _CUSTOM_PRINT_FUNC(f"[STARTUP] Operation mode: {setpoints.get_operation_mode()}. Pumps will activate only after first valid sensor reading.")
     # Clear old DB records and write all current setpoints fresh
     setpoints.save_all_setpoints()
 
