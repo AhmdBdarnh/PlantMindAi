@@ -1045,6 +1045,7 @@ def init_routes(
     # Fan duty setters added in Step 8. Pump parameters remain absent by design.
     _L3_SETPOINT_MAP = {
         'light_setpoint':         ('light',          lambda: setpoints.get_light_setpoint(),          setpoints.set_light_setpoint),
+        'soil_ec_setpoint':       ('soil_ec',        lambda: setpoints.get_soil_ec_setpoint(),        setpoints.set_soil_ec_setpoint),
         'soil_moisture_setpoint': ('soil_moisture',   lambda: setpoints.get_soil_humidity_setpoint(),  setpoints.set_soil_humidity_setpoint),
         'fan_day_duty':           ('fan_day_duty',    lambda: setpoints.get_fan_day_duty(),            setpoints.set_fan_day_duty),
         'fan_night_duty':         ('fan_night_duty',  lambda: setpoints.get_fan_night_duty(),          setpoints.set_fan_night_duty),
@@ -1053,6 +1054,7 @@ def init_routes(
     # Map Layer 2 parameter names to Layer 3 parameter names (for APPROVE fallback)
     _L2_TO_L3_PARAM_MAP = {
         'Light':            'light_setpoint',
+        'Soil EC':          'soil_ec_setpoint',
         'Soil Moisture':    'soil_moisture_setpoint',
     }
 
