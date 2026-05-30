@@ -1,51 +1,103 @@
 import React, { useState, useEffect } from 'react';
+import LineChart from '../components/LineChart';
+import { API_BASE_URL } from '../api/config';
 
-/* ── SVG Line chart ── */
-function LineChart({ data, dataKey, color, height = 120 }) {
-  if (!data || data.length < 2) {
-    return <div className="chart-empty">Collecting data…</div>;
-  }
-  const values = data.map(d => parseFloat(d[dataKey])).filter(v => !isNaN(v));
-  if (values.length < 2) return <div className="chart-empty">Collecting data…</div>;
+const fmtN = v => (v !== undefined && v !== null ? v : 'N/A');
 
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const range = max - min || 1;
-  const W = 500, H = height;
-  const px = 4, py = 6;
-  const iW = W - px * 2, iH = H - py * 2;
+// ── New Plant Cycle reset button + confirmation modal ─────────────────────────
+function NewCycleButton({ onNewCycle }) {
+  const [confirm,  setConfirm]  = useState(false);
+  const [loading,  setLoading]  = useState(false);
+  const [result,   setResult]   = useState(null);   // {ok: bool, msg: string}
 
-  const pts = values.map((v, i) => [
-    px + (i / (values.length - 1)) * iW,
-    py + iH - ((v - min) / range) * iH,
-  ]);
-
-  const linePts = pts.map(([x, y]) => `${x},${y}`).join(' ');
-  const areaPts = [
-    `${pts[0][0]},${py + iH}`,
-    ...pts.map(([x, y]) => `${x},${y}`),
-    `${pts[pts.length - 1][0]},${py + iH}`,
-  ].join(' ');
-
-  const gid = `g-${dataKey}`;
+  const handleConfirm = async () => {
+    setLoading(true);
+    setResult(null);
+    const data = await onNewCycle();
+    setLoading(false);
+    setConfirm(false);
+    if (data.success) {
+      setResult({ ok: true,  msg: data.message || 'New plant cycle started. All counters reset to zero.' });
+    } else {
+      setResult({ ok: false, msg: data.error  || 'Reset failed — check backend logs.' });
+    }
+  };
 
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="line-chart-full" preserveAspectRatio="none" style={{ height }}>
-      <defs>
-        <linearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%"   stopColor={color} stopOpacity="0.2" />
-          <stop offset="100%" stopColor={color} stopOpacity="0"   />
-        </linearGradient>
-      </defs>
-      <polygon fill={`url(#${gid})`} points={areaPts} />
-      <polyline fill="none" stroke={color} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" points={linePts} />
-      <circle cx={pts[pts.length-1][0]} cy={pts[pts.length-1][1]} r="3" fill={color} />
-    </svg>
+    <>
+      {/* Result banner */}
+      {result && (
+        <div style={{
+          marginBottom: 16, padding: '10px 16px', borderRadius: 8,
+          background: result.ok ? '#dcfce7' : '#fee2e2',
+          border: `1px solid ${result.ok ? '#86efac' : '#fca5a5'}`,
+          color: result.ok ? '#166534' : '#991b1b',
+          fontSize: 13, display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        }}>
+          {result.msg}
+          <button onClick={() => setResult(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: 'inherit' }}>✕</button>
+        </div>
+      )}
+
+      {/* Trigger button */}
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 16 }}>
+        <button
+          onClick={() => setConfirm(true)}
+          style={{
+            padding: '7px 18px', borderRadius: 8,
+            border: '1px solid #d97706', background: '#fff7ed',
+            color: '#92400e', fontWeight: 700, fontSize: 13, cursor: 'pointer',
+          }}
+        >
+          🌱 Start New Plant Cycle
+        </button>
+      </div>
+
+      {/* Confirmation modal */}
+      {confirm && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 2000 }}>
+          <div style={{ background: '#fff', borderRadius: 12, padding: 28, maxWidth: 460, width: '90%', boxShadow: '0 20px 60px rgba(0,0,0,0.3)' }}>
+            <h3 style={{ margin: '0 0 12px', fontSize: 17, color: '#111827' }}>Start New Plant Cycle?</h3>
+            <p style={{ fontSize: 13, color: '#374151', lineHeight: 1.7, margin: '0 0 14px' }}>
+              This will reset only resource and cost counters for a new plant cycle.
+              Historical sensor, pump, actuator, image, and decision records will be preserved.
+            </p>
+            <div style={{ background: '#f0fdf4', border: '1px solid #86efac', borderRadius: 8, padding: '10px 14px', marginBottom: 14, fontSize: 12, color: '#166534' }}>
+              <strong>What resets to zero:</strong>
+              <ul style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+                <li>Water / Fertilizer / Energy cumulative totals</li>
+                <li>All cost counters (₪)</li>
+                <li>Today's daily budget baseline</li>
+                <li>Active Layer 3 runtime constraints</li>
+                <li>Pending Layer 3 decisions (marked cancelled — kept as history)</li>
+              </ul>
+            </div>
+            <div style={{ background: '#fef9c3', border: '1px solid #fde047', borderRadius: 8, padding: '10px 14px', marginBottom: 18, fontSize: 12, color: '#854d0e' }}>
+              <strong>What is fully preserved:</strong> sensors_data, pump_logs, actuators_data, resources, plant_images,
+              AI recommendations, Layer 3 decision history, plant health results, growth measurements,
+              setpoints, budget config, camera calibration, all hardware control loops.
+            </div>
+            <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => setConfirm(false)}
+                style={{ padding: '8px 20px', borderRadius: 8, border: '1px solid #d1d5db', background: '#fff', fontSize: 13, cursor: 'pointer' }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleConfirm}
+                disabled={loading}
+                style={{ padding: '8px 20px', borderRadius: 8, border: 'none', background: loading ? '#d97706aa' : '#d97706', color: '#fff', fontWeight: 700, fontSize: 13, cursor: loading ? 'not-allowed' : 'pointer' }}
+              >
+                {loading ? 'Resetting…' : 'Yes, Start New Cycle'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
-
-const fmt  = (v, dec = 2) => (v !== undefined && v !== null ? Number(v).toFixed(dec) : 'N/A');
-const fmtN = v => (v !== undefined && v !== null ? v : 'N/A');
 
 function MetricBox({ label, value, unit, big }) {
   return (
@@ -72,7 +124,7 @@ function PumpLogs() {
 
   useEffect(() => {
     const fetch_logs = () => {
-      fetch('/api/pump-logs?limit=50')
+      fetch(`${API_BASE_URL}/pump-logs?limit=50`)
         .then(r => r.json())
         .then(d => { if (d.success) setLogs(d.logs || []); })
         .catch(() => {})
@@ -188,7 +240,7 @@ function PumpLogs() {
   );
 }
 
-export default function ResourceConsumption({ sensors, sensorHistory }) {
+export default function ResourceConsumption({ sensors, sensorHistory, onNewCycle }) {
   const s = sensors || {};
 
   const energyKwh = s.energy !== undefined && s.energy !== null
@@ -202,6 +254,9 @@ export default function ResourceConsumption({ sensors, sensorHistory }) {
   return (
     <div>
 
+      {/* ── New Plant Cycle button ── */}
+      {onNewCycle && <NewCycleButton onNewCycle={onNewCycle} />}
+
       {/* ── Total Cost Summary ── */}
       <div className="resource-big-card page-section">
         <div className="resource-section-title">
@@ -209,13 +264,17 @@ export default function ResourceConsumption({ sensors, sensorHistory }) {
             <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/>
             <path d="M12 6v12M8 9h8M8 15h8"/>
           </svg>
-          Total Resource Cost (₪)
+          Total Cost Since Reset (cumulative)
+        </div>
+        <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 12, padding: '6px 0', borderBottom: '1px solid #f3f4f6' }}>
+          Cumulative resource cost since the last plant cycle reset. Resets to zero when a new cycle starts.
+          For today's cost relative to your daily budget, see the <strong>Budget Manager</strong> page.
         </div>
         <div className="resource-metrics">
-          <MetricBox label="Electricity Cost" value={<CostBadge value={s.electricity_cost_nis} />} />
-          <MetricBox label="Water Cost"        value={<CostBadge value={s.water_cost_nis} />} />
-          <MetricBox label="Fertilizer Cost"   value={<CostBadge value={s.fertilizer_cost_nis} />} />
-          <MetricBox label="Total Cost" big
+          <MetricBox label="Electricity Cost (since reset)" value={<CostBadge value={s.electricity_cost_nis} />} />
+          <MetricBox label="Water Cost (since reset)"        value={<CostBadge value={s.water_cost_nis} />} />
+          <MetricBox label="Fertilizer Cost (since reset)"   value={<CostBadge value={s.fertilizer_cost_nis} />} />
+          <MetricBox label="Total Cost (since reset)" big
             value={totalCost !== null ? <span style={{ color: '#16a34a', fontWeight: 800 }}>₪{totalCost}</span> : <span className="na">N/A</span>}
           />
         </div>
@@ -233,9 +292,9 @@ export default function ResourceConsumption({ sensors, sensorHistory }) {
 
         <div className="resource-metrics">
           <MetricBox label="Power"            value={fmtN(s.power)}       unit="W"   big />
-          <MetricBox label="Energy (Total)"   value={fmtN(s.energy)}      unit="Wh"  />
-          <MetricBox label="Energy (kWh)"     value={energyKwh}            unit="kWh" />
-          <MetricBox label="Cost"             value={<CostBadge value={s.electricity_cost_nis} />} />
+          <MetricBox label="Energy (Total)"         value={fmtN(s.energy)}      unit="Wh"  />
+          <MetricBox label="Energy (kWh)"           value={energyKwh}            unit="kWh" />
+          <MetricBox label="Cost (since reset)"     value={<CostBadge value={s.electricity_cost_nis} />} />
           <MetricBox label="Voltage"          value={fmtN(s.voltage)}      unit="V"   />
           <MetricBox label="Current"          value={fmtN(s.current)}      unit="A"   />
           <MetricBox label="Frequency"        value={fmtN(s.frequency)}    unit="Hz"  />
@@ -262,9 +321,9 @@ export default function ResourceConsumption({ sensors, sensorHistory }) {
         </div>
 
         <div className="resource-metrics">
-          <MetricBox label="Flow Rate"    value={fmtN(s.water_flow)}   unit="L/min" big />
-          <MetricBox label="Total Volume" value={fmtN(s.water_amount)} unit="L"     />
-          <MetricBox label="Cost"         value={<CostBadge value={s.water_cost_nis} />} />
+          <MetricBox label="Flow Rate"              value={fmtN(s.water_flow)}   unit="L/min" big />
+          <MetricBox label="Total Volume (since reset)" value={fmtN(s.water_amount)} unit="L"     />
+          <MetricBox label="Cost (since reset)"     value={<CostBadge value={s.water_cost_nis} />} />
         </div>
 
         <div>
@@ -289,9 +348,9 @@ export default function ResourceConsumption({ sensors, sensorHistory }) {
         </div>
 
         <div className="resource-metrics">
-          <MetricBox label="Flow Rate"    value={fmtN(s.fertilizer_flow)}   unit="L/min" big />
-          <MetricBox label="Total Volume" value={fmtN(s.fertilizer_amount)} unit="L"     />
-          <MetricBox label="Cost"         value={<CostBadge value={s.fertilizer_cost_nis} />} />
+          <MetricBox label="Flow Rate"              value={fmtN(s.fertilizer_flow)}   unit="L/min" big />
+          <MetricBox label="Total Volume (since reset)" value={fmtN(s.fertilizer_amount)} unit="L"     />
+          <MetricBox label="Cost (since reset)"     value={<CostBadge value={s.fertilizer_cost_nis} />} />
         </div>
 
         <div>

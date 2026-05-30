@@ -1,9 +1,15 @@
-# --- Serial Logger with 3 Tables (Sensors/Actuators | Mode/Setpoints + Resources) --- 
+# --- Serial Logger with 3 Tables (Sensors/Actuators | Mode/Setpoints + Resources) ---
+# Set DEBUG_VERBOSE=true in .env to enable the full ASCII table.
+# When false (default) only a compact one-line heartbeat is printed every 30 seconds.
 
 import os
 import time
 import datetime
 import threading
+
+# Read once at import time — changing .env requires a backend restart.
+_verbose        = os.environ.get('DEBUG_VERBOSE', 'false').strip().lower() == 'true'
+_last_heartbeat = 0.0   # tracks time of last compact heartbeat print
 
 # Global dictionary to store the latest data for display
 latest_data = {
@@ -31,9 +37,9 @@ latest_data = {
 data_lock = threading.Lock()
 
 def serial_logger_task(sensors, get_last_sensor_update_fun, actuators, setpoints, temp_sem, light_sem, soil_sem, flow_sem, electricity_sem):
-    """Reads data, mode, setpoints, resources; prints 3 tables."""
-    global latest_data
-    
+    """Reads data, mode, setpoints, resources; prints 3 tables (verbose) or a heartbeat line."""
+    global latest_data, _last_heartbeat
+
     # Initialize cumulative water consumption within the task scope
     cumulative_water_liters = 0.0
     cumulative_fertilizer_liters = 0.0
@@ -232,127 +238,134 @@ def serial_logger_task(sensors, get_last_sensor_update_fun, actuators, setpoints
         with data_lock:
             latest_data.update(current_state)
 
-        # --- Formatting --- 
-        left_col1_width = 18; left_col2_width = 18
-        right_col1_width = 25; right_col2_width = 25
-        separator = " | "
-        left_total_width = left_col1_width + left_col2_width + 3
-        right_total_width = right_col1_width + right_col2_width + 3
+        # --- Output (controlled by DEBUG_VERBOSE in .env) ---
+        if _verbose:
+            # ── Full ASCII table — only shown when DEBUG_VERBOSE=true ─────────
+            left_col1_width = 18; left_col2_width = 18
+            right_col1_width = 25; right_col2_width = 25
+            separator = " | "
+            left_total_width  = left_col1_width  + left_col2_width  + 3
+            right_total_width = right_col1_width + right_col2_width + 3
 
-        def format_value(value, unit):
-            if isinstance(value, (int, float)):
-                if unit == "Wh" or unit == "L": formatted_val = f"{value:.3f}"
-                elif unit in ["A", "PF", "L/min", "L/h"]: formatted_val = f"{value:.2f}"
-                elif unit == "Lux": formatted_val = f"{value:.0f}"
-                elif isinstance(value, float): formatted_val = f"{value:.1f}"
-                else: formatted_val = str(value)
-                return f"{formatted_val} {unit}" if unit else formatted_val
-            else: return str(value)
+            def format_value(value, unit):
+                if isinstance(value, (int, float)):
+                    if unit == "Wh" or unit == "L": formatted_val = f"{value:.3f}"
+                    elif unit in ["A", "PF", "L/min", "L/h"]: formatted_val = f"{value:.2f}"
+                    elif unit == "Lux": formatted_val = f"{value:.0f}"
+                    elif isinstance(value, float): formatted_val = f"{value:.1f}"
+                    else: formatted_val = str(value)
+                    return f"{formatted_val} {unit}" if unit else formatted_val
+                else: return str(value)
 
-        # Build Left Table (Sensors/Actuators)
-        left_lines = []
-        left_sep =    '+' + '-' * left_col1_width + '+' + '-' * left_col2_width + '+'
-        left_header = '|' + " Sensor".ljust(left_col1_width) + '|' + " Value".ljust(left_col2_width) + '|'
-        act_header =  '|' + " Actuator".ljust(left_col1_width) + '|' + " Duty Cycle (Raw%)".ljust(left_col2_width) + '|'
-        left_lines.append(left_sep)
-        left_lines.append('|' + " Greenhouse Monitor".center(left_total_width - 2) + '|')
-        left_lines.append(left_sep)
-        left_lines.append('|' + f" Timestamp: {current_state['timestamp']} ".ljust(left_total_width - 2) + '|')
-        left_lines.append(left_sep)
-        left_lines.append(left_header)
-        left_lines.append(left_sep)
-        sensors_to_print = [
-            ("Temp (Air)", "temperature", "C"), ("Humidity (Air)", "humidity", "%"),
-            ("Light Intensity", "light_intensity", "Lux"), ("Soil pH", "soil_ph", "pH"),
-            ("Soil EC", "soil_ec", "uS/cm"), ("Soil Temp", "soil_temp", "C"),
-            ("Soil Humidity", "soil_humidity", "%"), ("Water Flow", "water_flow", "L/min"),
-            ("Fertilizer Flow", "fertilizer_flow", "L/min"),
-            ("Voltage", "electricity_voltage", "V"), ("Current", "electricity_current", "A"),
-            ("Power", "electricity_power", "W"), ("Energy", "electricity_energy", "Wh"), # Display instantaneous energy here
-            ("Frequency", "electricity_frequency", "Hz"), ("Power Factor", "electricity_pf", "PF"),
-            ("Alarm Status", "electricity_alarm", "")
-        ]
-        for name, key, unit in sensors_to_print:
-            val_str = format_value(current_state.get(key, "N/A"), unit)
-            left_lines.append('|' + f" {name}".ljust(left_col1_width) + '|' + f" {val_str}".ljust(left_col2_width) + '|')
-        left_lines.append(left_sep)
-        left_lines.append(act_header)
-        left_lines.append(left_sep)
-        max_dc = 4095
-        actuators_to_print = [
-            ("Heater", "heater_dc"), ("Heater Fan", "heater_fan_dc"),
-            ("Light Strip 1", "light_strip_1_dc"), ("Light Strip 2", "light_strip_2_dc"),
-            ("Water Pump", "water_pump_dc"), ("Fertilizer Pump", "fertilizer_pump_dc"),
-            ("Cooling Fan", "fan_dc")
-        ]
-        for name, key in actuators_to_print:
-            dc = current_state.get(key, "N/A")
-            if isinstance(dc, (int, float)): val_str = f"{dc:<4} ({(dc / max_dc * 100) if max_dc > 0 else 0:.1f}%)"
-            else: val_str = str(dc)
-            left_lines.append('|' + f" {name}".ljust(left_col1_width) + '|' + f" {val_str}".ljust(left_col2_width) + '|')
-        left_lines.append(left_sep)
+            # Build Left Table (Sensors/Actuators)
+            left_lines = []
+            left_sep =    '+' + '-' * left_col1_width + '+' + '-' * left_col2_width + '+'
+            left_header = '|' + " Sensor".ljust(left_col1_width) + '|' + " Value".ljust(left_col2_width) + '|'
+            act_header =  '|' + " Actuator".ljust(left_col1_width) + '|' + " Duty Cycle (Raw%)".ljust(left_col2_width) + '|'
+            left_lines.append(left_sep)
+            left_lines.append('|' + " Greenhouse Monitor".center(left_total_width - 2) + '|')
+            left_lines.append(left_sep)
+            left_lines.append('|' + f" Timestamp: {current_state['timestamp']} ".ljust(left_total_width - 2) + '|')
+            left_lines.append(left_sep)
+            left_lines.append(left_header)
+            left_lines.append(left_sep)
+            sensors_to_print = [
+                ("Temp (Air)", "temperature", "C"), ("Humidity (Air)", "humidity", "%"),
+                ("Light Intensity", "light_intensity", "Lux"), ("Soil pH", "soil_ph", "pH"),
+                ("Soil EC", "soil_ec", "uS/cm"), ("Soil Temp", "soil_temp", "C"),
+                ("Soil Humidity", "soil_humidity", "%"), ("Water Flow", "water_flow", "L/min"),
+                ("Fertilizer Flow", "fertilizer_flow", "L/min"),
+                ("Voltage", "electricity_voltage", "V"), ("Current", "electricity_current", "A"),
+                ("Power", "electricity_power", "W"), ("Energy", "electricity_energy", "Wh"),
+                ("Frequency", "electricity_frequency", "Hz"), ("Power Factor", "electricity_pf", "PF"),
+                ("Alarm Status", "electricity_alarm", "")
+            ]
+            for name, key, unit in sensors_to_print:
+                val_str = format_value(current_state.get(key, "N/A"), unit)
+                left_lines.append('|' + f" {name}".ljust(left_col1_width) + '|' + f" {val_str}".ljust(left_col2_width) + '|')
+            left_lines.append(left_sep)
+            left_lines.append(act_header)
+            left_lines.append(left_sep)
+            max_dc = 4095
+            actuators_to_print = [
+                ("Heater", "heater_dc"), ("Heater Fan", "heater_fan_dc"),
+                ("Light Strip 1", "light_strip_1_dc"), ("Light Strip 2", "light_strip_2_dc"),
+                ("Water Pump", "water_pump_dc"), ("Fertilizer Pump", "fertilizer_pump_dc"),
+                ("Cooling Fan", "fan_dc")
+            ]
+            for name, key in actuators_to_print:
+                dc = current_state.get(key, "N/A")
+                if isinstance(dc, (int, float)): val_str = f"{dc:<4} ({(dc / max_dc * 100) if max_dc > 0 else 0:.1f}%)"
+                else: val_str = str(dc)
+                left_lines.append('|' + f" {name}".ljust(left_col1_width) + '|' + f" {val_str}".ljust(left_col2_width) + '|')
+            left_lines.append(left_sep)
 
-        # Build Right Top Table (Mode/Setpoints)
-        right_top_lines = []
-        right_sep =    '+' + '-' * right_col1_width + '+' + '-' * right_col2_width + '+'
-        right_header = '|' + " Mode / Setpoint".ljust(right_col1_width) + '|' + " Value".ljust(right_col2_width) + '|'
-        right_top_lines.append(right_sep)
-        right_top_lines.append('|' + " Control Status".center(right_total_width - 2) + '|')
-        right_top_lines.append(right_sep)
-        right_top_lines.append(right_header)
-        right_top_lines.append(right_sep)
-        mode_str = str(current_state.get("mode", "N/A"))
-        right_top_lines.append('|' + " Mode".ljust(right_col1_width) + '|' + f" {mode_str}".ljust(right_col2_width) + '|')
-        right_top_lines.append(right_sep)
-        setpoints_to_print = [
-            ("Temp SP", "temp_sp", "C"),
-            # ("Humidity SP", "hum_sp", "%"),
-            ("Light SP", "light_sp", "Lux"), 
-            # ("Soil pH SP", "soil_ph_sp", "pH"),
-            # ("Soil EC SP", "soil_ec_sp", "uS/cm"), 
-            # ("Soil Temp SP", "soil_temp_sp", "C"),
-            ("Soil Humidity SP", "soil_hum_sp", "%"), 
-            # ("Water Flow SP", "flow_sp", "L/h")
-        ]
-        for name, key, unit in setpoints_to_print:
-            val_str = format_value(current_state.get(key, "N/A"), unit)
-            right_top_lines.append('|' + f" {name}".ljust(right_col1_width) + '|' + f" {val_str}".ljust(right_col2_width) + '|')
-        right_top_lines.append(right_sep)
+            # Build Right Top Table (Mode/Setpoints)
+            right_top_lines = []
+            right_sep =    '+' + '-' * right_col1_width + '+' + '-' * right_col2_width + '+'
+            right_header = '|' + " Mode / Setpoint".ljust(right_col1_width) + '|' + " Value".ljust(right_col2_width) + '|'
+            right_top_lines.append(right_sep)
+            right_top_lines.append('|' + " Control Status".center(right_total_width - 2) + '|')
+            right_top_lines.append(right_sep)
+            right_top_lines.append(right_header)
+            right_top_lines.append(right_sep)
+            mode_str = str(current_state.get("mode", "N/A"))
+            right_top_lines.append('|' + " Mode".ljust(right_col1_width) + '|' + f" {mode_str}".ljust(right_col2_width) + '|')
+            right_top_lines.append(right_sep)
+            setpoints_to_print = [
+                ("Temp SP", "temp_sp", "C"),
+                ("Light SP", "light_sp", "Lux"),
+                ("Soil Humidity SP", "soil_hum_sp", "%"),
+            ]
+            for name, key, unit in setpoints_to_print:
+                val_str = format_value(current_state.get(key, "N/A"), unit)
+                right_top_lines.append('|' + f" {name}".ljust(right_col1_width) + '|' + f" {val_str}".ljust(right_col2_width) + '|')
+            right_top_lines.append(right_sep)
 
-        # Build Right Bottom Table (Resources)
-        right_bottom_lines = []
-        res_header = '|' + " Resource".ljust(right_col1_width) + '|' + " Consumption".ljust(right_col2_width) + '|'
-        # No top title for this one, just append to the right column
-        right_bottom_lines.append(res_header)
-        right_bottom_lines.append(right_sep)
-        resources_to_print = [
-            ("Water Consumed", "water_consumed", "L"),
-            ("Fertilizer Consumed", "fertilizer_consumed", "L"),
-            ("Energy Consumed", "electricity_energy", "Wh"), # Get latest cumulative energy reading
-            ("Last Resource Reset", "last_resource_reset", ""), # Not printing this as it is a datetime
-            ("Last Update Readings", "last_update_readings", "") # Not printing this as it is a datetime
-        ]
-        for name, key, unit in resources_to_print:
-            val_str = format_value(current_state.get(key, "N/A"), unit)
-            right_bottom_lines.append('|' + f" {name}".ljust(right_col1_width) + '|' + f" {val_str}".ljust(right_col2_width) + '|')
-        right_bottom_lines.append(right_sep)
+            # Build Right Bottom Table (Resources)
+            right_bottom_lines = []
+            res_header = '|' + " Resource".ljust(right_col1_width) + '|' + " Consumption".ljust(right_col2_width) + '|'
+            right_bottom_lines.append(res_header)
+            right_bottom_lines.append(right_sep)
+            resources_to_print = [
+                ("Water Consumed",    "water_consumed",       "L"),
+                ("Fertilizer Cons.",  "fertilizer_consumed",  "L"),
+                ("Energy Consumed",   "electricity_energy",   "Wh"),
+                ("Last Reset",        "last_resource_reset",  ""),
+                ("Last Update",       "last_update_readings", ""),
+            ]
+            for name, key, unit in resources_to_print:
+                val_str = format_value(current_state.get(key, "N/A"), unit)
+                right_bottom_lines.append('|' + f" {name}".ljust(right_col1_width) + '|' + f" {val_str}".ljust(right_col2_width) + '|')
+            right_bottom_lines.append(right_sep)
 
-        # Combine Right Tables Vertically
-        right_lines = right_top_lines + right_bottom_lines
+            # Combine and print
+            right_lines = right_top_lines + right_bottom_lines
+            max_lines   = max(len(left_lines), len(right_lines))
+            left_blank  = ' ' * left_total_width
+            right_blank = ' ' * right_total_width
+            combined_output = []
+            for i in range(max_lines):
+                l = left_lines[i]  if i < len(left_lines)  else left_blank
+                r = right_lines[i] if i < len(right_lines) else right_blank
+                combined_output.append(l + separator + r)
 
-        # Combine Left and Right Tables Horizontally
-        max_lines = max(len(left_lines), len(right_lines))
-        combined_output = []
-        left_blank = ' ' * left_total_width
-        right_blank = ' ' * right_total_width
-        for i in range(max_lines):
-            left_line = left_lines[i] if i < len(left_lines) else left_blank
-            right_line = right_lines[i] if i < len(right_lines) else right_blank
-            combined_output.append(left_line + separator + right_line)
+            os.system('clear')
+            print("\n".join(combined_output))
 
-        # Print Output
-        os.system('clear')
-        print("\n".join(combined_output))
+        else:
+            # ── Compact heartbeat every 30 s — DEBUG_VERBOSE=false (default) ──
+            if time.time() - _last_heartbeat >= 30:
+                _last_heartbeat = time.time()
+                t  = current_state.get('temperature',    'N/A')
+                h  = current_state.get('humidity',       'N/A')
+                li = current_state.get('light_intensity','N/A')
+                m  = current_state.get('mode',           'N/A')
+                t_str  = f"{t:.1f}°C"   if isinstance(t,  (int, float)) else str(t)
+                h_str  = f"{h:.1f}%"    if isinstance(h,  (int, float)) else str(h)
+                li_str = f"{li:.0f}Lux" if isinstance(li, (int, float)) else str(li)
+                print(f"[SerialLogger] {current_state['timestamp']} | "
+                      f"T={t_str} H={h_str} Light={li_str} | Mode={m}")
 
         # Sleep
         time.sleep(1)

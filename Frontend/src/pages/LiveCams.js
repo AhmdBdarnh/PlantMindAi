@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { API_BASE_URL } from '../api/config';
 
 const CAMERAS = [
   { id: 1, displayId: 1, name: '2K USB Camera', streamPath: '/video_c1' },
@@ -201,7 +202,7 @@ export default function LiveCams() {
     setCapturing(true);
     setCaptureResult(null);
     try {
-      const res  = await fetch('/api/capture_local', { method: 'POST' });
+      const res  = await fetch(`${API_BASE_URL}/capture_local`, { method: 'POST' });
       const data = await res.json();
       setCaptureResult(data);
     } catch (e) {

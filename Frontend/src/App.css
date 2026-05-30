@@ -353,6 +353,32 @@ input  { font-family: inherit; }
 
 .error-close svg { width: 14px; height: 14px; }
 
+/* ── Health / staleness banner ── */
+.health-banner {
+  padding: 8px 20px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 500;
+  flex-shrink: 0;
+  border-bottom: 1px solid transparent;
+}
+
+/* Sensor loop completely frozen */
+.health-banner-frozen {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #b91c1c;
+}
+
+/* Sensor data is between 2 and 5 minutes old */
+.health-banner-stale {
+  background: var(--amber-light);
+  border-color: #fcd34d;
+  color: #92400e;
+}
+
 /* ── Page content ── */
 .page-content {
   flex: 1;
@@ -1343,3 +1369,24 @@ input[type="range"]:disabled { opacity: .5; cursor: not-allowed; }
 
 /* Page padding top helper */
 .page-section { margin-bottom: 24px; }
+
+/* ================================================================
+   PLANT HEALTH PAGE
+   ================================================================ */
+
+.health-page-two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+}
+
+@media (max-width: 760px) {
+  .health-page-two-col { grid-template-columns: 1fr; }
+}
+
+/* Growth page responsive right panel */
+@media (max-width: 960px) {
+  .growth-content-grid {
+    grid-template-columns: 1fr !important;
+  }
+}

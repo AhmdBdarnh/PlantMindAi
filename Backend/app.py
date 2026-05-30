@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import datetime
+import logging
 import os
 import sys
 import time
@@ -60,6 +61,8 @@ import actuator_helpers
 import capture_manager
 import app_loop
 import control_loops
+import growth_metrics
+import ai_setpoint_advisor
 import routes
 
 from config import (
@@ -89,12 +92,14 @@ i2c = busio.I2C(board.SCL, board.SDA)
 fertilizer_flow_sensor_pin = 16
 _CUSTOM_PRINT_FUNC("[STARTUP] Initializing sensors — checking ADS1115 at 0x48...")
 env_sensors = GH_Sensors(i2c, mongo_db_handler=mongo_db_handler)
+# Use print() directly so this line is always visible regardless of serial-log state.
 if env_sensors._ads_ok:
-    _CUSTOM_PRINT_FUNC("[STARTUP] ADS1115 OK — light sensor active.")
+    print("[STARTUP] ADS1115 OK — light sensor active.")
 else:
-    _CUSTOM_PRINT_FUNC(
-        "[STARTUP] WARNING: ADS1115 not detected. Light sensor disabled. "
-        "Water pump and fertilizer pump are NOT affected — they use the RS485 soil sensor."
+    print(
+        "[STARTUP] WARNING: ADS1115 not detected. "
+        "Light sensor disabled. Water pump and fertilizer pump are NOT affected "
+        "(they use the RS485 soil sensor)."
     )
 env_sensors.set_dht22_pin(DHT22_PIN)
 env_sensors.set_soil_moisture_ads1115_channel(ADS1115_SOIL_CH)
@@ -221,9 +226,15 @@ mongo_db_handler.create_collection("plant_images",   "plant image",  {"_id": "",
 
 # ── Other singletons ──────────────────────────────────────────────────────────
 
-s3_handler          = S3Handler(AWS_S3_BUCKET, AWS_REGION)
+s3_handler           = S3Handler(AWS_S3_BUCKET, AWS_REGION)
 plant_health_checker = PlantHealthChecker()
-camera              = GH_Camera()
+camera               = GH_Camera()
+
+# ── Growth metrics init ───────────────────────────────────────────────────────
+growth_metrics.init(s3_handler, mongo_db_handler)
+
+# ── AI Setpoint Advisor init ──────────────────────────────────────────────────
+ai_setpoint_advisor.init(setpoints, mongo_db_handler)
 
 # ── Semaphores / events ───────────────────────────────────────────────────────
 
@@ -268,6 +279,42 @@ app_loop.init(
 
 app = Flask(__name__)
 CORS(app)
+
+# ── Suppress repetitive polling GET logs (DEBUG_VERBOSE=false, the default) ───
+# POST requests, errors (4xx/5xx), and all non-polling GETs are always shown.
+# Set DEBUG_VERBOSE=true in .env to restore full werkzeug access logging.
+class _QuietPollingFilter(logging.Filter):
+    _QUIET = frozenset({
+        '/api/sensors', '/api/actuators', '/api/operation_mode',
+        '/api/setpoints', '/api/health',
+        '/api/plant_health', '/api/plant-health/latest', '/api/plant-health/history',
+        '/api/growth/latest', '/api/growth/history',
+        '/api/pump-logs', '/api/capture_sessions',
+        '/video_c1', '/video_c2', '/video_c4',
+    })
+
+    def filter(self, record):
+        msg = record.getMessage()
+        # Only consider suppressing GET requests
+        if '"GET ' not in msg:
+            return True
+        # Always show error responses (4xx / 5xx)
+        try:
+            status = int(msg.rsplit('"', 1)[-1].split()[0])
+            if status >= 400:
+                return True
+        except (ValueError, IndexError):
+            return True
+        # Suppress if the path matches a quiet endpoint.
+        # Check for path followed by space, query string (?), or closing quote
+        # so that /api/foo does not accidentally match /api/foobar.
+        for path in self._QUIET:
+            if f'"GET {path} ' in msg or f'"GET {path}?' in msg or f'"GET {path}"' in msg:
+                return False
+        return True
+
+if not os.environ.get('DEBUG_VERBOSE', 'false').strip().lower() == 'true':
+    logging.getLogger('werkzeug').addFilter(_QuietPollingFilter())
 
 routes.init_routes(
     app,
@@ -329,18 +376,81 @@ if __name__ == "__main__":
     )
     app_thread = threading.Thread(target=app_loop.app_task)
 
+    # 14:00 — health capture → s3://captures/ + PlantID health check
     daily_capture_thread = threading.Thread(
         target=capture_manager.daily_capture_task,
         kwargs={'hour': 14, 'minute': 0},
         daemon=True,
     )
 
+    # 14:10 — dedicated growth capture → s3://growth_capture_input/  (no health check)
+    daily_growth_capture_thread = threading.Thread(
+        target=capture_manager.daily_growth_capture_task,
+        kwargs={'hour': 14, 'minute': 10},
+        daemon=True,
+    )
+
+    def _daily_growth_task():
+        """
+        Fire a growth analysis from S3 every day at 14:15 — 5 minutes after the
+        dedicated growth capture (14:10) so images are guaranteed to be in S3.
+        Reads from growth_capture_input/ which contains ONLY growth photos,
+        completely separate from the health check captures in captures/.
+        """
+        import time
+        import os as _os
+        while True:
+            now    = datetime.datetime.now()
+            target = now.replace(hour=14, minute=15, second=0, microsecond=0)
+            if now >= target:
+                target += datetime.timedelta(days=1)
+            sleep_secs = (target - now).total_seconds()
+            _CUSTOM_PRINT_FUNC(
+                f"[GrowthScheduler] Next growth analysis at "
+                f"{target.strftime('%Y-%m-%d %H:%M')} (in {sleep_secs / 3600:.1f}h)"
+            )
+            time.sleep(sleep_secs)
+            try:
+                # Always read from growth_capture_input/ — never from captures/
+                prefix = _os.environ.get('AWS_S3_GROWTH_PREFIX', 'growth_capture_input/')
+                growth_metrics.run_from_s3(prefix=prefix)
+            except Exception as e:
+                _CUSTOM_PRINT_FUNC(f"[GrowthScheduler] Daily run failed: {e}")
+
+    daily_growth_thread = threading.Thread(target=_daily_growth_task, daemon=True)
+
+    # 15:30 — AI Setpoint Advisor: collect data → call GPT → save pending recommendation
+    daily_ai_advisor_thread = threading.Thread(
+        target=ai_setpoint_advisor.daily_advisor_task,
+        kwargs={'hour': 15, 'minute': 30},
+        daemon=True,
+    )
+
+    # ── Fan schedule test thread (2-day time-based schedule) ─────────────────
+    if control_loops.FAN_SCHEDULE_TEST_ENABLED:
+        fan_schedule_thread = threading.Thread(
+            target=control_loops.fan_schedule_task,
+            args=(env_actuators, setpoints),
+            kwargs={'check_interval_sec': 60},
+            daemon=True,
+        )
+        fan_schedule_thread.start()
+        _CUSTOM_PRINT_FUNC(
+            "[STARTUP] Fan schedule test ENABLED — "
+            "06:00–20:00 = 100%,  20:00–06:00 = 25%"
+        )
+    else:
+        _CUSTOM_PRINT_FUNC("[STARTUP] Fan schedule test DISABLED — using PID fan control.")
+
     temperature_thread.start()
     light_thread.start()
     soil_thread.start()
     fertilizer_thread.start()
     app_thread.start()
-    daily_capture_thread.start()
+    daily_capture_thread.start()          # 14:00 — health capture → captures/
+    daily_growth_capture_thread.start()   # 14:10 — growth capture → growth_capture_input/
+    daily_growth_thread.start()           # 14:15 — growth analysis from growth_capture_input/
+    daily_ai_advisor_thread.start()       # 15:30 — AI Setpoint Advisor
 
     _CUSTOM_PRINT_FUNC("Starting serial logger thread...")
     set_serial_log_enabled(True)

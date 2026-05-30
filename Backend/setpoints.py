@@ -11,12 +11,17 @@ class GH_Setpoints:
         self.__humidity_setpoint         = 68.0
         self.__light_setpoint            = 600.0
         self.__soil_ph_setpoint          = 6.3
-        self.__soil_ec_setpoint          = 1300.0
+        self.__soil_ec_setpoint          = 850.0
         self.__soil_temp_setpoint        = 21.0
-        self.__soil_humidity_setpoint    = 70.0
+        self.__soil_humidity_setpoint    = 50.0
         self.__soil_humidity_hysteresis  = 10.0
         self.__water_flow_setpoint       = 2.0
         self.__fertilizer_flow_setpoint  = 0.5
+        # Fan duty — migrated from hardcoded constants in control_loops.py (Step 8).
+        # Fallback values match the original hardcoded constants exactly so that
+        # behavior is unchanged when no value has been saved to MongoDB yet.
+        self.__fan_day_duty              = 4095   # 100% — matches FAN_DAY_DUTY fallback
+        self.__fan_night_duty            = 1024   # 25%  — matches FAN_NIGHT_DUTY fallback
         self.operation_mode              = "autonomous"
 
         self.__control_threads_events = {
@@ -56,6 +61,8 @@ class GH_Setpoints:
             self.__soil_humidity_hysteresis = float(doc.get('soil_hysteresis', self.__soil_humidity_hysteresis))
             self.__water_flow_setpoint      = float(doc.get('water_flow',      self.__water_flow_setpoint))
             self.__fertilizer_flow_setpoint = float(doc.get('fertilizer_flow', self.__fertilizer_flow_setpoint))
+            self.__fan_day_duty             = int(doc.get('fan_day_duty',   self.__fan_day_duty))
+            self.__fan_night_duty           = int(doc.get('fan_night_duty', self.__fan_night_duty))
             # Always start in manual mode regardless of what was saved
             self.operation_mode             = 'manual'
         except Exception as e:
@@ -89,6 +96,8 @@ class GH_Setpoints:
                     'soil_hysteresis':self.__soil_humidity_hysteresis,
                     'water_flow':     self.__water_flow_setpoint,
                     'fertilizer_flow':self.__fertilizer_flow_setpoint,
+                    'fan_day_duty':   self.__fan_day_duty,
+                    'fan_night_duty': self.__fan_night_duty,
                     'operation_mode': self.operation_mode,
                     'timestamp':      datetime.datetime.now(),
                 },
@@ -180,6 +189,20 @@ class GH_Setpoints:
         self._save("fertilizer_flow", float(value))
         _CUSTOM_PRINT_FUNC(f"[Setpoints] Fertilizer flow → {value} L/h")
 
+    def set_fan_day_duty(self, value: int) -> None:
+        """Set fan duty cycle for daytime (0–4095). Fallback: 4095."""
+        v = max(0, min(4095, int(value)))
+        self.__fan_day_duty = v
+        self._save("fan_day_duty", v)
+        _CUSTOM_PRINT_FUNC(f"[Setpoints] Fan day duty → {v} ({round((v/4095)*100,1)}%)")
+
+    def set_fan_night_duty(self, value: int) -> None:
+        """Set fan duty cycle for nighttime (0–4095). Fallback: 1024."""
+        v = max(0, min(4095, int(value)))
+        self.__fan_night_duty = v
+        self._save("fan_night_duty", v)
+        _CUSTOM_PRINT_FUNC(f"[Setpoints] Fan night duty → {v} ({round((v/4095)*100,1)}%)")
+
     # ── Getters ────────────────────────────────────────────────────────────────
 
     def get_temperature_setpoint(self) -> float:
@@ -212,6 +235,14 @@ class GH_Setpoints:
     def get_fertilizer_flow_setpoint(self) -> float:
         return self.__fertilizer_flow_setpoint
 
+    def get_fan_day_duty(self) -> int:
+        """Return fan daytime duty cycle (0–4095). Default 4095."""
+        return self.__fan_day_duty
+
+    def get_fan_night_duty(self) -> int:
+        """Return fan nighttime duty cycle (0–4095). Default 1024."""
+        return self.__fan_night_duty
+
     def get_all_setpoints(self) -> dict:
         return {
             "temperature":      self.__temperature_setpoint,
@@ -224,5 +255,7 @@ class GH_Setpoints:
             "soil_hysteresis":  self.__soil_humidity_hysteresis,
             "water_flow":       self.__water_flow_setpoint,
             "fertilizer_flow":  self.__fertilizer_flow_setpoint,
+            "fan_day_duty":     self.__fan_day_duty,
+            "fan_night_duty":   self.__fan_night_duty,
             "operation_mode":   self.operation_mode,
         }

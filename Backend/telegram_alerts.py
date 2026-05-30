@@ -1,0 +1,384 @@
+"""
+telegram_alerts.py — Telegram notification system for PlantMind AI.
+
+Sends alerts to your Telegram when abnormal events occur in sensors,
+actuators, or the backend system.
+
+Configuration (from .env):
+    TELEGRAM_BOT_TOKEN=your_bot_token
+    TELEGRAM_CHAT_ID=902586320
+
+All logic is here — other files only call the helper functions.
+"""
+
+import os
+import time
+import threading
+import requests
+from datetime import datetime
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID   = os.getenv('TELEGRAM_CHAT_ID', '902586320')
+TELEGRAM_ENABLED   = bool(TELEGRAM_BOT_TOKEN)
+
+# ── Cooldown settings ─────────────────────────────────────────────────────────
+# Same alert will not be re-sent until the cooldown expires.
+
+COOLDOWN_SEC = {
+    'INFO':     1800,   # 30 minutes
+    'WARNING':   600,   # 10 minutes
+    'CRITICAL':  120,   #  2 minutes
+    'DANGER':    120,   #  2 minutes
+}
+
+# ── Internal cooldown state ───────────────────────────────────────────────────
+
+_cooldown_lock = threading.Lock()
+_last_sent: dict = {}   # alert_key → timestamp (float)
+
+
+# ── Core send function ────────────────────────────────────────────────────────
+
+def send_telegram_alert(
+    title:           str,
+    message:         str,
+    severity:        str  = "WARNING",
+    component:       str  = None,
+    current_value          = None,
+    allowed_range:   str  = None,
+    action_taken:    str  = None,
+    recommendation:  str  = None,
+    data:            dict = None,
+) -> bool:
+    """
+    Send a Telegram message with cooldown and full error handling.
+    Returns True if sent, False if skipped (cooldown) or failed.
+    The backend will NEVER crash if Telegram fails.
+    """
+    if not TELEGRAM_ENABLED:
+        print(f"[Telegram] DISABLED (no token). Would send [{severity}] {title}: {message}")
+        return False
+
+    alert_key = f"{title}|{component or ''}"
+    cooldown  = COOLDOWN_SEC.get(severity.upper(), 600)
+
+    with _cooldown_lock:
+        last = _last_sent.get(alert_key, 0)
+        if (time.time() - last) < cooldown:
+            return False   # still on cooldown — skip silently
+        _last_sent[alert_key] = time.time()
+
+    text = _build_message(
+        title, message, severity, component,
+        current_value, allowed_range, action_taken, recommendation, data,
+    )
+
+    try:
+        url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        resp = requests.post(
+            url,
+            json={'chat_id': TELEGRAM_CHAT_ID, 'text': text, 'parse_mode': 'Markdown'},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            print(f"[Telegram] Sent [{severity}] {title}")
+            return True
+        print(f"[Telegram] HTTP {resp.status_code}: {resp.text[:200]}")
+        return False
+    except Exception as e:
+        print(f"[Telegram] ERROR (backend continues): {e}")
+        return False
+
+
+def _md_escape(text) -> str:
+    """Escape Telegram Markdown v1 special characters in dynamic/user-generated text."""
+    s = str(text) if not isinstance(text, str) else text
+    for ch in ('_', '*', '`', '['):
+        s = s.replace(ch, f'\\{ch}')
+    return s
+
+
+def _build_message(
+    title, message, severity, component,
+    current_value, allowed_range, action_taken, recommendation, data,
+) -> str:
+    icons = {'INFO': 'ℹ️', 'WARNING': '⚠️', 'CRITICAL': '🚨', 'DANGER': '🔴'}
+    icon  = icons.get(severity.upper(), '⚠️')
+    ts    = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    lines = [
+        f"{icon} *PlantMind AI Alert*",
+        "",
+        f"*Severity:* {severity.upper()}",
+        f"*Time:* {ts}",
+    ]
+    if component:
+        lines.append(f"*Component:* {_md_escape(component)}")
+    lines.append(f"*Problem:* {_md_escape(message)}")
+    if current_value is not None:
+        lines.append(f"*Current Value:* {_md_escape(current_value)}")
+    if allowed_range:
+        lines.append(f"*Allowed Range:* {_md_escape(allowed_range)}")
+    if action_taken:
+        lines.append(f"*Action Taken:* {_md_escape(action_taken)}")
+    if recommendation:
+        lines.append(f"*Recommendation:* {_md_escape(recommendation)}")
+    if data:
+        lines.append("")
+        lines.append("*Details:*")
+        for k, v in data.items():
+            lines.append(f"  • {k}: {_md_escape(v)}")
+
+    return "\n".join(lines)
+
+
+# ── Helper functions — called from other modules ──────────────────────────────
+
+def alert_sensor_error(sensor_name: str, value, reason: str = "Invalid reading"):
+    send_telegram_alert(
+        title         = "Sensor Error",
+        message       = reason,
+        severity      = "WARNING",
+        component     = sensor_name,
+        current_value = str(value),
+        action_taken  = "Pump disabled for this cycle",
+        recommendation= f"Check {sensor_name} wiring and RS485/I2C connection",
+    )
+
+
+def alert_sensor_lock(sensor_name: str, lock_minutes: int):
+    send_telegram_alert(
+        title         = "Sensor Lock — Pump Disabled",
+        message       = f"Too many consecutive bad readings from {sensor_name}",
+        severity      = "CRITICAL",
+        component     = sensor_name,
+        action_taken  = f"Pump locked for {lock_minutes} minutes",
+        recommendation= f"Inspect {sensor_name} immediately",
+    )
+
+
+def alert_actuator_failure(actuator_name: str, command: str, attempts: int):
+    send_telegram_alert(
+        title         = "Actuator Command Failed",
+        message       = f"Could not send '{command}' command after {attempts} attempts",
+        severity      = "CRITICAL",
+        component     = actuator_name,
+        action_taken  = "Retried and aborted",
+        recommendation= f"Check ESP32 connection and {actuator_name} hardware",
+    )
+
+
+def alert_pump_rate_limit(pump_name: str, count: int, max_count: int):
+    send_telegram_alert(
+        title         = "Pump Rate Limit Reached",
+        message       = f"Activated {count}x in the last hour — limit is {max_count}x",
+        severity      = "WARNING",
+        component     = pump_name,
+        action_taken  = "Activation skipped",
+        recommendation= "Inspect irrigation system — may indicate a leak or sensor fault",
+    )
+
+
+def alert_dangerous_ec(ec_value: float):
+    send_telegram_alert(
+        title         = "DANGEROUS EC Level",
+        message       = "EC is critically high — root burn risk!",
+        severity      = "DANGER",
+        component     = "EC Sensor / Fertilizer",
+        current_value = f"{ec_value:.0f} µS/cm",
+        allowed_range = "750 – 1999 µS/cm",
+        action_taken  = "Fertilizer pump OFF, water dilution pulse activated",
+        recommendation= "Check nutrient solution immediately and perform manual dilution",
+    )
+
+
+def alert_ec_above_target(ec_value: float):
+    send_telegram_alert(
+        title         = "EC Above Target",
+        message       = "EC is above 950 µS/cm — above the target range for lettuce",
+        severity      = "WARNING",
+        component     = "EC Sensor / Fertilizer",
+        current_value = f"{ec_value:.0f} µS/cm",
+        allowed_range = "target: 850 µS/cm  |  OK range: 750–950 µS/cm",
+        action_taken  = "Fertilizer pump OFF",
+        recommendation= "Monitor EC — reduce feeding or increase watering if EC keeps rising",
+    )
+
+
+def alert_ec_high(ec_value: float):
+    send_telegram_alert(
+        title         = "EC Very High",
+        message       = "EC is critically above the safe threshold (>= 1600 µS/cm)",
+        severity      = "WARNING",
+        component     = "EC Sensor / Fertilizer",
+        current_value = f"{ec_value:.0f} µS/cm",
+        allowed_range = "< 1600 µS/cm",
+        action_taken  = "Fertilizer pump OFF",
+        recommendation= "Monitor EC — may need manual dilution if it keeps rising",
+    )
+
+
+def alert_ec_low(ec_value: float):
+    send_telegram_alert(
+        title         = "EC Low",
+        message       = "EC is below 600 µS/cm — nutrient level is too low for lettuce",
+        severity      = "WARNING",
+        component     = "EC Sensor / Fertilizer",
+        current_value = f"{ec_value:.0f} µS/cm",
+        allowed_range = "target: 850 µS/cm  |  minimum: 600 µS/cm",
+        action_taken  = "Fertilizer pump pulsed (2 seconds)",
+        recommendation= "Check fertilizer supply and dosing pump flow rate",
+    )
+
+
+def alert_ph_warning(ph_value: float, direction: str):
+    tip = "Add pH Up solution to raise pH" if direction == "low" else "Add pH Down solution to lower pH"
+    send_telegram_alert(
+        title         = "pH Out of Safe Range",
+        message       = f"pH is too {'low' if direction == 'low' else 'high'} — outside the allowed range for lettuce",
+        severity      = "WARNING",
+        component     = "pH Sensor",
+        current_value = f"{ph_value:.2f}",
+        allowed_range = "5.2 – 7.5",
+        action_taken  = "Warning only — fertilizer pump not blocked",
+        recommendation= tip,
+    )
+
+
+def alert_ph_critical(ph_value: float):
+    send_telegram_alert(
+        title         = "CRITICAL: pH Dangerously Low",
+        message       = (
+            f"Soil pH is critically low ({ph_value:.2f}) — below 4.8. "
+            "At this level nutrient uptake is severely blocked and roots may sustain damage."
+        ),
+        severity      = "CRITICAL",
+        component     = "pH Sensor",
+        current_value = f"{ph_value:.2f}",
+        allowed_range = "5.2 – 7.5  (critical threshold: 4.8)",
+        action_taken  = "Warning only — add pH Up immediately",
+        recommendation= "Add pH Up solution immediately and recheck within 30 minutes",
+    )
+
+
+def alert_moisture_critical(moisture: float):
+    send_telegram_alert(
+        title         = "Soil Moisture Critically Low",
+        message       = "Soil is very dry — immediate irrigation triggered",
+        severity      = "CRITICAL",
+        component     = "Soil Moisture Sensor",
+        current_value = f"{moisture:.1f}%",
+        allowed_range = ">= 30%",
+        action_taken  = "2-second water pump pulse fired",
+        recommendation= "Check water supply and irrigation system",
+    )
+
+
+def alert_moisture_high(moisture: float):
+    send_telegram_alert(
+        title         = "Soil Moisture Too High",
+        message       = "Soil moisture is above the allowed maximum",
+        severity      = "WARNING",
+        component     = "Soil Moisture Sensor",
+        current_value = f"{moisture:.1f}%",
+        allowed_range = "< 70%",
+        action_taken  = "Water pump disabled",
+        recommendation= "Check irrigation system and soil moisture sensor",
+    )
+
+
+def alert_temperature_error(error: str):
+    send_telegram_alert(
+        title         = "Temperature Sensor Error",
+        message       = f"Failed to read DHT22: {error}",
+        severity      = "WARNING",
+        component     = "DHT22 Temperature/Humidity",
+        action_taken  = "Control loop cycle skipped",
+        recommendation= "Check DHT22 wiring and GPIO pin",
+    )
+
+
+def alert_camera_failure(camera_id, error: str):
+    send_telegram_alert(
+        title         = "Camera Capture Failed",
+        message       = f"Could not capture frame: {error}",
+        severity      = "WARNING",
+        component     = f"Camera {camera_id}",
+        action_taken  = "Camera skipped in this session",
+        recommendation= "Check camera USB/CSI connection",
+    )
+
+
+def alert_s3_failure(s3_key: str, error: str):
+    send_telegram_alert(
+        title         = "S3 Upload Failed",
+        message       = f"Could not upload image to AWS S3: {error}",
+        severity      = "WARNING",
+        component     = "AWS S3",
+        current_value = s3_key,
+        action_taken  = "Image not stored in cloud",
+        recommendation= "Check AWS credentials and internet connection",
+    )
+
+
+def alert_db_failure(operation: str, error: str):
+    send_telegram_alert(
+        title         = "Database Write Failed",
+        message       = f"MongoDB '{operation}' failed: {error}",
+        severity      = "WARNING",
+        component     = "MongoDB",
+        action_taken  = "Data may be lost for this cycle",
+        recommendation= "Check MongoDB connection and disk space",
+    )
+
+
+def alert_system_crash(component: str, error: str):
+    send_telegram_alert(
+        title         = "System Loop Crashed",
+        message       = f"Critical error in {component}: {error}",
+        severity      = "CRITICAL",
+        component     = component,
+        action_taken  = "Loop will retry",
+        recommendation= "Check backend logs immediately",
+    )
+
+
+def alert_temperature_high(temp: float):
+    send_telegram_alert(
+        title         = "Temperature Too High",
+        message       = (
+            "Air temperature is above the allowed threshold. "
+            "High temperature increases plant stress and may slow lettuce growth, "
+            "cause tip burn, and reduce yield."
+        ),
+        severity      = "WARNING",
+        component     = "Temperature Sensor",
+        current_value = f"{temp:.1f}°C",
+        allowed_range = "up to 27°C",
+        action_taken  = "Warning only — backend continues running",
+        recommendation= "Check fan, cooling system, and airflow in the grow chamber",
+    )
+
+
+def alert_health_api_failure(error: str):
+    send_telegram_alert(
+        title         = "Plant Health API Failed",
+        message       = f"Health API did not return a valid response: {error}",
+        severity      = "WARNING",
+        component     = "Plant Health API",
+        action_taken  = "Backend continued running — health result not saved",
+        recommendation= "Check API key, internet connection, API quota, and response format",
+    )
+
+
+def alert_no_sensor_data(minutes: int):
+    send_telegram_alert(
+        title         = "No Sensor Data Received",
+        message       = f"No new sensor readings for {minutes} minutes — system may be stuck",
+        severity      = "CRITICAL",
+        component     = "Sensor System",
+        action_taken  = "None — automatic intervention not possible",
+        recommendation= "Restart the backend and check all sensor connections",
+    )

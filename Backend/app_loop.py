@@ -7,9 +7,11 @@ for use by other modules (e.g. routes).
 """
 import datetime
 import threading
+import time
 
 import actuator_helpers
 from utils.utils import _CUSTOM_PRINT_FUNC
+from telegram_alerts import alert_sensor_error, alert_system_crash, alert_temperature_high, alert_no_sensor_data
 from config import (
     WATER_PRICE_PER_LITER_NIS,
     ELECTRICITY_PRICE_PER_KWH_NIS,
@@ -51,7 +53,7 @@ def init(env_sensors, env_actuators, setpoints, mqtt_handler, mongo_db_handler,
          resources_interval_hours=1):
     global _env_sensors, _env_actuators, _setpoints, _mqtt_handler, _mongo_db
     global _temp_sem, _light_sem, _soil_sem, _elec_sem, _wf_sem
-    global _resources_interval_hours
+    global _resources_interval_hours, last_sensor_update
     _env_sensors   = env_sensors
     _env_actuators = env_actuators
     _setpoints     = setpoints
@@ -63,6 +65,9 @@ def init(env_sensors, env_actuators, setpoints, mqtt_handler, mongo_db_handler,
     _elec_sem      = electricity_semaphore
     _wf_sem        = water_flow_semaphore
     _resources_interval_hours = resources_interval_hours
+    # Reset timestamp to now so the health endpoint never sees a stale value
+    # from module-import time (which could be 30-50 s before init() is called).
+    last_sensor_update = datetime.datetime.now()
 
 
 def get_last_sensor_update():
@@ -78,6 +83,69 @@ def get_total_fertilizer_liters() -> float:
 
 def get_total_energy_wh() -> float:
     return _total_energy_wh
+
+def reset_counters_only():
+    """
+    Safe new-plant-cycle reset: zeros resource/cost counters without deleting any collection.
+
+    What changes:
+      - In-memory totals (_total_water_liters etc.) → 0
+      - Hardware flow sensor counters → 0 (reset_water_amount / reset_fertilizer_amount)
+      - Energy delta baseline → current reading (so future deltas start from now)
+      - system_state totals → 0 (persisted to MongoDB)
+      - sensor_cache cost and volume fields → 0 (frontend sees zeros immediately)
+
+    What is NOT touched:
+      - sensors_data, pump_logs, actuators_data, resources, plant_images
+      - ai_setpoint_recommendations, layer3_decisions, plant_health_results
+      - growth_measurements, capture_sessions, budget_config, setpoints
+    """
+    global _total_water_liters, _total_fertilizer_liters, _total_energy_wh
+    global _prev_water_sensor, _prev_fertilizer_sensor, _prev_energy_sensor
+
+    _total_water_liters      = 0.0
+    _total_fertilizer_liters = 0.0
+    _total_energy_wh         = 0.0
+
+    # Reset the flow sensor hardware counters so the next reading starts at 0
+    _env_sensors.reset_water_amount()
+    _env_sensors.reset_fertilizer_amount()
+
+    # Water / fertilizer delta baseline → 0 (hardware was just reset)
+    _prev_water_sensor      = 0.0
+    _prev_fertilizer_sensor = 0.0
+
+    # Electricity: hardware meter cannot be reset, so snapshot the current reading
+    # as the new delta baseline.  Future delta = new_reading - _prev_energy_sensor.
+    try:
+        _, _, _, _e, _, _, _ = _env_sensors.get_electricity_values()
+        _prev_energy_sensor = _e
+    except Exception:
+        _prev_energy_sensor = 0.0
+
+    # Persist zeros so a backend restart loads the new counters, not the old ones
+    _mongo_db.upsert_state('total_water_liters',      0.0)
+    _mongo_db.upsert_state('total_fertilizer_liters', 0.0)
+    _mongo_db.upsert_state('total_energy_wh',         0.0)
+
+    # Update sensor cache immediately so Resource Consumption shows 0 without
+    # waiting for the next 5-second sensor loop tick
+    with _sensor_cache_lock:
+        _sensor_cache.update({
+            'water_amount':         0.0,
+            'fertilizer_amount':    0.0,
+            'energy':               0.0,
+            'water_cost_nis':       0.0,
+            'electricity_cost_nis': 0.0,
+            'fertilizer_cost_nis':  0.0,
+            'total_cost_nis':       0.0,
+        })
+
+    _CUSTOM_PRINT_FUNC(
+        "[NewCycle] Resource counters reset to zero. "
+        "Historical collections (sensors_data, pump_logs, etc.) preserved."
+    )
+
 
 def reset_resources():
     """Reset all resource counters to zero — call when starting a new plant cycle."""
@@ -189,50 +257,78 @@ def app_task():
 
     while True:
       try:
-        # ── Sensor reads every 10 s ───────────────────────────────────────────
-        if (datetime.datetime.now() - last_sensor_update).total_seconds() > 10:
-            # Defaults so cache update never fails on a partial read
-            air_temp_c = air_temp_f = air_humidity = 0.0
-            light_intensity = 0.0
-            soil_ph = soil_ec = soil_humidity = soil_temp = 0.0
-            voltage = current = power = energy = frequency = power_factor = 0.0
-            alarm = False
+        # ── Sensor reads every 5 s ───────────────────────────────────────────
+        if (datetime.datetime.now() - last_sensor_update).total_seconds() > 5:
+            # Seed locals from the current cache so a semaphore timeout or
+            # sensor error preserves the last known-good value in the cache
+            # instead of overwriting it with zero.
+            with _sensor_cache_lock:
+                _prev = dict(_sensor_cache)
+            air_temp_c   = _prev.get('air_temperature',  0.0)
+            air_temp_f   = air_temp_c * 9/5 + 32
+            air_humidity = _prev.get('air_humidity',     0.0)
+            light_intensity = _prev.get('light_intensity', 0.0)
+            soil_ph      = _prev.get('soil_ph',          0.0)
+            soil_ec      = _prev.get('soil_ec',          0.0)
+            soil_humidity= _prev.get('soil_humidity',    0.0)
+            soil_temp    = _prev.get('soil_temperature', 0.0)
+            voltage      = _prev.get('voltage',          0.0)
+            current      = _prev.get('current',          0.0)
+            power        = _prev.get('power',            0.0)
+            energy       = _prev.get('energy',           0.0)
+            frequency    = _prev.get('frequency',        0.0)
+            power_factor = _prev.get('power_factor',     0.0)
+            alarm        = False
 
-            _temp_sem.acquire()
-            try:
-                air_temp_c   = _env_sensors.get_air_temperature_C()
-                air_temp_f   = _env_sensors.get_air_temperature_F()
-                air_humidity = _env_sensors.get_air_humidity()
-            except Exception as e:
-                _CUSTOM_PRINT_FUNC(f"[AppLoop] Error reading temperature: {e}")
-            finally:
-                _temp_sem.release()
+            # Each semaphore acquire uses a 15-second timeout so that an I2C hang
+            # (e.g. ADS1115 [Errno 5]) never freezes this loop indefinitely.
+            if _temp_sem.acquire(timeout=15):
+                try:
+                    air_temp_c   = _env_sensors.get_air_temperature_C()
+                    air_temp_f   = _env_sensors.get_air_temperature_F()
+                    air_humidity = _env_sensors.get_air_humidity()
+                    if air_temp_c > 27.0:
+                        alert_temperature_high(air_temp_c)
+                except Exception as e:
+                    _CUSTOM_PRINT_FUNC(f"[AppLoop] Error reading temperature: {e}")
+                    alert_sensor_error("DHT22 Temperature/Humidity", None, str(e))
+                finally:
+                    _temp_sem.release()
+            else:
+                _CUSTOM_PRINT_FUNC("[AppLoop] WARNING: temp_semaphore blocked >15s — skipping temp read")
 
-            _light_sem.acquire()
-            try:
-                light_intensity = _env_sensors.get_light_intensity()
-            except Exception as e:
-                _CUSTOM_PRINT_FUNC(f"[AppLoop] Error reading light: {e}")
-            finally:
-                _light_sem.release()
+            if _light_sem.acquire(timeout=15):
+                try:
+                    light_intensity = _env_sensors.get_light_intensity()
+                except Exception as e:
+                    _CUSTOM_PRINT_FUNC(f"[AppLoop] Error reading light: {e}")
+                finally:
+                    _light_sem.release()
+            else:
+                _CUSTOM_PRINT_FUNC("[AppLoop] WARNING: light_semaphore blocked >15s — skipping light read (I2C issue?)")
 
-            _soil_sem.acquire()
-            try:
-                soil_ph, soil_ec, soil_humidity, soil_temp = _env_sensors.get_soil_values()
-            except Exception as e:
-                _CUSTOM_PRINT_FUNC(f"[AppLoop] Error reading soil: {e}")
-            finally:
-                _soil_sem.release()
+            if _soil_sem.acquire(timeout=15):
+                try:
+                    soil_ph, soil_ec, soil_humidity, soil_temp = _env_sensors.get_soil_values()
+                except Exception as e:
+                    _CUSTOM_PRINT_FUNC(f"[AppLoop] Error reading soil: {e}")
+                    alert_sensor_error("Soil RS485 Sensor", None, str(e))
+                finally:
+                    _soil_sem.release()
+            else:
+                _CUSTOM_PRINT_FUNC("[AppLoop] WARNING: soil_semaphore blocked >15s — skipping soil read")
 
-            _elec_sem.acquire()
-            try:
-                voltage, current, power, energy, frequency, power_factor, alarm = (
-                    _env_sensors.get_electricity_values()
-                )
-            except Exception as e:
-                _CUSTOM_PRINT_FUNC(f"[AppLoop] Error reading electricity: {e}")
-            finally:
-                _elec_sem.release()
+            if _elec_sem.acquire(timeout=15):
+                try:
+                    voltage, current, power, energy, frequency, power_factor, alarm = (
+                        _env_sensors.get_electricity_values()
+                    )
+                except Exception as e:
+                    _CUSTOM_PRINT_FUNC(f"[AppLoop] Error reading electricity: {e}")
+                finally:
+                    _elec_sem.release()
+            else:
+                _CUSTOM_PRINT_FUNC("[AppLoop] WARNING: elec_semaphore blocked >15s — skipping electricity read")
 
             # MQTT publish — sensors
             _mqtt_handler.publish("env_monitoring_system/sensors/air_temperature_C", air_temp_c)
@@ -263,16 +359,18 @@ def app_task():
 
             # Water flow / fertilizer flow reads
             _wf = _ff = _wa = _fa = 0.0
-            _wf_sem.acquire()
-            try:
-                _wf = _env_sensors.get_water_flow_rate()
-                _wa = _env_sensors.get_total_water_amount()
-                _ff = _env_sensors.get_fertilizer_flow_rate()
-                _fa = _env_sensors.get_total_fertilizer_amount()
-            except Exception as e:
-                _CUSTOM_PRINT_FUNC(f"[AppLoop] Error reading flow sensors: {e}")
-            finally:
-                _wf_sem.release()
+            if _wf_sem.acquire(timeout=15):
+                try:
+                    _wf = _env_sensors.get_water_flow_rate()
+                    _wa = _env_sensors.get_total_water_amount()
+                    _ff = _env_sensors.get_fertilizer_flow_rate()
+                    _fa = _env_sensors.get_total_fertilizer_amount()
+                except Exception as e:
+                    _CUSTOM_PRINT_FUNC(f"[AppLoop] Error reading flow sensors: {e}")
+                finally:
+                    _wf_sem.release()
+            else:
+                _CUSTOM_PRINT_FUNC("[AppLoop] WARNING: wf_semaphore blocked >15s — skipping flow read")
 
             # Delta-based accumulation
             delta_water      = max(0.0, _wa  - _prev_water_sensor)
@@ -370,8 +468,10 @@ def app_task():
 
             _wf_sem.acquire()
             try:
-                water_flow = _env_sensors.get_water_flow_rate()
-                _mongo_db.insert_sensor_data("water flow", water_flow)
+                water_flow       = _env_sensors.get_water_flow_rate()
+                fertilizer_flow  = _env_sensors.get_fertilizer_flow_rate()
+                _mongo_db.insert_sensor_data("water flow",       water_flow)
+                _mongo_db.insert_sensor_data("fertilizer flow",  fertilizer_flow)
                 _mqtt_handler.publish(
                     "env_monitoring_system/sensors/water_flow", water_flow
                 )
@@ -383,6 +483,19 @@ def app_task():
             water_pump_duty_cycle  = _env_actuators.get_water_pump_duty_cycle()
             fertilizer_pump_duty_cycle = _env_actuators.get_fertilizer_pump_duty_cycle()
             fan_duty_cycle         = _env_actuators.get_fan_duty_cycle()
+
+            # Update sensor cache with actuator states so Layer 2 / AI Advisor
+            # can read real values instead of N/A.
+            with _sensor_cache_lock:
+                _sensor_cache.update({
+                    'heater_pct':            round((heater_duty_cycle / 4095) * 100, 1),
+                    'light_pct':             round((light_duty_cycle  / 4095) * 100, 1),
+                    'fan_pct':               round((fan_duty_cycle    / 4095) * 100, 1),
+                    'water_pump_state':      'Off' if water_pump_duty_cycle == 0
+                                             else f'On at {round((water_pump_duty_cycle / 4095) * 100, 1)}%',
+                    'fertilizer_pump_state': 'Off' if fertilizer_pump_duty_cycle == 0
+                                             else f'On at {round((fertilizer_pump_duty_cycle / 4095) * 100, 1)}%',
+                })
 
             if heater_duty_cycle != prev_heater_duty_cycle:
                 prev_heater_duty_cycle = heater_duty_cycle
@@ -449,5 +562,15 @@ def app_task():
                     )
                 _mongo_db.upsert_actuator_data("fan", fan_duty_cycle)
 
+        # Alert if sensor cache has not been updated for more than 5 minutes
+        stale_seconds = (datetime.datetime.now() - last_sensor_update).total_seconds()
+        if stale_seconds > 300:
+            minutes = int(stale_seconds // 60)
+            _CUSTOM_PRINT_FUNC(f"[AppLoop] WARNING: no sensor update for {minutes}m")
+            alert_no_sensor_data(minutes)
+
       except Exception as e:
           _CUSTOM_PRINT_FUNC(f"[AppLoop] Cycle error (will retry): {e}")
+          alert_system_crash("App Loop", str(e))
+
+      time.sleep(0.2)   # prevent 100% CPU spin — actuator check gate is 1s anyway

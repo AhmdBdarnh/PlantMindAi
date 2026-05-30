@@ -147,11 +147,27 @@ export default function Dashboard({ sensors, setpoints, lastUpdate, captureSessi
           )}
         </div>
 
-        {/* Right: Plant image */}
+        {/* Right: Latest plant image (live from captures, falls back to static) */}
         <div className="dash-plant-image-card">
           <div className="plant-image-area">
-            <img src="/plant.jpeg" alt="Lettuce plant" />
+            {latestImage ? (
+              <a href={latestImage.url} target="_blank" rel="noopener noreferrer"
+                 title={`Captured ${latestImage.ts ? new Date(latestImage.ts).toLocaleString() : ''}`}>
+                <img
+                  src={latestImage.url}
+                  alt="Latest plant capture"
+                  onError={e => { e.target.src = '/plant.jpeg'; }}
+                />
+              </a>
+            ) : (
+              <img src="/plant.jpeg" alt="Lettuce plant" />
+            )}
           </div>
+          {latestImage && (
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', textAlign: 'center', paddingBottom: 6 }}>
+              Last capture: {latestImage.ts ? new Date(latestImage.ts).toLocaleString() : '—'}
+            </div>
+          )}
         </div>
       </div>
 

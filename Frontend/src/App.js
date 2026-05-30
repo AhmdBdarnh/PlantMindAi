@@ -1,13 +1,15 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import './App.css';
 import Dashboard from './pages/Dashboard';
 import PlantEnvironment from './pages/PlantEnvironment';
 import ActuatorControl from './pages/ActuatorControl';
 import ResourceConsumption from './pages/ResourceConsumption';
 import PlantGrowth from './pages/PlantGrowth';
+import PlantHealth from './pages/PlantHealth';
 import LiveCams from './pages/LiveCams';
-
-const API_BASE_URL = 'http://localhost:5000/api';
+import AISetpointAdvisor from './pages/AISetpointAdvisor';
+import Layer3Decision    from './pages/Layer3Decision';
+import { API_BASE_URL } from './api/config';
 const MAX_HISTORY = 60;
 
 const NAV_ITEMS = [
@@ -15,8 +17,11 @@ const NAV_ITEMS = [
   { id: 'environment',  label: 'Plant Environment',    icon: 'M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z' },
   { id: 'actuators',    label: 'Actuator Control',     icon: 'M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4' },
   { id: 'resources',    label: 'Resource Consumption', icon: 'M13 10V3L4 14h7v7l9-11h-7z' },
+  { id: 'health',       label: 'Plant Health',         icon: 'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z' },
   { id: 'growth',       label: 'Plant Growth',         icon: 'M3 9a2 2 0 014 0v9a2 2 0 01-4 0V9zM9 3a2 2 0 014 0v15a2 2 0 01-4 0V3zM15 6a2 2 0 014 0v12a2 2 0 01-4 0V6z' },
   { id: 'livecams',     label: 'Live Cams',            icon: 'M15 10l4.553-2.069A1 1 0 0121 8.82v6.36a1 1 0 01-1.447.894L15 14M3 8a2 2 0 012-2h10a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z' },
+  { id: 'ai-advisor',  label: 'AI Setpoint Advisor',  icon: 'M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z' },
+  { id: 'layer3',      label: 'Budget Manager',       icon: 'M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z' },
 ];
 
 function App() {
@@ -35,19 +40,38 @@ function App() {
   const [lastUpdate, setLastUpdate]     = useState(null);
   const [autoRefresh, setAutoRefresh]   = useState(true);
 
+  // Backend health status — populated by /api/health polling every 15 s
+  const [healthStatus, setHealthStatus] = useState(null);
+  // True only while the manual refresh button is mid-flight
+  const [refreshing, setRefreshing]     = useState(false);
+  // Tracks when captureWaiting started so we can enforce a 3-minute timeout
+  const captureWaitStartRef             = useRef(null);
+
   // Sensor history for charts (ring buffer)
   const [sensorHistory, setSensorHistory] = useState([]);
 
-  // Plant health
+  // Plant health (live API result + DB-backed latest)
   const [healthResult, setHealthResult]       = useState(null);
   const [healthLoading, setHealthLoading]     = useState(false);
   const [healthLastChecked, setHealthLastChecked] = useState(null);
+  const [healthDbLatest, setHealthDbLatest]   = useState(null);
+  const [healthDbHistory, setHealthDbHistory] = useState([]);
+  const [healthFetchError, setHealthFetchError] = useState(false);
 
   // Capture sessions
   const [captureSessions, setCaptureSessions]             = useState([]);
   const [captureSessionsLoading, setCaptureSessionsLoading] = useState(false);
   const [captureManualLoading, setCaptureManualLoading]   = useState(false);
   const [captureManualError, setCaptureManualError]       = useState(null);
+
+  // Plant growth metrics
+  const [growthLatest,    setGrowthLatest]    = useState(null);
+  const [growthHistory,   setGrowthHistory]   = useState([]);
+  const [growthLoading,   setGrowthLoading]   = useState(false);
+  const [growthAnalyzing, setGrowthAnalyzing] = useState(false);
+  const [growthError,     setGrowthError]     = useState(null);
+  // captureWaiting = true when capture is running and we are polling for it to finish
+  const [captureWaiting,  setCaptureWaiting]  = useState(false);
 
   // ==================== DATA FETCHING ====================
 
@@ -58,12 +82,20 @@ function App() {
 
   const fetchSensors = async () => {
     try {
-      const res  = await fetch(`${API_BASE_URL}/sensors`);
+      const res  = await fetch(`${API_BASE_URL}/sensors`, { cache: 'no-store' });
       const data = await safeJson(res);
       if (!data) { setError('Backend is offline — start the Flask server on port 5000'); return; }
       if (data.success) {
+        setError(null);
         setSensors(data.data);
-        setLastUpdate(new Date().toLocaleTimeString());
+        // Use the actual hardware measurement timestamp from the backend cache,
+        // not the browser clock. Falls back to browser time if the field is missing.
+        const rawTs = data.last_sensor_update;
+        setLastUpdate(
+          rawTs
+            ? new Date(rawTs.replace(' ', 'T')).toLocaleTimeString()
+            : new Date().toLocaleTimeString()
+        );
         setSensorHistory(prev => {
           const entry = { ...data.data, time: new Date().toLocaleTimeString() };
           return [...prev, entry].slice(-MAX_HISTORY);
@@ -76,7 +108,7 @@ function App() {
 
   const fetchActuators = async () => {
     try {
-      const res  = await fetch(`${API_BASE_URL}/actuators`);
+      const res  = await fetch(`${API_BASE_URL}/actuators`, { cache: 'no-store' });
       const data = await safeJson(res);
       if (data?.success) setActuators(data.data);
     } catch {}
@@ -92,17 +124,46 @@ function App() {
 
   const fetchSetpoints = async () => {
     try {
-      const res  = await fetch(`${API_BASE_URL}/setpoints`);
+      const res  = await fetch(`${API_BASE_URL}/setpoints`, { cache: 'no-store' });
       const data = await safeJson(res);
       if (data?.success) setSetpoints(data.setpoints);
     } catch {}
   };
 
+  // Silent background refresh — does NOT touch the loading spinner.
   const fetchAllData = useCallback(async () => {
-    setLoading(true);
+    await Promise.all([fetchSensors(), fetchActuators(), fetchOperationMode(), fetchSetpoints()]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Manual refresh — shows the button spinner, clears stale errors first.
+  const handleManualRefresh = useCallback(async () => {
+    setRefreshing(true);
     setError(null);
     await Promise.all([fetchSensors(), fetchActuators(), fetchOperationMode(), fetchSetpoints()]);
-    setLoading(false);
+    setRefreshing(false);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Polls /api/health every 15 s to detect sensor loop freeze and data age.
+  const fetchBackendHealth = useCallback(async () => {
+    try {
+      const res  = await fetch(`${API_BASE_URL}/health`, { cache: 'no-store' });
+      const text = await res.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch {}
+      if (data) {
+        setHealthStatus({
+          online:             true,
+          sensorAlive:        data.sensor_loop_alive === true,
+          secondsSinceUpdate: typeof data.seconds_since_last_sensor_update === 'number'
+                                ? data.seconds_since_last_sensor_update : null,
+          status:             data.status,
+        });
+      } else {
+        setHealthStatus({ online: false });
+      }
+    } catch {
+      setHealthStatus({ online: false });
+    }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ==================== OPERATION MODE ====================
@@ -167,6 +228,22 @@ function App() {
     } catch {}
   };
 
+  const fetchHealthFromDb = async () => {
+    try {
+      const [latestRes, historyRes] = await Promise.all([
+        fetch(`${API_BASE_URL}/plant-health/latest`),
+        fetch(`${API_BASE_URL}/plant-health/history?limit=20`),
+      ]);
+      const latestData  = await latestRes.json();
+      const historyData = await historyRes.json();
+      if (latestData.success && latestData.result) setHealthDbLatest(latestData.result);
+      if (historyData.success) setHealthDbHistory(historyData.results || []);
+      setHealthFetchError(false);
+    } catch {
+      setHealthFetchError(true);
+    }
+  };
+
   const checkPlantHealth = async () => {
     setHealthLoading(true);
     try {
@@ -174,6 +251,8 @@ function App() {
       const data = await res.json();
       setHealthResult(data);
       setHealthLastChecked(new Date().toLocaleTimeString());
+      // Refresh DB copy after a short delay (health check runs in background)
+      setTimeout(fetchHealthFromDb, 8000);
     } catch (err) {
       setHealthResult({ success: false, error: 'Connection error: ' + err.message });
     } finally {
@@ -224,19 +303,124 @@ function App() {
     }
   };
 
+  // ==================== NEW PLANT CYCLE RESET ====================
+
+  const handleNewCycle = useCallback(async () => {
+    try {
+      const res  = await fetch(`${API_BASE_URL}/new-plant-cycle`, { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        // Immediately refresh sensors so UI shows zeros without waiting for the 2s auto-tick
+        await fetchAllData();
+      }
+      return data;
+    } catch (e) {
+      return { success: false, error: 'Connection error: ' + e.message };
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ==================== PLANT GROWTH ====================
+
+  const fetchGrowthLatest = async () => {
+    try {
+      const res  = await fetch(`${API_BASE_URL}/growth/latest`);
+      const data = await safeJson(res);
+      if (data?.success) {
+        setGrowthLatest(data.data);
+        setGrowthError(null);   // clear any stale error when data loads successfully
+      }
+    } catch {}
+  };
+
+  const fetchGrowthHistory = async () => {
+    setGrowthLoading(true);
+    try {
+      const res  = await fetch(`${API_BASE_URL}/growth/history?limit=50`);
+      const data = await safeJson(res);
+      if (data?.success) setGrowthHistory(data.data);
+    } catch {}
+    finally { setGrowthLoading(false); }
+  };
+
+  const runGrowthFromS3 = async () => {
+    setGrowthAnalyzing(true);
+    setGrowthError(null);
+    try {
+      const res  = await fetch(`${API_BASE_URL}/growth/run-latest-s3`, { method: 'POST' });
+      const data = await safeJson(res);
+      if (data?.success) {
+        setGrowthLatest(data.data);
+        await fetchGrowthHistory();
+      } else {
+        setGrowthError(data?.error || 'Growth analysis failed');
+      }
+    } catch (err) {
+      setGrowthError('Connection error: ' + err.message);
+    } finally {
+      setGrowthAnalyzing(false);
+    }
+  };
+
+  const fetchCaptureStatus = async () => {
+    try {
+      const res  = await fetch(`${API_BASE_URL}/camera/status`, { cache: 'no-store' });
+      const data = await safeJson(res);
+      return data;
+    } catch { return null; }
+  };
+
+  const captureAndAnalyze = async () => {
+    setGrowthAnalyzing(true);
+    setGrowthError(null);
+    setCaptureWaiting(false);
+    try {
+      const res  = await fetch(`${API_BASE_URL}/growth/capture-and-analyze`, { method: 'POST' });
+      const data = await safeJson(res);
+      if (data?.success) {
+        setGrowthLatest(data.data);
+        await fetchGrowthHistory();
+      } else if (data?.capture_busy || res.status === 409) {
+        // Not a real error — another capture is running; poll until it finishes
+        setCaptureWaiting(true);
+      } else {
+        setGrowthError(data?.error || 'Capture & analyze failed');
+      }
+    } catch (err) {
+      setGrowthError('Connection error: ' + err.message);
+    } finally {
+      setGrowthAnalyzing(false);
+    }
+  };
+
   // ==================== EFFECTS ====================
 
+  // ── Initial load: show loading spinner exactly once on mount ──────────────
   useEffect(() => {
-    fetchAllData();
-    if (autoRefresh) {
-      const id = setInterval(fetchAllData, 3000);
-      return () => clearInterval(id);
-    }
+    setLoading(true);
+    fetchAllData().finally(() => setLoading(false));
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Background auto-refresh: silently updates data, no spinner ────────────
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const id = setInterval(fetchAllData, 2000);
+    return () => clearInterval(id);
   }, [autoRefresh]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Backend health polling: every 15 s, detects sensor loop / data age ────
+  useEffect(() => {
+    fetchBackendHealth();
+    const id = setInterval(fetchBackendHealth, 15000);
+    return () => clearInterval(id);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     fetchLatestHealthResult();
-    const id = setInterval(fetchLatestHealthResult, 60000);
+    fetchHealthFromDb();
+    const id = setInterval(() => {
+      fetchLatestHealthResult();
+      fetchHealthFromDb();
+    }, 60000);
     return () => clearInterval(id);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -244,7 +428,58 @@ function App() {
     fetchCaptureSessions();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  useEffect(() => {
+    fetchGrowthLatest();
+    fetchGrowthHistory();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Poll /api/camera/status while a capture is running and auto-refresh growth data when done.
+  // Times out after 3 minutes so the UI never gets permanently stuck if the backend hangs.
+  useEffect(() => {
+    if (!captureWaiting) {
+      captureWaitStartRef.current = null;
+      return;
+    }
+    captureWaitStartRef.current = Date.now();
+    const TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
+
+    const id = setInterval(async () => {
+      // Give up if we have been waiting longer than TIMEOUT_MS
+      if (captureWaitStartRef.current !== null &&
+          Date.now() - captureWaitStartRef.current > TIMEOUT_MS) {
+        setCaptureWaiting(false);
+        setGrowthError(
+          'Camera capture timed out after 3 minutes. ' +
+          'Check backend logs or call POST /api/capture/unlock to release the lock.'
+        );
+        return;
+      }
+      const status = await fetchCaptureStatus();
+      if (status && !status.in_progress) {
+        setCaptureWaiting(false);
+        await fetchGrowthLatest();
+        await fetchGrowthHistory();
+      }
+    }, 3000);
+    return () => clearInterval(id);
+  }, [captureWaiting]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ==================== RENDER ====================
+
+  // Compute health banner content once per render (only shown when backend is reachable
+  // but sensors have issues — backend-offline is already covered by the error banner).
+  const healthBanner = (() => {
+    if (!healthStatus || !healthStatus.online) return null;
+    if (!healthStatus.sensorAlive)
+      return { type: 'frozen', msg: 'Sensor loop is not responding — sensor data may be frozen' };
+    if (healthStatus.secondsSinceUpdate !== null && healthStatus.secondsSinceUpdate > 120) {
+      const ageStr = healthStatus.secondsSinceUpdate < 300
+        ? `${healthStatus.secondsSinceUpdate}s`
+        : `${Math.round(healthStatus.secondsSinceUpdate / 60)} min`;
+      return { type: 'stale', msg: `Sensor data is ${ageStr} old — may not be current` };
+    }
+    return null;
+  })();
 
   return (
     <div className="app-layout">
@@ -303,7 +538,7 @@ function App() {
           </span>
 
           <div className="header-right">
-            {loading && (
+            {(loading || refreshing) && (
               <span className="header-spinner" title="Loading…">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="spin-svg">
                   <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" strokeLinecap="round"/>
@@ -326,7 +561,7 @@ function App() {
               />
               <span>Auto-refresh</span>
             </label>
-            <button className="btn-icon-header" onClick={fetchAllData} disabled={loading} title="Refresh now">
+            <button className="btn-icon-header" onClick={handleManualRefresh} disabled={loading || refreshing} title="Refresh now">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
                 <path d="M1 4v6h6M23 20v-6h-6" strokeLinecap="round" strokeLinejoin="round"/>
                 <path d="M20.49 9A9 9 0 005.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 013.51 15" strokeLinecap="round" strokeLinejoin="round"/>
@@ -335,7 +570,7 @@ function App() {
           </div>
         </header>
 
-        {/* Error banner */}
+        {/* Error banner — backend unreachable or command failure */}
         {error && (
           <div className="error-banner">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="icon-sm">
@@ -347,6 +582,18 @@ function App() {
                 <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round"/>
               </svg>
             </button>
+          </div>
+        )}
+
+        {/* Health banner — sensor loop frozen or data age warning (auto-clears when resolved) */}
+        {healthBanner && (
+          <div className={`health-banner health-banner-${healthBanner.type}`}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="icon-sm">
+              <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+              <line x1="12" y1="9" x2="12" y2="13" strokeLinecap="round"/>
+              <line x1="12" y1="17" x2="12.01" y2="17" strokeLinecap="round"/>
+            </svg>
+            {healthBanner.msg}
           </div>
         )}
 
@@ -381,6 +628,7 @@ function App() {
             <ResourceConsumption
               sensors={sensors}
               sensorHistory={sensorHistory}
+              onNewCycle={handleNewCycle}
             />
           )}
           {activePage === 'livecams' && (
@@ -391,19 +639,38 @@ function App() {
               onRefreshSessions={fetchCaptureSessions}
             />
           )}
-          {activePage === 'growth' && (
-            <PlantGrowth
+          {activePage === 'health' && (
+            <PlantHealth
+              healthResult={healthResult}
+              healthDbLatest={healthDbLatest}
+              healthDbHistory={healthDbHistory}
+              healthFetchError={healthFetchError}
+              onRefreshHealth={() => { fetchLatestHealthResult(); return fetchHealthFromDb(); }}
               captureSessions={captureSessions}
               captureSessionsLoading={captureSessionsLoading}
               captureManualLoading={captureManualLoading}
               captureManualError={captureManualError}
-              healthResult={healthResult}
-              healthLoading={healthLoading}
-              healthLastChecked={healthLastChecked}
               onCapture={triggerCaptureNow}
-              onRefreshSessions={fetchCaptureSessions}
-              onCheckHealth={checkPlantHealth}
             />
+          )}
+          {activePage === 'growth' && (
+            <PlantGrowth
+              growthLatest={growthLatest}
+              growthHistory={growthHistory}
+              growthLoading={growthLoading}
+              growthAnalyzing={growthAnalyzing}
+              growthError={growthError}
+              captureWaiting={captureWaiting}
+              onRunGrowthS3={runGrowthFromS3}
+              onCaptureAndAnalyze={captureAndAnalyze}
+              onRefreshGrowth={() => { fetchGrowthLatest(); fetchGrowthHistory(); }}
+            />
+          )}
+          {activePage === 'ai-advisor' && (
+            <AISetpointAdvisor setpoints={setpoints} onSetpointsRefresh={fetchSetpoints} />
+          )}
+          {activePage === 'layer3' && (
+            <Layer3Decision />
           )}
         </main>
       </div>
