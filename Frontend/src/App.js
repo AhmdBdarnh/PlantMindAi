@@ -9,6 +9,8 @@ import PlantHealth from './pages/PlantHealth';
 import LiveCams from './pages/LiveCams';
 import AISetpointAdvisor from './pages/AISetpointAdvisor';
 import Layer3Decision    from './pages/Layer3Decision';
+import NotificationBell from './components/NotificationBell';
+import Toast from './components/Toast';
 import { API_BASE_URL } from './api/config';
 const MAX_HISTORY = 60;
 
@@ -25,7 +27,11 @@ const NAV_ITEMS = [
 ];
 
 function App() {
-  const [activePage, setActivePage]     = useState('dashboard');
+  const validPages = NAV_ITEMS.map(n => n.id);
+  const [activePage, setActivePage] = useState(() => {
+    const hash = window.location.hash.slice(1);
+    return validPages.includes(hash) ? hash : 'dashboard';
+  });
   const [sidebarOpen, setSidebarOpen]   = useState(true);
 
   // Core data
@@ -38,12 +44,9 @@ function App() {
   const [loading, setLoading]           = useState(false);
   const [error, setError]               = useState(null);
   const [lastUpdate, setLastUpdate]     = useState(null);
-  const [autoRefresh, setAutoRefresh]   = useState(true);
 
   // Backend health status — populated by /api/health polling every 15 s
   const [healthStatus, setHealthStatus] = useState(null);
-  // True only while the manual refresh button is mid-flight
-  const [refreshing, setRefreshing]     = useState(false);
   // Tracks when captureWaiting started so we can enforce a 3-minute timeout
   const captureWaitStartRef             = useRef(null);
 
@@ -133,14 +136,6 @@ function App() {
   // Silent background refresh — does NOT touch the loading spinner.
   const fetchAllData = useCallback(async () => {
     await Promise.all([fetchSensors(), fetchActuators(), fetchOperationMode(), fetchSetpoints()]);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Manual refresh — shows the button spinner, clears stale errors first.
-  const handleManualRefresh = useCallback(async () => {
-    setRefreshing(true);
-    setError(null);
-    await Promise.all([fetchSensors(), fetchActuators(), fetchOperationMode(), fetchSetpoints()]);
-    setRefreshing(false);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Polls /api/health every 15 s to detect sensor loop freeze and data age.
@@ -394,18 +389,22 @@ function App() {
 
   // ==================== EFFECTS ====================
 
+  // ── Sync URL hash with active page so F5 restores position ──────────────
+  useEffect(() => {
+    window.location.hash = activePage;
+  }, [activePage]);
+
   // ── Initial load: show loading spinner exactly once on mount ──────────────
   useEffect(() => {
     setLoading(true);
     fetchAllData().finally(() => setLoading(false));
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Background auto-refresh: silently updates data, no spinner ────────────
+  // ── Background auto-refresh: silently updates data every 2 s, no spinner ──
   useEffect(() => {
-    if (!autoRefresh) return;
     const id = setInterval(fetchAllData, 2000);
     return () => clearInterval(id);
-  }, [autoRefresh]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Backend health polling: every 15 s, detects sensor loop / data age ────
   useEffect(() => {
@@ -464,6 +463,67 @@ function App() {
     return () => clearInterval(id);
   }, [captureWaiting]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Notifications (bell + toast) ──────────────────────────────────────────
+  const [notifications, setNotifications] = useState([]);
+  const [unreadCount,   setUnreadCount]   = useState(0);
+  const [toasts,        setToasts]        = useState([]);
+  const seenNotifIdsRef = useRef(null); // null until first load (don't toast pre-existing)
+
+  const fetchNotifications = useCallback(async () => {
+    try {
+      const res  = await fetch(`${API_BASE_URL}/notifications?limit=30`, { cache: 'no-store' });
+      const data = await res.json();
+      if (!data?.success) return;
+      const items = data.notifications || [];
+      setNotifications(items);
+      setUnreadCount(data.unread_count || 0);
+
+      // Toast only notifications that are new since the previous poll.
+      const ids = new Set(items.map(n => n.notification_id));
+      if (seenNotifIdsRef.current === null) {
+        seenNotifIdsRef.current = ids; // first load — seed silently, no toasts
+        return;
+      }
+      const fresh = items.filter(n => !seenNotifIdsRef.current.has(n.notification_id));
+      seenNotifIdsRef.current = ids;
+      const toToast = fresh
+        .filter(n => n.severity === 'warning' || n.severity === 'critical')
+        .slice(0, 3);
+      if (toToast.length) {
+        setToasts(prev => [
+          ...prev,
+          ...toToast.map(n => ({ id: n.notification_id, severity: n.severity, title: n.title, message: n.message })),
+        ]);
+      }
+    } catch { /* backend unreachable — ignore; next poll retries */ }
+  }, []);
+
+  useEffect(() => {
+    fetchNotifications();
+    const id = setInterval(fetchNotifications, 10000);
+    return () => clearInterval(id);
+  }, [fetchNotifications]);
+
+  const handleNotifClick = useCallback(async (n) => {
+    // Mark-read on click only (opening the panel does NOT mark as read).
+    if (!n.read) {
+      setNotifications(prev => prev.map(x => x.notification_id === n.notification_id ? { ...x, read: true } : x));
+      setUnreadCount(c => Math.max(0, c - 1));
+      try { await fetch(`${API_BASE_URL}/notifications/${n.notification_id}/read`, { method: 'POST' }); } catch { /* retry next poll */ }
+    }
+    if (n.link) setActivePage(n.link);
+  }, []);
+
+  const handleMarkAllRead = useCallback(async () => {
+    setNotifications(prev => prev.map(x => ({ ...x, read: true })));
+    setUnreadCount(0);
+    try { await fetch(`${API_BASE_URL}/notifications/read-all`, { method: 'POST' }); } catch { /* retry next poll */ }
+  }, []);
+
+  const dismissToast = useCallback((id) => {
+    setToasts(prev => prev.filter(t => t.id !== id));
+  }, []);
+
   // ==================== RENDER ====================
 
   // Compute health banner content once per render (only shown when backend is reachable
@@ -490,7 +550,12 @@ function App() {
           <svg className="brand-leaf" viewBox="0 0 24 24" fill="none">
             <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14.5v-4.74l-4 2.31-1-1.73 4-2.31-4-2.31 1-1.73 4 2.31V4.5h2v4.8l4-2.31 1 1.73-4 2.31 4 2.31-1 1.73-4-2.31v4.74h-2z" fill="currentColor"/>
           </svg>
-          {sidebarOpen && <span className="brand-name">PlantMind AI</span>}
+          {sidebarOpen && (
+            <span className="brand-text">
+              <span className="brand-name">PlantMind</span>
+              <span className="brand-tagline">Smart Greenhouse System</span>
+            </span>
+          )}
         </div>
 
         <nav className="sidebar-nav">
@@ -525,50 +590,15 @@ function App() {
       {/* ── Main area ── */}
       <div className="main-area">
 
-        {/* Top header */}
-        <header className="top-header">
-          <button className="sidebar-toggle-btn" onClick={() => setSidebarOpen(v => !v)} aria-label="Toggle sidebar">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M4 6h16M4 12h16M4 18h16" strokeLinecap="round"/>
-            </svg>
-          </button>
-
-          <span className="header-page-title">
-            {NAV_ITEMS.find(n => n.id === activePage)?.label}
-          </span>
-
-          <div className="header-right">
-            {(loading || refreshing) && (
-              <span className="header-spinner" title="Loading…">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="spin-svg">
-                  <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" strokeLinecap="round"/>
-                </svg>
-              </span>
-            )}
-            {lastUpdate && (
-              <span className="header-update">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="icon-xs">
-                  <circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2" strokeLinecap="round"/>
-                </svg>
-                {lastUpdate}
-              </span>
-            )}
-            <label className="auto-refresh-label">
-              <input
-                type="checkbox"
-                checked={autoRefresh}
-                onChange={e => setAutoRefresh(e.target.checked)}
-              />
-              <span>Auto-refresh</span>
-            </label>
-            <button className="btn-icon-header" onClick={handleManualRefresh} disabled={loading || refreshing} title="Refresh now">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                <path d="M1 4v6h6M23 20v-6h-6" strokeLinecap="round" strokeLinejoin="round"/>
-                <path d="M20.49 9A9 9 0 005.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 013.51 15" strokeLinecap="round" strokeLinejoin="round"/>
-              </svg>
-            </button>
-          </div>
-        </header>
+        {/* Top bar — notification bell (right-aligned) */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', padding: '8px 4px 0', marginBottom: 4 }}>
+          <NotificationBell
+            notifications={notifications}
+            unreadCount={unreadCount}
+            onItemClick={handleNotifClick}
+            onMarkAllRead={handleMarkAllRead}
+          />
+        </div>
 
         {/* Error banner — backend unreachable or command failure */}
         {error && (
@@ -605,12 +635,16 @@ function App() {
               setpoints={setpoints}
               lastUpdate={lastUpdate}
               captureSessions={captureSessions}
+              healthDbLatest={healthDbLatest}
+              growthLatest={growthLatest}
+              onNavigate={setActivePage}
             />
           )}
           {activePage === 'environment' && (
             <PlantEnvironment
               sensors={sensors}
               sensorHistory={sensorHistory}
+              setpoints={setpoints}
               lastUpdate={lastUpdate}
             />
           )}
@@ -674,6 +708,13 @@ function App() {
           )}
         </main>
       </div>
+
+      {/* ── Toast stack ── */}
+      {toasts.length > 0 && (
+        <div style={{ position: 'fixed', top: 16, right: 16, zIndex: 2000, display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {toasts.map(t => <Toast key={t.id} toast={t} onClose={dismissToast} />)}
+        </div>
+      )}
     </div>
   );
 }

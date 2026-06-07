@@ -1,216 +1,85 @@
 import React, { useState } from 'react';
 import { fmtDate } from '../utils/format';
 
-const HEALTH_ICONS = {
-  healthy:  'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z',
-  unhealthy:'M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z',
-  error:    'M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z',
-  unknown:  'M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z',
+// ── SVG icon helper ───────────────────────────────────────────────────────────
+
+function Icon({ path, size = 16, color = 'currentColor', sw = 2, fill = 'none' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill={fill}
+      stroke={color} strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round">
+      <path d={path} />
+    </svg>
+  );
+}
+
+const IC = {
+  healthy:   'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z',
+  warning:   'M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z',
+  unknown:   'M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z',
+  refresh:   'M1 4v6h6M23 20v-6h-6M20.49 9A9 9 0 005.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 013.51 15',
+  camera:    'M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z M12 13m-3 0a3 3 0 106 0 3 3 0 00-6 0',
+  image:     'M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z',
+  history:   'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z',
+  leaf:      'M17 8C8 10 5.9 16.17 3.82 19c3.15.6 6.41-.34 8.68-2.61 2.56-2.56 3.07-6.44 1.5-9.39zm0 0c-.2 4.17-2.69 7.78-6 10',
+  disease:   'M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z',
+  check:     'M5 13l4 4L19 7',
+  s3:        'M5 19a2 2 0 01-2-2V7a2 2 0 012-2h4l2 2h4a2 2 0 012 2v1M5 19h14a2 2 0 002-2v-5a2 2 0 00-2-2H9a2 2 0 00-2 2v5a2 2 0 01-2 2z',
+  info:      'M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z',
+  bio:       'M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z',
+  chemical:  'M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z',
+  shield:    'M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z',
 };
 
-function deriveStatus(dbLatest, liveResult) {
-  const r = dbLatest || liveResult;
-  if (!r)           return { type: 'unknown',   title: 'No data yet',      conf: null };
-  if (!r.success && !dbLatest) return { type: 'error', title: 'Check failed', conf: null };
-  if (r.is_healthy) return { type: 'healthy',   title: 'Plant is Healthy', conf: r.health_probability };
-  return             { type: 'unhealthy', title: 'Issues Detected',  conf: r.health_probability };
-}
-
-// ── Camera capture helpers ────────────────────────────────────────────────────
-
-function getLatestImagePerCamera(sessions) {
-  if (!sessions || sessions.length === 0) return [];
-  const latest   = sessions[0];
-  const images   = latest.images || [];
-  const byCamera = {};
-  images.forEach(img => {
-    const id = Number(img.camera_id);
-    if (!isNaN(id) && id > 0 && !byCamera[id]) byCamera[id] = img;
-  });
-  return [1, 2, 4].map(camId => {
-    const img = byCamera[camId];
-    return img
-      ? { ...img, camera_id: camId, sessionTs: latest.timestamp }
-      : { camera_id: camId, success: false, sessionTs: latest.timestamp };
-  });
-}
-
-function CaptureImageCard({ img, label }) {
-  return (
-    <div className="capture-image-card">
-      <div className="capture-img-container">
-        {img ? (
-          <a href={img.url} target="_blank" rel="noopener noreferrer">
-            <img
-              src={img.url}
-              alt={`Camera ${img.camera_id}`}
-              onError={e => {
-                e.target.style.display = 'none';
-                e.target.nextSibling.style.display = 'flex';
-              }}
-            />
-            <div className="capture-img-placeholder"
-                 style={{ display: 'none', position: 'absolute', inset: 0 }}>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-                <path d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" strokeLinecap="round"/>
-              </svg>
-              <span>URL expired</span>
-            </div>
-          </a>
-        ) : (
-          <div className="capture-img-placeholder">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-              <path d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" strokeLinecap="round"/>
-              <circle cx="12" cy="13" r="3"/>
-            </svg>
-            <span>No image</span>
-          </div>
-        )}
-      </div>
-      <div className="capture-img-footer">
-        <div className="capture-img-cam">
-          {img ? `Camera ${img.camera_id} — ${img.camera_name || label}` : label}
-        </div>
-        <div className="capture-img-time">
-          {img ? fmtDate(img.sessionTs) : 'No capture yet'}
-        </div>
-        {img && (
-          <span className="capture-img-s3">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
-                 style={{ width: 10, height: 10 }}>
-              <path d="M5 13l4 4L19 7" strokeLinecap="round" strokeLinejoin="round"/>
-            </svg>
-            Saved to S3
-          </span>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ── Sub-components ────────────────────────────────────────────────────────────
-
-function StatusHero({ type, title, conf, imagesCount }) {
-  const colorMap = {
-    healthy:  { bg: 'var(--green-light)',  fg: 'var(--green-dark)', badge: '#dcfce7', badgeFg: '#15803d' },
-    unhealthy:{ bg: 'var(--amber-light)',  fg: '#b45309',           badge: '#fef9c3', badgeFg: '#a16207' },
-    error:    { bg: 'var(--red-light)',    fg: 'var(--red)',         badge: '#fee2e2', badgeFg: '#b91c1c' },
-    unknown:  { bg: '#f1f5f9',            fg: 'var(--text-muted)',  badge: '#f1f5f9', badgeFg: '#475569' },
-  };
-  const c = colorMap[type] || colorMap.unknown;
-
-  return (
-    <div style={{
-      background: 'var(--card-bg)',
-      borderRadius: 'var(--r-lg)',
-      border: '1px solid var(--border)',
-      boxShadow: 'var(--shadow)',
-      padding: '40px 32px',
-      textAlign: 'center',
-      position: 'relative',
-      overflow: 'hidden',
-    }}>
-      <div style={{
-        position: 'absolute', top: 0, left: 0, right: 0,
-        height: 4, background: c.fg,
-        borderRadius: 'var(--r-lg) var(--r-lg) 0 0',
-      }}/>
-
-      <div style={{
-        width: 72, height: 72, borderRadius: '50%',
-        background: c.bg,
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        margin: '0 auto 20px',
-        boxShadow: `0 0 0 8px ${c.bg}`,
-      }}>
-        <svg viewBox="0 0 24 24" fill="none" stroke={c.fg} strokeWidth="2"
-             strokeLinecap="round" strokeLinejoin="round"
-             style={{ width: 36, height: 36 }}>
-          <path d={HEALTH_ICONS[type]} />
-        </svg>
-      </div>
-
-      <div style={{ fontSize: 22, fontWeight: 800, color: 'var(--text)', marginBottom: 8, letterSpacing: '-0.4px' }}>
-        {title}
-      </div>
-
-      {conf != null && (
-        <div style={{
-          display: 'inline-flex', alignItems: 'center', gap: 6,
-          background: c.badge, color: c.badgeFg,
-          borderRadius: 20, padding: '4px 14px',
-          fontSize: 13, fontWeight: 700, marginBottom: 8,
-        }}>
-          {conf}% confidence
-        </div>
-      )}
-
-      {imagesCount > 0 && (
-        <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
-          {imagesCount} image{imagesCount !== 1 ? 's' : ''} analyzed
-        </div>
-      )}
-    </div>
-  );
-}
-
-function InfoRow({ label, value }) {
-  return (
-    <div style={{
-      display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start',
-      padding: '10px 0', borderBottom: '1px solid var(--border-light)', gap: 16,
-    }}>
-      <span style={{ fontSize: 13, color: 'var(--text-muted)', fontWeight: 500, flexShrink: 0 }}>{label}</span>
-      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)', textAlign: 'right' }}>{value}</span>
-    </div>
-  );
-}
+// ── Disease card ──────────────────────────────────────────────────────────────
 
 function DiseaseCard({ disease }) {
-  const { name, probability, description, treatment } = disease;
+  const [open, setOpen] = useState(false);
+  const { name, probability, description, cause, treatment } = disease;
   const sections = [
-    ['Prevention', treatment?.prevention],
-    ['Biological', treatment?.biological],
-    ['Chemical',   treatment?.chemical],
-  ].filter(([, items]) => items && items.length > 0);
+    { label: 'Prevention', icon: IC.shield,   color: '#16a34a', items: treatment?.prevention },
+    { label: 'Biological', icon: IC.bio,      color: '#2563eb', items: treatment?.biological },
+    { label: 'Chemical',   icon: IC.chemical, color: '#dc2626', items: treatment?.chemical   },
+  ].filter(s => s.items && s.items.length > 0);
+
+  const sev = probability >= 50 ? { bg: '#fee2e2', border: '#fca5a5', color: '#991b1b', bar: '#dc2626' }
+            : probability >= 20 ? { bg: '#fffbeb', border: '#fde68a', color: '#92400e', bar: '#d97706' }
+            :                     { bg: '#f9fafb', border: '#e5e7eb', color: '#374151', bar: '#9ca3af' };
 
   return (
-    <div style={{
-      background: 'var(--amber-light)',
-      border: '1px solid #fcd34d',
-      borderRadius: 'var(--r)',
-      padding: '16px 18px',
-    }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-        <span style={{ fontSize: 15, fontWeight: 700, color: '#78350f' }}>{name}</span>
-        <span style={{
-          background: '#fef3c7', color: '#b45309',
-          borderRadius: 20, padding: '2px 10px',
-          fontSize: 12, fontWeight: 700,
-        }}>
-          {probability}%
-        </span>
-      </div>
+    <div style={{ background: sev.bg, border: `1px solid ${sev.border}`, borderRadius: 12, overflow: 'hidden' }}>
+      <button onClick={() => setOpen(v => !v)} style={{ width: '100%', padding: '14px 16px', background: 'none', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, textAlign: 'left' }}>
+          <Icon path={IC.disease} size={16} color={sev.color} />
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 700, color: sev.color }}>{name}</div>
+            {cause && <div style={{ fontSize: 11, color: sev.color, opacity: 0.75, marginTop: 1 }}>{cause}</div>}
+          </div>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+          <div style={{ textAlign: 'right' }}>
+            <div style={{ fontSize: 16, fontWeight: 800, color: sev.color }}>{probability}%</div>
+            <div style={{ background: '#e5e7eb', borderRadius: 99, height: 5, width: 60, overflow: 'hidden', marginTop: 3 }}>
+              <div style={{ width: `${probability}%`, height: '100%', background: sev.bar, borderRadius: 99 }} />
+            </div>
+          </div>
+          <Icon path={open ? 'M5 15l7-7 7 7' : 'M19 9l-7 7-7-7'} size={14} color={sev.color} />
+        </div>
+      </button>
 
-      {description && (
-        <p style={{ fontSize: 13, color: '#92400e', lineHeight: 1.6, marginBottom: sections.length ? 12 : 0 }}>
-          {description}
-        </p>
-      )}
-
-      {sections.length > 0 && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {sections.map(([lbl, items]) => (
-            <div key={lbl}>
-              <div style={{
-                fontSize: 11, fontWeight: 700, textTransform: 'uppercase',
-                letterSpacing: '.5px', color: '#b45309', marginBottom: 4,
-              }}>
-                {lbl}
+      {open && (
+        <div style={{ padding: '0 16px 14px', borderTop: `1px solid ${sev.border}` }}>
+          {description && (
+            <p style={{ fontSize: 13, color: sev.color, lineHeight: 1.6, margin: '12px 0', opacity: 0.9 }}>{description}</p>
+          )}
+          {sections.map(({ label, icon, color, items }) => (
+            <div key={label} style={{ marginBottom: 10 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 5 }}>
+                <Icon path={icon} size={12} color={color} />
+                <span style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', color }}>{label}</span>
               </div>
-              <ul style={{ paddingLeft: 16, margin: 0 }}>
+              <ul style={{ paddingLeft: 18, margin: 0 }}>
                 {items.slice(0, 3).map((item, i) => (
-                  <li key={i} style={{ fontSize: 12, color: '#92400e', lineHeight: 1.6 }}>{item}</li>
+                  <li key={i} style={{ fontSize: 12, color: sev.color, lineHeight: 1.6 }}>{item}</li>
                 ))}
               </ul>
             </div>
@@ -221,78 +90,17 @@ function DiseaseCard({ disease }) {
   );
 }
 
-function S3ImageRow({ urls }) {
-  if (!urls || urls.length === 0) return null;
-  return (
-    <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(urls.length, 3)}, 1fr)`, gap: 12 }}>
-      {urls.map((url, i) => (
-        <a key={i} href={url} target="_blank" rel="noopener noreferrer"
-           style={{ display: 'block', borderRadius: 8, overflow: 'hidden', border: '1px solid var(--border)' }}>
-          <img src={url} alt={`Analysis result ${i + 1}`}
-               style={{ width: '100%', display: 'block', objectFit: 'cover', maxHeight: 200 }}
-               onError={e => { e.target.style.display = 'none'; }}/>
-        </a>
-      ))}
-    </div>
-  );
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function deriveStatus(dbLatest, liveResult) {
+  const r = dbLatest || liveResult;
+  if (!r)           return { type: 'unknown',   title: 'No data yet',      conf: null };
+  if (!r.success && !dbLatest) return { type: 'error', title: 'Check failed', conf: null };
+  if (r.is_healthy) return { type: 'healthy',   title: 'Plant is Healthy', conf: r.health_probability };
+  return             { type: 'unhealthy', title: 'Issues Detected',  conf: r.health_probability };
 }
 
-// ── Empty / Error states ──────────────────────────────────────────────────────
-
-function EmptyState() {
-  return (
-    <div style={{
-      background: 'var(--card-bg)', borderRadius: 'var(--r-lg)',
-      border: '1px dashed var(--border)', padding: '60px 40px',
-      textAlign: 'center',
-    }}>
-      <svg viewBox="0 0 24 24" fill="none" stroke="var(--text-light)" strokeWidth="1.5"
-           style={{ width: 48, height: 48, margin: '0 auto 16px', display: 'block' }}>
-        <path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" strokeLinecap="round" strokeLinejoin="round"/>
-      </svg>
-      <div style={{ fontSize: 17, fontWeight: 700, color: 'var(--text)', marginBottom: 8 }}>
-        No plant health data available yet
-      </div>
-      <div style={{ fontSize: 13, color: 'var(--text-muted)', maxWidth: 340, margin: '0 auto' }}>
-        Health analysis results will appear here automatically once the system runs a check.
-      </div>
-    </div>
-  );
-}
-
-function ErrorState({ onRetry }) {
-  return (
-    <div style={{
-      background: 'var(--red-light)', borderRadius: 'var(--r-lg)',
-      border: '1px solid #fecaca', padding: '40px',
-      textAlign: 'center',
-    }}>
-      <svg viewBox="0 0 24 24" fill="none" stroke="var(--red)" strokeWidth="1.5"
-           style={{ width: 40, height: 40, margin: '0 auto 16px', display: 'block' }}>
-        <path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" strokeLinecap="round" strokeLinejoin="round"/>
-      </svg>
-      <div style={{ fontSize: 16, fontWeight: 700, color: '#b91c1c', marginBottom: 8 }}>
-        Could not load data right now.
-      </div>
-      <div style={{ fontSize: 13, color: '#b91c1c', marginBottom: 20 }}>
-        Please try again later.
-      </div>
-      {onRetry && (
-        <button className="btn btn-outline" onClick={onRetry}
-                style={{ border: '1.5px solid #fca5a5', color: '#b91c1c' }}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
-               style={{ width: 13, height: 13 }}>
-            <path d="M1 4v6h6M23 20v-6h-6" strokeLinecap="round" strokeLinejoin="round"/>
-            <path d="M20.49 9A9 9 0 005.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 013.51 15" strokeLinecap="round" strokeLinejoin="round"/>
-          </svg>
-          Try Again
-        </button>
-      )}
-    </div>
-  );
-}
-
-// ── Main PlantHealth page ─────────────────────────────────────────────────────
+// ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function PlantHealth({
   healthResult,
@@ -300,7 +108,6 @@ export default function PlantHealth({
   healthDbHistory,
   healthFetchError,
   onRefreshHealth,
-  // Camera capture props
   captureSessions,
   captureSessionsLoading,
   captureManualLoading,
@@ -316,264 +123,233 @@ export default function PlantHealth({
     setLocalLoading(false);
   };
 
-  const hasData   = !!(healthDbLatest || (healthResult && healthResult.success));
+  const hasData   = !!(healthDbLatest || healthResult?.success);
   const showError = healthFetchError && !hasData;
 
-  const status   = deriveStatus(healthDbLatest, healthResult);
-  const r        = healthDbLatest || (healthResult?.success ? healthResult : null);
+  const status    = deriveStatus(healthDbLatest, healthResult);
+  const r         = healthDbLatest || (healthResult?.success ? healthResult : null);
+  const diseases  = r?.diseases || [];
+  const pct       = r?.health_probability ?? 0;
+  const isHealthy = r?.is_healthy ?? true;
 
-  const diseases  = r?.diseases   || [];
-  const s3Urls    = healthDbLatest?.s3_urls || [];
-  const savedAt   = fmtDate(healthDbLatest?.created_at);
-  const imgCount  = healthDbLatest?.images_analyzed ?? healthResult?.images_sent ?? 0;
+  // Color theme based on health
+  const accent = isHealthy ? '#16a34a' : pct >= 40 ? '#d97706' : '#dc2626';
+  const accentBg = isHealthy ? '#f0fdf4' : pct >= 40 ? '#fffbeb' : '#fef2f2';
+  const accentBorder = isHealthy ? '#86efac' : pct >= 40 ? '#fde68a' : '#fca5a5';
 
-  const latestImages = getLatestImagePerCamera(captureSessions);
+  // Text palette
+  const T = { primary: '#111827', secondary: '#1f2937', label: '#374151', muted: '#6b7280' };
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 24, maxWidth: 900, margin: '0 auto', width: '100%' }}>
+    <div style={{ maxWidth: 1200, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-      {/* ── Page title bar ───────────────────────────────────────────────── */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+      {/* ── Header ─────────────────────────────────────────────────────────── */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <div>
-          <h1 style={{ fontSize: 22, fontWeight: 800, color: 'var(--text)', margin: 0, letterSpacing: '-0.4px' }}>
-            Plant Health
-          </h1>
-          <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: '4px 0 0' }}>
-            Latest automated health analysis result
-          </p>
+          <h2 style={{ margin: 0, fontSize: 18, fontWeight: 800, color: T.primary }}>Plant Health</h2>
+          <div style={{ fontSize: 11, color: T.muted, marginTop: 1 }}>
+            AI-powered health analysis via Plant.id · runs daily at 14:00
+          </div>
         </div>
-
-        <button className="btn btn-outline" onClick={handleRefresh} disabled={localLoading}
-                style={{ flexShrink: 0 }}>
-          {localLoading ? (
-            <>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
-                   className="spin-svg" style={{ width: 13, height: 13 }}>
-                <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4" strokeLinecap="round"/>
-              </svg>
-              Refreshing…
-            </>
-          ) : (
-            <>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
-                   style={{ width: 13, height: 13 }}>
-                <path d="M1 4v6h6M23 20v-6h-6" strokeLinecap="round" strokeLinejoin="round"/>
-                <path d="M20.49 9A9 9 0 005.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 013.51 15" strokeLinecap="round" strokeLinejoin="round"/>
-              </svg>
-              Refresh
-            </>
-          )}
-        </button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button onClick={onCapture} disabled={captureManualLoading}
+            style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '7px 14px', borderRadius: 8, border: '1.5px solid #e5e7eb', background: '#fff', color: T.label, fontWeight: 700, fontSize: 12, cursor: captureManualLoading ? 'not-allowed' : 'pointer' }}>
+            <Icon path={IC.camera} size={13} color={T.muted} />
+            {captureManualLoading ? 'Capturing…' : 'Capture Now'}
+          </button>
+          <button onClick={handleRefresh} disabled={localLoading}
+            style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '7px 14px', borderRadius: 8, border: 'none', background: localLoading ? '#86efac' : '#16a34a', color: '#fff', fontWeight: 700, fontSize: 12, cursor: localLoading ? 'not-allowed' : 'pointer' }}>
+            <Icon path={IC.refresh} size={13} color='#fff' />
+            {localLoading ? 'Loading…' : 'Refresh'}
+          </button>
+        </div>
       </div>
 
-      {/* ── Error state ─────────────────────────────────────────────────── */}
-      {showError && <ErrorState onRetry={handleRefresh} />}
+      {captureManualError && (
+        <div style={{ background: '#fee2e2', border: '1px solid #fca5a5', borderRadius: 8, padding: '9px 14px', color: '#991b1b', fontSize: 12 }}>
+          {captureManualError}
+        </div>
+      )}
 
-      {/* ── No data empty state ──────────────────────────────────────────── */}
-      {!showError && !hasData && <EmptyState />}
+      {/* ── Error state ────────────────────────────────────────────────────── */}
+      {showError && (
+        <div style={{ background: '#fef2f2', border: '1px solid #fca5a5', borderRadius: 12, padding: '36px', textAlign: 'center' }}>
+          <Icon path={IC.warning} size={36} color='#dc2626' />
+          <div style={{ fontSize: 15, fontWeight: 700, color: '#991b1b', marginTop: 10 }}>Could not load health data</div>
+          <button onClick={handleRefresh} style={{ marginTop: 14, display: 'inline-flex', alignItems: 'center', gap: 6, padding: '7px 16px', borderRadius: 8, border: '1.5px solid #fca5a5', background: '#fff', color: '#dc2626', fontWeight: 700, fontSize: 12, cursor: 'pointer' }}>
+            <Icon path={IC.refresh} size={12} color='#dc2626' /> Try Again
+          </button>
+        </div>
+      )}
 
-      {/* ── Main content (only shown when there is health data) ──────────── */}
+      {/* ── Empty state ────────────────────────────────────────────────────── */}
+      {!showError && !hasData && (
+        <div style={{ background: '#f9fafb', border: '1px dashed #d1d5db', borderRadius: 12, padding: '50px', textAlign: 'center' }}>
+          <Icon path={IC.leaf} size={36} color='#d1d5db' />
+          <div style={{ fontSize: 15, fontWeight: 700, color: T.label, marginTop: 12, marginBottom: 6 }}>No health data yet</div>
+          <div style={{ fontSize: 12, color: T.muted, maxWidth: 320, margin: '0 auto' }}>
+            Health analysis runs automatically every day at 14:00. Trigger manually with Capture Now.
+          </div>
+        </div>
+      )}
+
+      {/* ── Main content ───────────────────────────────────────────────────── */}
       {!showError && hasData && (
         <>
-          {/* Status hero */}
-          <StatusHero
-            type={status.type}
-            title={status.title}
-            conf={status.conf}
-            imagesCount={imgCount}
-          />
-
-          {/* Details + History two-column */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
-
-            {/* Left: Details */}
-            <div style={{
-              background: 'var(--card-bg)', borderRadius: 'var(--r)',
-              border: '1px solid var(--border)', boxShadow: 'var(--shadow-sm)',
-              padding: '20px 24px',
-            }}>
-              <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 16, color: 'var(--text)' }}>
-                Details
-              </div>
-
-              {r?.is_healthy != null && (
-                <InfoRow
-                  label="Overall Status"
-                  value={
-                    <span style={{ color: r.is_healthy ? 'var(--green-dark)' : '#b45309', fontWeight: 700 }}>
-                      {r.is_healthy ? '✓ Healthy' : '✗ Issues Detected'}
-                    </span>
-                  }
-                />
-              )}
-              {r?.health_probability != null && (
-                <InfoRow label="Confidence Score" value={`${r.health_probability}%`} />
-              )}
-              {healthDbLatest?.created_at && (
-                <InfoRow label="Last Updated" value={savedAt} />
-              )}
-              {imgCount > 0 && (
-                <InfoRow label="Images Analyzed" value={`${imgCount} image${imgCount !== 1 ? 's' : ''}`} />
-              )}
-              {!diseases.length && r?.is_healthy && (
-                <div style={{
-                  marginTop: 16, padding: '12px 14px',
-                  background: 'var(--green-light)', borderRadius: 'var(--r-sm)',
-                  display: 'flex', alignItems: 'center', gap: 8,
-                }}>
-                  <svg viewBox="0 0 24 24" fill="none" stroke="var(--green-dark)" strokeWidth="2.5"
-                       style={{ width: 16, height: 16, flexShrink: 0 }}>
-                    <path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" strokeLinecap="round" strokeLinejoin="round"/>
-                  </svg>
-                  <span style={{ fontSize: 13, color: 'var(--green-dark)', fontWeight: 600 }}>
-                    No diseases or issues detected
-                  </span>
-                </div>
-              )}
+          {/* ── One compact summary bar — shown ONCE ── */}
+          <div style={{
+            background: accentBg, border: `1.5px solid ${accentBorder}`,
+            borderRadius: 12, padding: '12px 20px',
+            display: 'flex', alignItems: 'center', gap: 0, flexWrap: 'wrap',
+          }}>
+            {/* Status */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 9, paddingRight: 24, borderRight: `1px solid ${accentBorder}` }}>
+              <div style={{ width: 10, height: 10, borderRadius: '50%', background: accent, flexShrink: 0 }} />
+              <span style={{ fontSize: 15, fontWeight: 800, color: accent }}>{status.title}</span>
             </div>
-
-            {/* Right: History */}
-            {healthDbHistory && healthDbHistory.length > 0 && (
-              <div style={{
-                background: 'var(--card-bg)', borderRadius: 'var(--r)',
-                border: '1px solid var(--border)', boxShadow: 'var(--shadow-sm)',
-                padding: '20px 24px',
-              }}>
-                <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 16, color: 'var(--text)' }}>
-                  Recent History
-                </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  {healthDbHistory.slice(0, 6).map((entry, i) => {
-                    const ok = entry.is_healthy;
-                    return (
-                      <div key={i} style={{
-                        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                        padding: '8px 12px',
-                        background: ok ? 'var(--green-light)' : 'var(--amber-light)',
-                        borderRadius: 'var(--r-sm)', fontSize: 12,
-                      }}>
-                        <span style={{ fontWeight: 600, color: ok ? 'var(--green-dark)' : '#b45309' }}>
-                          {ok ? '✓ Healthy' : '✗ Issues'}
-                        </span>
-                        <span style={{ color: 'var(--text-muted)' }}>
-                          {fmtDate(entry.created_at)}
-                        </span>
-                        {entry.health_probability != null && (
-                          <span style={{ fontWeight: 700, color: ok ? 'var(--green-dark)' : '#b45309' }}>
-                            {entry.health_probability}%
-                          </span>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
+            {/* Confidence */}
+            <div style={{ paddingLeft: 24, paddingRight: 24, borderRight: `1px solid ${accentBorder}` }}>
+              <div style={{ fontSize: 10, color: T.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 2 }}>Confidence</div>
+              <div style={{ fontSize: 22, fontWeight: 900, color: accent, lineHeight: 1 }}>{pct}%</div>
+            </div>
+            {/* Issues */}
+            <div style={{ paddingLeft: 24, paddingRight: 24, borderRight: `1px solid ${accentBorder}` }}>
+              <div style={{ fontSize: 10, color: T.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 2 }}>Issues Found</div>
+              <div style={{ fontSize: 22, fontWeight: 900, color: diseases.length > 0 ? '#d97706' : '#16a34a', lineHeight: 1 }}>
+                {diseases.length}
               </div>
-            )}
+            </div>
+            {/* Last check */}
+            <div style={{ paddingLeft: 24, marginLeft: 'auto' }}>
+              <div style={{ fontSize: 10, color: T.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 2 }}>Last Check</div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: T.primary }}>
+                {r?.created_at ? fmtDate(r.created_at) : '—'}
+              </div>
+            </div>
           </div>
 
-          {/* S3 images used for analysis */}
-          {s3Urls.length > 0 && (
-            <div style={{
-              background: 'var(--card-bg)', borderRadius: 'var(--r)',
-              border: '1px solid var(--border)', boxShadow: 'var(--shadow-sm)',
-              padding: '20px 24px',
-            }}>
-              <div style={{
-                fontSize: 14, fontWeight: 700, marginBottom: 14, color: 'var(--text)',
-                display: 'flex', alignItems: 'center', gap: 8,
-              }}>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
-                     style={{ width: 16, height: 16 }}>
-                  <path d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" strokeLinecap="round" strokeLinejoin="round"/>
-                </svg>
-                Images Used for Analysis
-              </div>
-              <S3ImageRow urls={s3Urls} />
-            </div>
-          )}
+          {/* ── Two-column: API Result | Health History ── */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, alignItems: 'start' }}>
 
-          {/* Detected diseases */}
-          {diseases.length > 0 && (
-            <div style={{
-              background: 'var(--card-bg)', borderRadius: 'var(--r)',
-              border: '1px solid var(--border)', boxShadow: 'var(--shadow-sm)',
-              padding: '20px 24px',
-            }}>
-              <div style={{
-                fontSize: 14, fontWeight: 700, marginBottom: 16, color: 'var(--text)',
-                display: 'flex', alignItems: 'center', gap: 8,
-              }}>
-                <svg viewBox="0 0 24 24" fill="none" stroke="#b45309" strokeWidth="2"
-                     style={{ width: 16, height: 16 }}>
-                  <path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" strokeLinecap="round" strokeLinejoin="round"/>
-                </svg>
-                Detected Issues
-                <span style={{
-                  marginLeft: 4, background: '#fef3c7', color: '#b45309',
-                  borderRadius: 20, padding: '1px 8px', fontSize: 11, fontWeight: 700,
-                }}>
-                  {diseases.length}
-                </span>
+            {/* Left: API Result */}
+            <div style={{ background: '#fff', border: '1.5px solid #e5e7eb', borderRadius: 14, overflow: 'hidden', boxShadow: '0 1px 4px rgba(0,0,0,0.05)' }}>
+              {/* Card header */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '13px 18px', borderBottom: '1px solid #e5e7eb', background: '#fafafa' }}>
+                <div style={{ background: accentBg, borderRadius: 8, padding: 7, display: 'flex' }}>
+                  <Icon path={IC.leaf} size={14} color={accent} />
+                </div>
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 800, color: T.primary }}>API Result</div>
+                  <div style={{ fontSize: 10, color: T.muted, marginTop: 1 }}>Latest health check from Plant.id</div>
+                </div>
               </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {diseases.map((d, i) => <DiseaseCard key={i} disease={d} />)}
+
+              {/* Body — no scroll, grows with content */}
+              <div style={{ padding: '16px 20px' }}>
+                {/* Status + confidence row */}
+                <div style={{ display: 'flex', gap: 12, marginBottom: 18 }}>
+                  <div style={{ flex: 1, textAlign: 'center', padding: '14px 10px', background: accentBg, borderRadius: 10, border: `1px solid ${accentBorder}` }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: T.muted, textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 6 }}>Status</div>
+                    <div style={{ fontSize: 20, fontWeight: 900, color: accent }}>{isHealthy ? 'Healthy' : 'Issues'}</div>
+                  </div>
+                  <div style={{ flex: 1, textAlign: 'center', padding: '14px 10px', background: '#f9fafb', borderRadius: 10, border: '1px solid #e5e7eb' }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: T.muted, textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 6 }}>Confidence</div>
+                    <div style={{ fontSize: 20, fontWeight: 900, color: accent }}>{pct}%</div>
+                  </div>
+                  <div style={{ flex: 1, textAlign: 'center', padding: '14px 10px', background: diseases.length > 0 ? '#fffbeb' : '#f0fdf4', borderRadius: 10, border: `1px solid ${diseases.length > 0 ? '#fde68a' : '#86efac'}` }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: T.muted, textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 6 }}>Issues</div>
+                    <div style={{ fontSize: 20, fontWeight: 900, color: diseases.length > 0 ? '#d97706' : '#16a34a' }}>{diseases.length}</div>
+                  </div>
+                </div>
+
+                {/* No issues banner */}
+                {diseases.length === 0 && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', background: '#f0fdf4', border: '1px solid #86efac', borderRadius: 8, marginBottom: 12 }}>
+                    <Icon path={IC.check} size={13} color='#16a34a' />
+                    <span style={{ fontSize: 12, fontWeight: 700, color: '#166534' }}>No diseases or issues detected</span>
+                  </div>
+                )}
+
+                {/* Disease cards */}
+                {diseases.length > 0 && (
+                  <div>
+                    <div style={{ fontSize: 10, fontWeight: 800, color: T.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 }}>
+                      Detected Issues — click to expand
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {diseases.map((d, i) => <DiseaseCard key={i} disease={d} />)}
+                    </div>
+                  </div>
+                )}
+
               </div>
             </div>
-          )}
+
+            {/* Right: Health History */}
+            <div style={{ background: '#fff', border: '1.5px solid #e5e7eb', borderRadius: 14, overflow: 'hidden', boxShadow: '0 1px 4px rgba(0,0,0,0.05)' }}>
+              {/* Card header */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '13px 18px', borderBottom: '1px solid #e5e7eb', background: '#fafafa' }}>
+                <div style={{ background: '#f5f3ff', borderRadius: 8, padding: 7, display: 'flex' }}>
+                  <Icon path={IC.history} size={14} color='#7c3aed' />
+                </div>
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 800, color: T.primary }}>Health History</div>
+                  <div style={{ fontSize: 10, color: T.muted, marginTop: 1 }}>
+                    {healthDbHistory?.length || 0} check{healthDbHistory?.length !== 1 ? 's' : ''} recorded
+                  </div>
+                </div>
+              </div>
+
+              {/* Body — no scroll */}
+              <div>
+                {!healthDbHistory || healthDbHistory.length === 0 ? (
+                  <div style={{ padding: '30px', textAlign: 'center', color: T.muted, fontSize: 13 }}>No history yet</div>
+                ) : (
+                  <>
+                    {/* Column headers */}
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 90px 64px 64px', padding: '9px 20px', background: '#f9fafb', borderBottom: '1px solid #e5e7eb' }}>
+                      {['Date / Time', 'Status', 'Conf.', 'Issues'].map(h => (
+                        <span key={h} style={{ fontSize: 10, fontWeight: 800, color: T.muted, textTransform: 'uppercase', letterSpacing: '0.07em' }}>{h}</span>
+                      ))}
+                    </div>
+                    {/* Rows */}
+                    {healthDbHistory.map((e, i) => {
+                      const ok = e.is_healthy;
+                      const p  = e.health_probability ?? 0;
+                      const c  = p >= 70 ? '#16a34a' : p >= 40 ? '#d97706' : '#dc2626';
+                      const issueCount = (e.diseases || []).length;
+                      return (
+                        <div key={i} style={{
+                          display: 'grid', gridTemplateColumns: '1fr 90px 64px 64px',
+                          padding: '12px 20px', borderBottom: '1px solid #f3f4f6',
+                          background: i % 2 === 0 ? '#fff' : '#fafafa',
+                          alignItems: 'center',
+                        }}>
+                          <span style={{ fontSize: 12, color: T.label, fontWeight: 600 }}>
+                            {fmtDate(e.created_at)}
+                          </span>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <div style={{ width: 7, height: 7, borderRadius: '50%', background: c, flexShrink: 0 }} />
+                            <span style={{ fontSize: 12, fontWeight: 700, color: c }}>
+                              {ok ? 'Healthy' : 'Issues'}
+                            </span>
+                          </div>
+                          <span style={{ fontSize: 13, fontWeight: 800, color: c }}>{p}%</span>
+                          <span style={{ fontSize: 13, fontWeight: 700, color: issueCount > 0 ? '#d97706' : '#9ca3af' }}>
+                            {issueCount}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </>
+                )}
+              </div>
+            </div>
+
+          </div>
         </>
       )}
 
-      {/* ── Latest Camera Captures (always shown, even when no health data) ── */}
-      <div style={{
-        background: 'var(--card-bg)', borderRadius: 'var(--r)',
-        border: '1px solid var(--border)', boxShadow: 'var(--shadow-sm)',
-        padding: '20px 24px',
-      }}>
-        <div className="section-title">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
-               style={{ width: 18, height: 18 }}>
-            <path d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" strokeLinecap="round"/>
-            <circle cx="12" cy="13" r="3"/>
-          </svg>
-          Latest Camera Captures
-          <button
-            className="btn btn-outline"
-            style={{ marginLeft: 'auto', padding: '4px 10px', fontSize: 12 }}
-            onClick={onCapture}
-            disabled={captureManualLoading}
-          >
-            {captureManualLoading ? 'Capturing…' : 'Capture Now'}
-          </button>
-        </div>
-
-        {captureManualError && (
-          <div style={{ color: 'var(--red)', fontSize: 12, marginBottom: 10 }}>
-            {captureManualError}
-          </div>
-        )}
-
-        {captureSessionsLoading && (!captureSessions || captureSessions.length === 0) ? (
-          <div className="loading-state" style={{ minHeight: 80 }}>Loading…</div>
-        ) : latestImages.length === 0 ? (
-          <div className="empty-state" style={{ minHeight: 80 }}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-              <path d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"/>
-              <circle cx="12" cy="13" r="3"/>
-            </svg>
-            No captures yet
-          </div>
-        ) : (
-          <div className="image-cards-row">
-            {latestImages.map(img => (
-              <CaptureImageCard
-                key={img.camera_id}
-                img={img.success && img.url ? img : null}
-                label={`Camera ${img.camera_id}`}
-              />
-            ))}
-          </div>
-        )}
-      </div>
 
     </div>
   );

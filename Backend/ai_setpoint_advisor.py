@@ -1259,6 +1259,22 @@ def run_advisor(triggered_by: str = "scheduler") -> dict:
         )
         _mongo_db_handler.insert_ai_recommendation(doc)
 
+        # 6-ntf. UI notification (bell/toast) — UI only, never email, never blocks.
+        try:
+            import notifications
+            _n_changes = len(doc.get('changes') or [])
+            notifications.create_notification(
+                'ai_recommendation_ready', 'info',
+                'New AI recommendation ready',
+                (f"{_n_changes} setpoint change(s) recommended." if _n_changes
+                 else "AI analysis complete — no setpoint changes recommended."),
+                category='workflow', link='ai-advisor',
+                meta={'rec_id': doc['recommendation_id']},
+                dedup_key=f"ai_rec:{doc['recommendation_id']}", dedup_window_sec=3600,
+            )
+        except Exception as _ntf_err:
+            _CUSTOM_PRINT_FUNC(f"[Notifications] ai_recommendation_ready skipped: {_ntf_err}")
+
         # 6a. Trigger Layer 3 review automatically (runs in background, never blocks Layer 2)
         _trigger_layer3_review(doc['recommendation_id'])
 

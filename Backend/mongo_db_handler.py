@@ -7,7 +7,7 @@ from utils.utils import _CUSTOM_PRINT_FUNC
 
 class MongoDBHandler:
     def __init__(self, uri, db_name):
-        self.__client = MongoClient(uri)
+        self.__client = MongoClient(uri, serverSelectionTimeoutMS=5000, connectTimeoutMS=5000, socketTimeoutMS=5000)
         # Send a ping to confirm a successful connection
         try:
             self.__client.admin.command('ping')
@@ -264,15 +264,19 @@ class MongoDBHandler:
             _CUSTOM_PRINT_FUNC(f"Error getting state '{key}': {e}")
             return None
 
-    def insert_pump_log(self, pump_type: str, pulse_sec: float, duty_cycle: int, flow_rate_l_min: float = 0.0) -> bool:
+    def insert_pump_log(self, pump_type: str, pulse_sec: float, duty_cycle: int,
+                        flow_rate_l_min: float = 0.0, reason: str = '') -> bool:
         """Log a single pump pulse event to the pump_logs collection."""
         try:
+            amount_l = round(flow_rate_l_min * (pulse_sec / 60), 6) if flow_rate_l_min > 0 else 0.0
             self.__db['pump_logs'].insert_one({
                 'pump':            pump_type,
                 'timestamp':       datetime.datetime.now(),
                 'pulse_sec':       pulse_sec,
                 'duty_cycle':      duty_cycle,
                 'flow_rate_l_min': round(flow_rate_l_min, 4),
+                'amount_l':        amount_l,
+                'reason':          reason,
             })
             return True
         except Exception as e:
@@ -291,6 +295,97 @@ class MongoDBHandler:
             return list(cursor)
         except Exception as e:
             _CUSTOM_PRINT_FUNC(f"Error fetching pump logs: {e}")
+            return []
+
+    # ── Actuator session log (event-based, one open session per actuator) ────
+
+    def record_actuator_state(self, actuator: str, duty_cycle: int) -> bool:
+        """
+        Event-based actuator session logging — NO polling duplication.
+
+        Maintains exactly ONE open 'running' session per actuator_id:
+          OFF → ON : insert a new running session (started_at)
+          ON  → ON : update the open running session only (duty/percentage/last_updated)
+          ON  → OFF: close the open running session (stopped_at, duration_sec, status='stopped')
+          OFF → OFF: do nothing
+
+        Safe to call on every poll — a steady/ fluctuating ON state never creates
+        a new row, it only updates the existing open session.
+        """
+        try:
+            now   = datetime.datetime.now()
+            is_on = duty_cycle is not None and duty_cycle > 0
+            col   = self.__db['actuator_events']
+
+            # The single currently-open session for this actuator (if any)
+            open_doc = col.find_one(
+                {'actuator': actuator, 'status': 'running'},
+                sort=[('started_at', pymongo.DESCENDING)],
+            )
+
+            if is_on:
+                pct = round((duty_cycle / 4095) * 100, 1)
+                if open_doc is None:
+                    # OFF → ON : start a new running session
+                    col.insert_one({
+                        'actuator':     actuator,
+                        'status':       'running',
+                        'started_at':   now,
+                        'stopped_at':   None,
+                        'duration_sec': None,
+                        'duty_cycle':   duty_cycle,
+                        'percentage':   pct,
+                        'last_updated': now,
+                    })
+                else:
+                    # ON → ON : update the open session only (no insert)
+                    col.update_one(
+                        {'_id': open_doc['_id']},
+                        {'$set': {
+                            'duty_cycle':   duty_cycle,
+                            'percentage':   pct,
+                            'last_updated': now,
+                        }},
+                    )
+            else:
+                if open_doc is not None:
+                    # ON → OFF : close the open session
+                    started  = open_doc.get('started_at') or now
+                    duration = max(0, int((now - started).total_seconds()))
+                    col.update_one(
+                        {'_id': open_doc['_id']},
+                        {'$set': {
+                            'status':       'stopped',
+                            'stopped_at':   now,
+                            'duration_sec': duration,
+                            'last_updated': now,
+                        }},
+                    )
+                # OFF → OFF : nothing to do
+            return True
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error recording actuator state: {e}")
+            return False
+
+    def get_actuator_events(self, limit: int = 60, actuator: str = None) -> list:
+        """
+        Return recent actuator sessions (newest first), one document per
+        ON→OFF session (or the current open 'running' one).
+        Only returns the new session schema (docs that have started_at).
+        """
+        try:
+            query = {'started_at': {'$exists': True}}
+            if actuator:
+                query['actuator'] = actuator
+            cursor = (
+                self.__db['actuator_events']
+                .find(query, {'_id': 0})
+                .sort('started_at', pymongo.DESCENDING)
+                .limit(limit)
+            )
+            return list(cursor)
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error fetching actuator events: {e}")
             return []
 
     # ── Growth measurements ───────────────────────────────────────────────────
@@ -380,6 +475,48 @@ class MongoDBHandler:
             return list(cursor)
         except Exception as e:
             _CUSTOM_PRINT_FUNC(f"Error fetching plant health history: {e}")
+            return []
+
+    # ── Sensor time-series history ────────────────────────────────────────────
+
+    def get_sensor_history(self, sensor_id: str, hours: int = 24,
+                           max_points: int = 150) -> list:
+        """
+        Return time-series [{time, value}] for one sensor over the last N hours.
+        Sampled down to max_points so the frontend chart stays fast.
+        """
+        try:
+            since  = datetime.datetime.now() - datetime.timedelta(hours=hours)
+            cursor = (
+                self.__db['sensors_data']
+                .find(
+                    {'sensor_id': sensor_id, 'timestamp': {'$gte': since}},
+                    {'sensor_value': 1, 'timestamp': 1, '_id': 0},
+                )
+                .sort('timestamp', pymongo.ASCENDING)
+            )
+            docs = list(cursor)
+            if not docs:
+                return []
+            # Uniform sampling
+            if len(docs) > max_points:
+                step = len(docs) / max_points
+                docs = [docs[int(i * step)] for i in range(max_points)]
+            result = []
+            for d in docs:
+                ts  = d.get('timestamp')
+                val = d.get('sensor_value')
+                if ts and val is not None:
+                    try:
+                        result.append({
+                            'time':  ts.isoformat(),
+                            'value': round(float(val), 4),
+                        })
+                    except (TypeError, ValueError):
+                        pass
+            return result
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error fetching sensor history for '{sensor_id}': {e}")
             return []
 
     # ── Sensor statistics (for AI Advisor) ───────────────────────────────────
@@ -900,6 +1037,99 @@ class MongoDBHandler:
         except Exception as e:
             _CUSTOM_PRINT_FUNC(f"[Layer3] Error updating layer3_status: {e}")
             return False
+
+    # ── Notifications ─────────────────────────────────────────────────────────
+    # Backend-generated UI notifications (bell + toast in the React app).
+    # These are UI-only and never send email; critical email alerts are owned by
+    # the existing alert module and are unchanged.
+
+    def insert_notification(self, doc: dict) -> bool:
+        """Insert one UI notification document into the notifications collection."""
+        try:
+            self.__db['notifications'].insert_one(doc)
+            return True
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error inserting notification: {e}")
+            return False
+
+    def get_notifications(self, since: str = None, limit: int = 50,
+                          unread_only: bool = False) -> list:
+        """Return notifications newest-first. Optionally only those created after
+        *since* (ISO-8601 string) and/or only unread ones."""
+        try:
+            query = {}
+            if unread_only:
+                query['read'] = False
+            if since:
+                query['created_at'] = {'$gt': since}
+            cursor = (
+                self.__db['notifications']
+                .find(query, {'_id': 0})
+                .sort('created_at', pymongo.DESCENDING)
+                .limit(limit)
+            )
+            return list(cursor)
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error fetching notifications: {e}")
+            return []
+
+    def get_unread_notification_count(self) -> int:
+        """Return the number of unread notifications."""
+        try:
+            return self.__db['notifications'].count_documents({'read': False})
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error counting unread notifications: {e}")
+            return 0
+
+    def mark_notification_read(self, notification_id: str) -> bool:
+        """Mark a single notification as read. Returns True if it existed."""
+        try:
+            result = self.__db['notifications'].update_one(
+                {'notification_id': notification_id},
+                {'$set': {'read': True}},
+            )
+            return result.matched_count > 0
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error marking notification read '{notification_id}': {e}")
+            return False
+
+    def mark_all_notifications_read(self) -> int:
+        """Mark every unread notification as read. Returns the count updated."""
+        try:
+            result = self.__db['notifications'].update_many(
+                {'read': False},
+                {'$set': {'read': True}},
+            )
+            return result.modified_count
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error marking all notifications read: {e}")
+            return 0
+
+    def clear_notifications(self) -> int:
+        """Delete all notifications. Returns the count removed."""
+        try:
+            result = self.__db['notifications'].delete_many({})
+            return result.deleted_count
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error clearing notifications: {e}")
+            return 0
+
+    def get_recent_notification(self, dedup_key: str, window_sec: int) -> dict:
+        """Return the most recent notification with *dedup_key* created within the
+        last *window_sec* seconds, or None. Used for spam/duplicate suppression."""
+        try:
+            if not dedup_key or window_sec <= 0:
+                return None
+            cutoff = (datetime.datetime.now()
+                      - datetime.timedelta(seconds=window_sec)).isoformat()
+            return self.__db['notifications'].find_one(
+                {'dedup_key': dedup_key, 'created_at': {'$gte': cutoff}},
+                {'_id': 0},
+                sort=[('created_at', pymongo.DESCENDING)],
+            )
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error checking recent notification '{dedup_key}': {e}")
+            return None
 
     def close_connection(self):
         try:

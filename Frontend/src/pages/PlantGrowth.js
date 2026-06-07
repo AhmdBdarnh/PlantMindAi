@@ -1,9 +1,10 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   Legend, ResponsiveContainer,
 } from 'recharts';
 import { fmt, fmtNum, fmtDate, fmtDateShort } from '../utils/format';
+import { API_BASE_URL } from '../api/config';
 
 // ── Growth metric card ────────────────────────────────────────────────────────
 
@@ -22,40 +23,6 @@ function MetricCard({ label, value, unit, icon, color = 'var(--green)' }) {
       <div>
         <span className="sensor-card-value">{fmt(value)}</span>
         {unit && <span className="sensor-card-unit" style={{ marginLeft: 4 }}>{unit}</span>}
-      </div>
-    </div>
-  );
-}
-
-// ── Detection image card ───────────────────────────────────────────────────────
-
-function DetectionImageCard({ url, label }) {
-  if (!url) return null;
-  return (
-    <div style={{
-      width: '100%',
-      background: 'var(--bg)',
-      borderRadius: 'var(--r)',
-      border: '1px solid var(--border)',
-      overflow: 'hidden',
-    }}>
-      <a href={url} target="_blank" rel="noopener noreferrer" style={{ display: 'block' }}>
-        <img
-          src={url}
-          alt={label}
-          style={{ width: '100%', display: 'block', objectFit: 'contain' }}
-          onError={e => { e.target.style.display = 'none'; }}
-        />
-      </a>
-      <div style={{
-        padding: '8px 12px',
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        fontSize: 13,
-      }}>
-        <span style={{ fontWeight: 600 }}>{label}</span>
-        <span className="capture-img-s3">Detection result</span>
       </div>
     </div>
   );
@@ -87,14 +54,12 @@ function GrowthChart({ history }) {
       area_cm2:   d.area_cm2   != null ? Number(d.area_cm2.toFixed(3))   : null,
       height_cm:  d.height_cm  != null ? Number(d.height_cm.toFixed(3))  : null,
       growth_pct: d.growth_pct != null ? Number(d.growth_pct.toFixed(2)) : null,
-      agr:        d.agr        != null ? Number(d.agr.toFixed(3))        : null,
     }));
 
   const METRICS = [
     { key: 'area_cm2',   label: 'Area (cm²)',    color: '#22c55e' },
     { key: 'height_cm',  label: 'Height (cm)',   color: '#3b82f6' },
     { key: 'growth_pct', label: 'Growth %',      color: '#f59e0b' },
-    { key: 'agr',        label: 'AGR (cm²/day)', color: '#8b5cf6' },
   ];
 
   const active = METRICS.find(m => m.key === activeMetric) || METRICS[0];
@@ -199,6 +164,281 @@ function GrowthSummaryCard({ g }) {
   );
 }
 
+// ── Growth Images Timeline (Tab 2) ───────────────────────────────────────────
+
+const CAMERAS = [
+  { id: 1, label: 'Camera 1' },
+  { id: 2, label: 'Camera 2' },
+  { id: 4, label: 'Camera 3' },   // physical cam ID 4 = display "Camera 3"
+];
+
+// Build date strings for today / yesterday / 2 days ago in local time
+function getDayStrings() {
+  return [0, 1, 2].map(n => {
+    const d = new Date();
+    d.setDate(d.getDate() - n);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  });
+}
+
+function fmtDisplayDate(isoDate) {
+  // "2026-06-04" → "04 Jun 2026"
+  try {
+    const d = new Date(isoDate + 'T00:00:00');
+    return d.toLocaleDateString([], { day: '2-digit', month: 'short', year: 'numeric' });
+  } catch { return isoDate; }
+}
+
+function fmtDisplayTime(isoTs) {
+  if (!isoTs) return null;
+  try {
+    return new Date(isoTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  } catch { return null; }
+}
+
+function GrowthImagesTab({ growthHistory }) {
+  const [sessions,     setSessions]     = useState([]);
+  const [loading,      setLoading]      = useState(true);
+  const [selectedCam,  setSelectedCam]  = useState(1);
+  const [lightbox,     setLightbox]     = useState(null); // url string or null
+
+  useEffect(() => {
+    setLoading(true);
+    fetch(`${API_BASE_URL}/capture_sessions?limit=60`, { cache: 'no-store' })
+      .then(r => r.json())
+      .then(d => { if (d.success) setSessions(d.sessions || []); })
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }, []);
+
+  const dayStrings = getDayStrings();   // [today, yesterday, 2daysago]
+  const DAY_LABELS = ['Today', 'Yesterday', '2 Days Ago'];
+
+  // Group by local date → pick most-recent session per day
+  const sessionByDay = {};
+  for (const s of sessions) {
+    if (!s.timestamp) continue;
+    // timestamp is ISO string: "2026-06-04T14:10:23..."
+    const dateKey = s.timestamp.slice(0, 10);
+    if (!dayStrings.includes(dateKey)) continue;
+    if (!sessionByDay[dateKey] || s.timestamp > sessionByDay[dateKey].timestamp) {
+      sessionByDay[dateKey] = s;
+    }
+  }
+
+  // Group successful growth measurements by local date → most recent per day.
+  // These come from the metrics tab's history (one 3D measurement per analysis run).
+  const growthByDay = {};
+  for (const m of (growthHistory || [])) {
+    if (m.status !== 'success' || !m.captured_at) continue;
+    const dateKey = String(m.captured_at).slice(0, 10);
+    if (!dayStrings.includes(dateKey)) continue;
+    if (!growthByDay[dateKey] || m.captured_at > growthByDay[dateKey].captured_at) {
+      growthByDay[dateKey] = m;
+    }
+  }
+
+  const T = { primary: '#111827', label: '#374151', muted: '#6b7280' };
+
+  return (
+    <div>
+      {/* ── Camera selector ─────────────────────────────────────────── */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 24 }}>
+        <span style={{ fontSize: 12, fontWeight: 700, color: T.muted, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+          View:
+        </span>
+        {CAMERAS.map(cam => (
+          <button key={cam.id} onClick={() => setSelectedCam(cam.id)} style={{
+            padding: '8px 22px', borderRadius: 10, fontWeight: 700, fontSize: 13,
+            cursor: 'pointer', transition: 'all 0.13s',
+            background: selectedCam === cam.id ? '#111827' : '#fff',
+            color:      selectedCam === cam.id ? '#fff'    : T.label,
+            border:     selectedCam === cam.id ? '2px solid #111827' : '2px solid #e5e7eb',
+            boxShadow:  selectedCam === cam.id ? '0 2px 8px rgba(0,0,0,0.15)' : 'none',
+          }}>
+            {cam.label}
+          </button>
+        ))}
+        <span style={{ marginLeft: 'auto', fontSize: 11, color: T.muted }}>
+          Click any image to enlarge
+        </span>
+      </div>
+
+      {loading ? (
+        <div style={{ textAlign: 'center', padding: '48px', color: T.muted, fontSize: 13 }}>
+          Loading capture sessions…
+        </div>
+      ) : (
+        /* ── 3-column grid: Today | Yesterday | 2 Days Ago ── */
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 20 }}>
+          {dayStrings.map((dateStr, idx) => {
+            const session  = sessionByDay[dateStr];
+            const image    = session?.images?.find(img => Number(img.camera_id) === selectedCam);
+            const hasImage = image?.url && image?.success !== false;
+            const camLabel = CAMERAS.find(c => c.id === selectedCam)?.label || '';
+            const time     = fmtDisplayTime(session?.timestamp);
+            const growth   = growthByDay[dateStr];   // metrics for this day (shared across cameras)
+
+            return (
+              <div key={dateStr} style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
+                {/* Day header */}
+                <div style={{
+                  background: '#111827', borderRadius: '12px 12px 0 0',
+                  padding: '12px 16px',
+                }}>
+                  <div style={{ fontSize: 14, fontWeight: 800, color: '#fff', marginBottom: 2 }}>
+                    {DAY_LABELS[idx]}
+                  </div>
+                  <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.6)' }}>
+                    {fmtDisplayDate(dateStr)}
+                  </div>
+                  {time && (
+                    <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)', marginTop: 1 }}>
+                      {time} · {camLabel}
+                    </div>
+                  )}
+                </div>
+
+                {/* Image area */}
+                <div style={{
+                  background: '#f1f5f9',
+                  border: '1.5px solid #e2e8f0',
+                  borderTop: 'none',
+                  borderBottom: 'none',
+                  overflow: 'hidden',
+                  minHeight: 280,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}>
+                  {hasImage ? (
+                    <div
+                      onClick={() => setLightbox(image.url)}
+                      style={{ width: '100%', cursor: 'zoom-in', lineHeight: 0 }}
+                      title="Click to enlarge"
+                    >
+                      <img
+                        src={image.url}
+                        alt={`${DAY_LABELS[idx]} — ${camLabel}`}
+                        style={{ width: '100%', display: 'block', objectFit: 'cover' }}
+                        onError={e => { e.target.parentElement.style.display = 'none'; }}
+                      />
+                    </div>
+                  ) : (
+                    <div style={{ textAlign: 'center', padding: '32px 20px' }}>
+                      <svg viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="1.5"
+                        style={{ width: 40, height: 40, margin: '0 auto 10px', display: 'block' }}>
+                        <path d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" strokeLinecap="round"/>
+                      </svg>
+                      <div style={{ fontSize: 12, color: T.muted, fontWeight: 600 }}>
+                        No image for this day
+                      </div>
+                      <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 4 }}>
+                        {session ? `Session found but no ${camLabel} image` : 'No capture session recorded'}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Metrics strip — height / width / area for this day */}
+                <div style={{
+                  background: '#fff',
+                  border: '1.5px solid #e2e8f0',
+                  borderTop: '1px solid #f1f5f9',
+                  borderRadius: '0 0 12px 12px',
+                  padding: '12px 14px',
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(3, 1fr)',
+                  gap: 8,
+                }}>
+                  {growth ? (
+                    [
+                      { lbl: 'Height', val: growth.height_cm, unit: 'cm', color: '#3b82f6' },
+                      { lbl: 'Width',  val: growth.width_cm,  unit: 'cm', color: '#14b8a6' },
+                      { lbl: 'Area',   val: growth.area_cm2,  unit: 'cm²', color: '#22c55e' },
+                    ].map(({ lbl, val, unit, color }) => (
+                      <div key={lbl} style={{
+                        textAlign: 'center', padding: '8px 4px',
+                        background: '#f8fafc', borderRadius: 8,
+                      }}>
+                        <div style={{ fontSize: 9, fontWeight: 700, color: T.muted, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 3 }}>
+                          {lbl}
+                        </div>
+                        <div style={{ fontSize: 16, fontWeight: 900, color: val != null ? color : '#cbd5e1', lineHeight: 1 }}>
+                          {val != null ? Number(val).toFixed(2) : '—'}
+                        </div>
+                        {val != null && (
+                          <div style={{ fontSize: 9, color: T.muted, marginTop: 2 }}>{unit}</div>
+                        )}
+                      </div>
+                    ))
+                  ) : (
+                    <div style={{ gridColumn: '1 / -1', textAlign: 'center', fontSize: 11, color: '#94a3b8', padding: '6px 0' }}>
+                      No growth measurement for this day
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* ── Lightbox ─────────────────────────────────────────────────── */}
+      {lightbox && (
+        <div
+          onClick={() => setLightbox(null)}
+          style={{
+            position: 'fixed', inset: 0, zIndex: 9999,
+            background: 'rgba(0,0,0,0.92)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            cursor: 'zoom-out', padding: 24,
+          }}
+        >
+          <img
+            src={lightbox}
+            alt="Enlarged view"
+            style={{
+              maxWidth: '90vw', maxHeight: '88vh',
+              borderRadius: 10, boxShadow: '0 8px 60px rgba(0,0,0,0.5)',
+              objectFit: 'contain',
+            }}
+            onClick={e => e.stopPropagation()}
+          />
+          <button
+            onClick={() => setLightbox(null)}
+            style={{
+              position: 'fixed', top: 20, right: 24,
+              background: 'rgba(255,255,255,0.15)', border: 'none',
+              borderRadius: '50%', width: 40, height: 40,
+              color: '#fff', fontSize: 20, cursor: 'pointer',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}
+          >×</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Tab button ────────────────────────────────────────────────────────────────
+function GrowthTabBtn({ active, onClick, children }) {
+  return (
+    <button onClick={onClick} style={{
+      display: 'flex', alignItems: 'center', gap: 7,
+      padding: '8px 20px', borderRadius: 10,
+      fontWeight: 700, fontSize: 13, cursor: 'pointer', transition: 'all 0.15s',
+      background: active ? '#111827' : '#fff',
+      color:      active ? '#fff'    : '#374151',
+      border:     active ? '2px solid #111827' : '2px solid #e5e7eb',
+      boxShadow:  active ? '0 2px 8px rgba(0,0,0,0.15)' : 'none',
+    }}>{children}</button>
+  );
+}
+
 // ── Main PlantGrowth component ────────────────────────────────────────────────
 
 export default function PlantGrowth({
@@ -212,25 +452,46 @@ export default function PlantGrowth({
   onCaptureAndAnalyze,
   onRefreshGrowth,
 }) {
+  const [activeTab, setActiveTab] = useState('metrics'); // 'metrics' | 'images'
   const g            = growthLatest || {};
   const hasGrowth    = growthLatest && growthLatest.status === 'success';
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
 
-      {/* ── Page title ──────────────────────────────────────────────────── */}
+      {/* ── Page title + tabs ────────────────────────────────────────────── */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
         <div>
-          <h1 style={{ fontSize: 22, fontWeight: 800, color: 'var(--text)', margin: 0, letterSpacing: '-0.4px' }}>
-            Plant Growth
+          <h1 style={{ fontSize: 20, fontWeight: 800, color: 'var(--text)', margin: 0, letterSpacing: '-0.3px' }}>
+            {activeTab === 'metrics' ? 'Plant Growth Statistics' : 'Plant Growth Photos'}
           </h1>
-          <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: '4px 0 0' }}>
-            Growth measurements and analysis results
+          <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '3px 0 0' }}>
+            {activeTab === 'metrics' ? 'Growth measurements and analysis results' : 'Visual comparison — Today / Yesterday / 2 Days Ago'}
           </p>
         </div>
 
-        {/* Action buttons */}
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          {/* Tab bar */}
+          <div style={{ display: 'flex', gap: 5, padding: 5, background: '#f3f4f6', borderRadius: 11 }}>
+            <GrowthTabBtn active={activeTab === 'metrics'} onClick={() => setActiveTab('metrics')}>
+              📊 Growth Statistics
+            </GrowthTabBtn>
+            <GrowthTabBtn active={activeTab === 'images'} onClick={() => setActiveTab('images')}>
+              🌱 Growth Photos
+            </GrowthTabBtn>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Tab 2: Growth Images ─────────────────────────────────────────── */}
+      {activeTab === 'images' && <GrowthImagesTab growthHistory={growthHistory} />}
+
+      {/* ── Tab 1: Metrics (everything below only renders in metrics tab) ── */}
+      {activeTab === 'metrics' && (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+
+      {/* Action buttons */}
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
           <button
             className="btn btn-primary"
             onClick={onCaptureAndAnalyze}
@@ -278,7 +539,6 @@ export default function PlantGrowth({
             Refresh
           </button>
         </div>
-      </div>
 
       {/* Capture waiting banner — shown while another capture is running */}
       {captureWaiting && (
@@ -405,13 +665,6 @@ export default function PlantGrowth({
                     color="var(--teal)"
                   />
                   <MetricCard
-                    label="AGR"
-                    value={fmtNum(g.agr, 4)}
-                    unit="cm²/day"
-                    icon="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"
-                    color="var(--purple)"
-                  />
-                  <MetricCard
                     label="RGR"
                     value={fmtNum(g.rgr, 6)}
                     unit="/day"
@@ -448,53 +701,6 @@ export default function PlantGrowth({
               <GrowthChart history={growthHistory} />
             </div>
 
-            {/* Detection images from latest growth run */}
-            {hasGrowth && (g.detection_cam1_url || g.detection_cam2_url || g.detection_cam3_url) && (
-              <div style={{
-                background: 'var(--card-bg)', borderRadius: 'var(--r)',
-                border: '1px solid var(--border)', boxShadow: 'var(--shadow-sm)',
-                padding: '20px 24px',
-              }}>
-                <div className="section-title">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
-                       style={{ width: 18, height: 18 }}>
-                    <path d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" strokeLinecap="round"/>
-                  </svg>
-                  Detection Results
-                </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-                  <DetectionImageCard url={g.detection_cam1_url} label="cam1 — Side view" />
-                  <DetectionImageCard url={g.detection_cam2_url} label="cam2 — Front view" />
-                  <DetectionImageCard url={g.detection_cam3_url} label="cam3 — Top-down" />
-                </div>
-              </div>
-            )}
-
-            {/* Growth chart image from growth calculator */}
-            {hasGrowth && g.growth_chart_url && (
-              <div style={{
-                background: 'var(--card-bg)', borderRadius: 'var(--r)',
-                border: '1px solid var(--border)', boxShadow: 'var(--shadow-sm)',
-                padding: '20px 24px',
-              }}>
-                <div className="section-title">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
-                       style={{ width: 18, height: 18 }}>
-                    <rect x="3" y="3" width="18" height="18" rx="2"/>
-                    <polyline points="3 9 9 9 9 21"/>
-                  </svg>
-                  Growth Chart (Camera Output)
-                </div>
-                <a href={g.growth_chart_url} target="_blank" rel="noopener noreferrer">
-                  <img
-                    src={g.growth_chart_url}
-                    alt="Growth chart"
-                    style={{ width: '100%', borderRadius: 8, border: '1px solid var(--border)' }}
-                  />
-                </a>
-              </div>
-            )}
-
           </div>
 
           {/* ── Right column: growth summary ─────────────────────────────── */}
@@ -526,6 +732,10 @@ export default function PlantGrowth({
 
         </div>
       )}
+
+      </div>
+      )}
+
     </div>
   );
 }

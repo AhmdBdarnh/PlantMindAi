@@ -46,6 +46,13 @@ def init_routes(
     except Exception as _l3_init_err:
         _CUSTOM_PRINT_FUNC(f"[Layer3] WARNING: init failed at startup: {_l3_init_err}")
 
+    # ── Notifications init (UI-only; never sends email) ───────────────────────
+    try:
+        import notifications
+        notifications.init(mongo_db_handler)
+    except Exception as _ntf_init_err:
+        _CUSTOM_PRINT_FUNC(f"[Notifications] WARNING: init failed at startup: {_ntf_init_err}")
+
     # ── Sensor endpoints ──────────────────────────────────────────────────────
 
     @bp.route('/api/sensors', methods=['GET'])
@@ -100,6 +107,92 @@ def init_routes(
             return resp
         except Exception as e:
             _CUSTOM_PRINT_FUNC(f"[/api/sensors] ERROR: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    # ── Daily resource costs + cycle start date ──────────────────────────────
+
+    @bp.route('/api/resources/daily', methods=['GET'])
+    def get_resources_daily():
+        """
+        Return today's resource usage/costs (baseline-delta approach) and
+        the timestamp of the last plant cycle reset (for 'Counting from' label).
+        """
+        import datetime as _dt
+        try:
+            daily = mongo_db_handler.get_today_costs(
+                water_price_per_liter     = WATER_PRICE_PER_LITER_NIS,
+                electricity_price_per_kwh = ELECTRICITY_PRICE_PER_KWH_NIS,
+                fertilizer_price_per_5l   = FERTILIZER_PRICE_PER_5_LITERS_NIS,
+            )
+            # Serialize datetime inside daily dict
+            for k, v in daily.items():
+                if hasattr(v, 'isoformat'):
+                    daily[k] = v.isoformat()
+
+            cycle_raw = mongo_db_handler.get_state('cycle_started_at')
+
+            resp = jsonify({
+                'success':          True,
+                'daily':            daily,
+                'cycle_started_at': cycle_raw,
+            })
+            resp.headers['Cache-Control'] = 'no-store'
+            return resp
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"[/api/resources/daily] ERROR: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    # ── Resource price constants ──────────────────────────────────────────────
+
+    @bp.route('/api/resource-prices', methods=['GET'])
+    def get_resource_prices():
+        """Return per-unit resource cost constants (₪) for frontend calculations."""
+        return jsonify({
+            'success': True,
+            'prices': {
+                'water_per_liter_nis':        WATER_PRICE_PER_LITER_NIS,
+                'electricity_per_kwh_nis':    ELECTRICITY_PRICE_PER_KWH_NIS,
+                'fertilizer_per_liter_nis':   FERTILIZER_PRICE_PER_5_LITERS_NIS / 5,
+                'fertilizer_per_5liters_nis': FERTILIZER_PRICE_PER_5_LITERS_NIS,
+            },
+        })
+
+    # ── Sensor 24 h time-series ───────────────────────────────────────────────
+
+    @bp.route('/api/sensors/history', methods=['GET'])
+    def get_sensors_history():
+        """
+        Return time-series [{time, value}] for all environment sensors over
+        the last N hours (default 24, max 48).
+
+        Response shape:
+          {success: true, hours: 24, data: {air_temperature: [...], ...}}
+        """
+        try:
+            hours = min(int(request.args.get('hours', 24)), 48)
+
+            # Maps frontend key → sensor_id stored in sensors_data collection
+            SENSOR_MAP = {
+                'air_temperature':  'dht22.temperature',
+                'air_humidity':     'dht22.humidity',
+                'light_intensity':  'ads1115.light_intensity',
+                'soil_ph':          'soil_ph',
+                'soil_ec':          'soil_ec',
+                'soil_temperature': 'soil_temp',
+                'soil_humidity':    'soil_humidity',
+            }
+
+            data = {}
+            for key, sensor_id in SENSOR_MAP.items():
+                data[key] = mongo_db_handler.get_sensor_history(
+                    sensor_id, hours=hours, max_points=150
+                )
+
+            resp = jsonify({'success': True, 'hours': hours, 'data': data})
+            resp.headers['Cache-Control'] = 'no-store'
+            return resp
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"[/api/sensors/history] ERROR: {e}")
             return jsonify({'success': False, 'error': str(e)}), 500
 
     # ── Health endpoint ───────────────────────────────────────────────────────
@@ -379,6 +472,7 @@ def init_routes(
             })
 
             reset_ts = _dt.datetime.now().isoformat(timespec='seconds')
+            mongo_db_handler.upsert_state('cycle_started_at', reset_ts)
             _CUSTOM_PRINT_FUNC(
                 f"[NewCycle] Safe plant cycle reset complete at {reset_ts}. "
                 f"Cancelled {cancelled} pending Layer 3 decision(s). "
@@ -445,6 +539,7 @@ def init_routes(
             })
 
             reset_ts = _dt.datetime.now().isoformat(timespec='seconds')
+            mongo_db_handler.upsert_state('cycle_started_at', reset_ts)
             _CUSTOM_PRINT_FUNC(
                 f"[NewCycle] Plant cycle reset complete at {reset_ts}. "
                 f"Cancelled {cancelled} pending Layer 3 decision(s)."
@@ -1041,21 +1136,34 @@ def init_routes(
             return [_serialize_l3_doc(i) for i in obj]
         return obj
 
-    # Map Layer 3 modification parameter names → (setpoint key, getter, setter)
-    # Fan duty setters added in Step 8. Pump parameters remain absent by design.
+    # Map Layer 3 modification parameter names → (setpoint key, getter, setter).
+    # Covers every environment setpoint the AI Advisor can recommend so that an
+    # approval actually applies the change. Pump power/pulse remain absent by design.
     _L3_SETPOINT_MAP = {
-        'light_setpoint':         ('light',          lambda: setpoints.get_light_setpoint(),          setpoints.set_light_setpoint),
-        'soil_ec_setpoint':       ('soil_ec',        lambda: setpoints.get_soil_ec_setpoint(),        setpoints.set_soil_ec_setpoint),
-        'soil_moisture_setpoint': ('soil_moisture',   lambda: setpoints.get_soil_humidity_setpoint(),  setpoints.set_soil_humidity_setpoint),
-        'fan_day_duty':           ('fan_day_duty',    lambda: setpoints.get_fan_day_duty(),            setpoints.set_fan_day_duty),
-        'fan_night_duty':         ('fan_night_duty',  lambda: setpoints.get_fan_night_duty(),          setpoints.set_fan_night_duty),
+        'temperature_setpoint':     ('temperature',    lambda: setpoints.get_temperature_setpoint(),    setpoints.set_temperature_setpoint),
+        'humidity_setpoint':        ('humidity',       lambda: setpoints.get_humidity_setpoint(),       setpoints.set_humidity_setpoint),
+        'light_setpoint':           ('light',          lambda: setpoints.get_light_setpoint(),          setpoints.set_light_setpoint),
+        'soil_ph_setpoint':         ('soil_ph',        lambda: setpoints.get_soil_ph_setpoint(),        setpoints.set_soil_ph_setpoint),
+        'soil_ec_setpoint':         ('soil_ec',        lambda: setpoints.get_soil_ec_setpoint(),        setpoints.set_soil_ec_setpoint),
+        'soil_temp_setpoint':       ('soil_temp',      lambda: setpoints.get_soil_temp_setpoint(),      setpoints.set_soil_temp_setpoint),
+        'soil_moisture_setpoint':   ('soil_moisture',  lambda: setpoints.get_soil_humidity_setpoint(),  setpoints.set_soil_humidity_setpoint),
+        'soil_hysteresis_setpoint': ('soil_hysteresis',lambda: setpoints.get_soil_humidity_hysteresis(),setpoints.set_soil_humidity_hysteresis),
+        'fan_day_duty':             ('fan_day_duty',   lambda: setpoints.get_fan_day_duty(),            setpoints.set_fan_day_duty),
+        'fan_night_duty':           ('fan_night_duty', lambda: setpoints.get_fan_night_duty(),          setpoints.set_fan_night_duty),
     }
 
-    # Map Layer 2 parameter names to Layer 3 parameter names (for APPROVE fallback)
+    # Map Layer 2 (AI Advisor) parameter labels → Layer 3 parameter names
+    # (used on APPROVE to apply the AI's recommended changes). Must cover every
+    # label the advisor emits, otherwise that change is silently skipped.
     _L2_TO_L3_PARAM_MAP = {
+        'Temperature':      'temperature_setpoint',
+        'Humidity':         'humidity_setpoint',
         'Light':            'light_setpoint',
+        'Soil pH':          'soil_ph_setpoint',
         'Soil EC':          'soil_ec_setpoint',
+        'Soil Temp':        'soil_temp_setpoint',
         'Soil Moisture':    'soil_moisture_setpoint',
+        'Soil Hysteresis':  'soil_hysteresis_setpoint',
     }
 
     @bp.route('/api/layer3/run', methods=['POST'])
@@ -1065,6 +1173,23 @@ def init_routes(
         if not _l3._run_lock.acquire(blocking=False):
             return jsonify({'success': False, 'error': 'Layer 3 review already in progress.'}), 409
         _l3._run_lock.release()
+
+        # Only the Layer 2 "Send to Budget Manager" button sets triggered_by=advisor.
+        # Other callers (Budget Manager "Run Review", background auto-trigger) do not,
+        # so this notification is created only for the explicit user hand-off.
+        try:
+            _run_body = request.get_json(silent=True) or {}
+            if _run_body.get('triggered_by') == 'advisor':
+                import notifications
+                notifications.create_notification(
+                    'sent_to_budget', 'info',
+                    'Sent to Budget Manager',
+                    'The AI recommendation was sent to the Budget Manager for review.',
+                    category='workflow', link='layer3',
+                    dedup_key='sent_to_budget', dedup_window_sec=60,
+                )
+        except Exception as _ntf_err:
+            _CUSTOM_PRINT_FUNC(f"[Notifications] sent_to_budget skipped: {_ntf_err}")
 
         def _bg():
             try:
@@ -1077,6 +1202,27 @@ def init_routes(
             'success': True,
             'message': 'Layer 3 review started. Check /api/layer3/latest in a few seconds.',
         }), 202
+
+    @bp.route('/api/layer3/run-test', methods=['POST'])
+    def layer3_run_test():
+        """
+        Test-mode Layer 3 run.  Bypasses real sensors and real daily costs.
+        Does NOT write to MongoDB.  Returns the decision immediately (synchronous).
+
+        Optional JSON body fields:
+          sensors:  {soil_moisture, soil_ec, soil_ph, air_temperature, ...}
+          costs:    {water_cost_nis, electricity_cost_nis, fertilizer_cost_nis}
+
+        Uses the saved budget_config from MongoDB (water_budget, electricity_budget, etc.).
+        If no body is supplied, uses safe default sensors and zero costs.
+        """
+        import layer3_budget_manager as _l3
+        body = request.get_json(silent=True) or {}
+        result = _l3.run_test(
+            injected_sensors=body.get('sensors'),
+            injected_costs=body.get('costs'),
+        )
+        return jsonify(result), 200
 
     @bp.route('/api/layer3/latest', methods=['GET'])
     def layer3_get_latest():
@@ -1154,6 +1300,16 @@ def init_routes(
                     'approved_values':       {},
                     'previous_values':       {},
                 })
+                # Sync linked AI recommendation status
+                _alert_rec_id = doc.get('layer2_recommendation_id')
+                if _alert_rec_id:
+                    try:
+                        mongo_db_handler.update_ai_recommendation(_alert_rec_id, {
+                            'status':     'approved',
+                            'applied_at': now,
+                        })
+                    except Exception as _sync_err:
+                        _CUSTOM_PRINT_FUNC(f"[Layer3 Approve] AI rec status sync failed: {_sync_err}")
                 _CUSTOM_PRINT_FUNC(f"[Layer3 Approve] ALERT_ONLY {did[:8]} acknowledged — no setpoints changed.")
                 return jsonify({
                     'success': True,
@@ -1231,10 +1387,34 @@ def init_routes(
                 'approved_values':       appr_vals,
             })
 
+            # Sync the linked AI recommendation so the AI Advisor page reflects
+            # the Layer 3 decision (no separate, conflicting approval state).
+            layer2_rec_id = doc.get('layer2_recommendation_id')
+            if layer2_rec_id:
+                try:
+                    mongo_db_handler.update_ai_recommendation(layer2_rec_id, {
+                        'status':     'approved',
+                        'applied_at': now,
+                    })
+                except Exception as _sync_err:
+                    _CUSTOM_PRINT_FUNC(f"[Layer3 Approve] AI rec status sync failed: {_sync_err}")
+
             _CUSTOM_PRINT_FUNC(
                 f"[Layer3 Approve] Decision {did[:8]}: "
                 f"{len(applied)} applied, {len(skipped)} skipped."
             )
+            try:
+                import notifications
+                notifications.create_notification(
+                    'changes_approved', 'info',
+                    'Changes approved',
+                    f"{len(applied)} setpoint change(s) approved and applied to the live system.",
+                    category='workflow', link='layer3',
+                    meta={'decision_id': did},
+                    dedup_key=f"changes_approved:{did}", dedup_window_sec=86400,
+                )
+            except Exception as _ntf_err:
+                _CUSTOM_PRINT_FUNC(f"[Notifications] changes_approved skipped: {_ntf_err}")
             return jsonify({
                 'success':   True,
                 'message':   f'Layer 3 decision approved. {len(applied)} change(s) applied.',
@@ -1279,7 +1459,31 @@ def init_routes(
                 'rejection_reason':      reason,
             })
 
+            # Sync the linked AI recommendation so the AI Advisor page reflects
+            # the Layer 3 rejection (single source of truth).
+            layer2_rec_id = doc.get('layer2_recommendation_id')
+            if layer2_rec_id:
+                try:
+                    mongo_db_handler.update_ai_recommendation(layer2_rec_id, {
+                        'status':           'rejected',
+                        'rejection_reason': reason,
+                    })
+                except Exception as _sync_err:
+                    _CUSTOM_PRINT_FUNC(f"[Layer3 Reject] AI rec status sync failed: {_sync_err}")
+
             _CUSTOM_PRINT_FUNC(f"[Layer3 Reject] Decision {did[:8]} rejected. Reason: {reason}")
+            try:
+                import notifications
+                notifications.create_notification(
+                    'changes_rejected', 'info',
+                    'Changes rejected',
+                    'The Budget Manager decision was rejected. No changes were applied.',
+                    category='workflow', link='layer3',
+                    meta={'decision_id': did, 'reason': reason},
+                    dedup_key=f"changes_rejected:{did}", dedup_window_sec=86400,
+                )
+            except Exception as _ntf_err:
+                _CUSTOM_PRINT_FUNC(f"[Notifications] changes_rejected skipped: {_ntf_err}")
             return jsonify({
                 'success':     True,
                 'message':     'Layer 3 decision rejected. No changes applied.',
@@ -1329,6 +1533,378 @@ def init_routes(
                 'decisions': [_serialize_l3_doc(d) for d in docs],
                 'count':     len(docs),
             }), 200
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    # ── Actuator history (all 5 actuators, state-change events) ─────────────
+
+    @bp.route('/api/actuators/history', methods=['GET'])
+    def get_actuators_history():
+        """
+        Return recent actuator SESSIONS (event-based, no polling duplication).
+        Each session is one ON→OFF run, or the current open 'running' session.
+        Query params:
+          limit    — max sessions to return (default 60, max 200)
+          actuator — filter by actuator name (optional)
+        """
+        try:
+            limit    = min(int(request.args.get('limit', 60)), 200)
+            actuator = request.args.get('actuator', None)
+            events   = mongo_db_handler.get_actuator_events(limit=limit, actuator=actuator)
+            for ev in events:
+                for field in ('started_at', 'stopped_at', 'last_updated'):
+                    val = ev.get(field)
+                    if hasattr(val, 'isoformat'):
+                        ev[field] = val.isoformat()
+            return jsonify({'success': True, 'events': events, 'count': len(events)}), 200
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    # ── Actuator dashboard (enriched: sensors + setpoints + reason) ──────────
+
+    @bp.route('/api/actuators/dashboard', methods=['GET'])
+    def get_actuators_dashboard():
+        """
+        Return one structured object per actuator with related sensors,
+        setpoints, action state, and a human-readable reason for the
+        current ON/OFF decision.  Used exclusively by the Actuators page.
+        """
+        import datetime as _dt
+        try:
+            import control_loops
+
+            # ── Snapshot sensor cache ─────────────────────────────────────────
+            with app_loop._sensor_cache_lock:
+                snap = dict(app_loop._sensor_cache)
+
+            now = _dt.datetime.now()
+
+            # ── Setpoints ─────────────────────────────────────────────────────
+            sp_temp       = setpoints.get_temperature_setpoint()
+            sp_light      = setpoints.get_light_setpoint()
+            sp_ec         = setpoints.get_soil_ec_setpoint()
+            sp_moisture   = setpoints.get_soil_humidity_setpoint()
+            sp_hysteresis = setpoints.get_soil_humidity_hysteresis()
+            sp_fan_day    = setpoints.get_fan_day_duty()
+            sp_fan_night  = setpoints.get_fan_night_duty()
+
+            # ── Actuator duty cycles ──────────────────────────────────────────
+            heater_dc = env_actuators.get_heater_duty_cycle()
+            light_dc  = env_actuators.get_light_strip_1_duty_cycle()
+            fan_dc    = env_actuators.get_fan_duty_cycle()
+            pump_dc   = env_actuators.get_water_pump_duty_cycle()
+            fert_dc   = env_actuators.get_fertilizer_pump_duty_cycle()
+
+            def dc_to_pct(dc):
+                return round((dc / 4095) * 100, 1)
+
+            # ── Fan schedule ──────────────────────────────────────────────────
+            sched_on  = control_loops.FAN_SCHEDULE_ENABLED
+            is_day    = control_loops.FAN_DAY_START_HOUR <= now.hour < control_loops.FAN_NIGHT_START_HOUR
+            fan_phase = 'day' if is_day else 'night'
+            fan_target_duty = sp_fan_day if is_day else sp_fan_night
+
+            # ── Last pump logs ─────────────────────────────────────────────────
+            recent_logs    = mongo_db_handler.get_pump_logs(30)
+            last_water_log = next((l for l in recent_logs if l.get('pump') == 'water'), None)
+            last_fert_log  = next((l for l in recent_logs if l.get('pump') == 'fertilizer'), None)
+
+            ABSORB_WAIT_SEC = 10800   # 3 h — must match control_loops.py
+            SETTLE_WAIT_SEC = 18000   # 5 h — must match control_loops.py
+
+            def _fmt_duration(sec):
+                if sec is None:
+                    return None
+                h = int(sec // 3600)
+                m = int((sec % 3600) // 60)
+                return f"{h}h {m}m" if h else f"{m}m"
+
+            def _fmt_ago(ts):
+                if ts is None:
+                    return None
+                delta = (now - ts).total_seconds()
+                if delta < 60:
+                    return "just now"
+                m = int(delta // 60)
+                if m < 60:
+                    return f"{m}m ago"
+                h = int(m // 60)
+                return f"{h}h {m % 60}m ago"
+
+            def _pump_action(log, cooldown_sec, dc):
+                base = {
+                    'state':               'on' if dc > 0 else 'off',
+                    'percentage':          dc_to_pct(dc),
+                    'last_pulse_sec':      None,
+                    'last_run':            None,
+                    'last_run_ago':        None,
+                    'cooldown_remaining_sec': None,
+                    'cooldown_remaining_str': None,
+                    'is_in_cooldown':      False,
+                }
+                if log is None:
+                    return base
+                ts = log.get('timestamp')
+                if not hasattr(ts, 'total_seconds'):
+                    delta_sec = (now - ts).total_seconds() if ts else None
+                else:
+                    delta_sec = None
+                if ts and not hasattr(ts, 'total_seconds'):
+                    base['last_run']     = ts.isoformat()
+                    base['last_run_ago'] = _fmt_ago(ts)
+                    delta_sec = (now - ts).total_seconds()
+                base['last_pulse_sec'] = log.get('pulse_sec')
+                if delta_sec is not None:
+                    rem = cooldown_sec - delta_sec
+                    base['cooldown_remaining_sec'] = max(0, int(rem))
+                    base['cooldown_remaining_str'] = _fmt_duration(max(0, rem))
+                    base['is_in_cooldown']         = rem > 0
+                return base
+
+            # ── Live sensor values ─────────────────────────────────────────────
+            soil_moisture = snap.get('soil_humidity')
+            soil_ec       = snap.get('soil_ec')
+            soil_ph       = snap.get('soil_ph')
+            air_temp      = snap.get('air_temperature')
+            air_humidity  = snap.get('air_humidity')
+            soil_temp     = snap.get('soil_temperature')
+            light_lux     = snap.get('light_intensity')
+
+            def _safe(v, decimals=1):
+                if v is None or (isinstance(v, float) and v != v):
+                    return None
+                return round(v, decimals)
+
+            # ── Water pump reason ──────────────────────────────────────────────
+            band_ok   = sp_moisture
+            band_acc  = sp_moisture - sp_hysteresis
+            band_1s   = band_acc - 5.0
+            band_1_5s = band_1s  - 5.0
+            _m = soil_moisture
+            if _m is None or (_m == _m) is False or _m == 0 or _m < 5.0:
+                water_reason = "Blocked: soil sensor data invalid (RS485 error)"
+                water_sensor_status = 'error'
+            else:
+                water_sensor_status = 'ok'
+                if _m >= band_ok:
+                    water_reason = f"Moisture {_m:.1f}% ≥ target {band_ok:.1f}% — pump OFF"
+                elif _m >= band_acc:
+                    water_reason = f"Moisture {_m:.1f}% in acceptable range ({band_acc:.1f}–{band_ok:.1f}%) — pump OFF"
+                elif _m >= band_1s:
+                    water_reason = f"Moisture {_m:.1f}% low — 1 s pulse due ({band_1s:.1f}–{band_acc:.1f}%)"
+                elif _m >= band_1_5s:
+                    water_reason = f"Moisture {_m:.1f}% very low — 1.5 s pulse due"
+                else:
+                    water_reason = f"Moisture {_m:.1f}% critically low — 2 s pulse due"
+
+            # ── Fertilizer pump reason ─────────────────────────────────────────
+            EC_DANGER     = 2000.0
+            EC_HIGH       = 1600.0
+            EC_ABOVE_WARN = 1000.0
+            ec_close    = sp_ec - 200.0
+            ec_pulse_1s = sp_ec - 400.0
+            _e = soil_ec
+            if _e is None or (_e == _e) is False or _e < 50:
+                fert_reason = "Blocked: EC sensor data invalid (RS485 error)"
+                fert_sensor_status = 'error'
+            elif _e >= EC_DANGER:
+                fert_reason = f"DANGER: EC {_e:.0f} µS/cm ≥ {EC_DANGER:.0f} — root burn risk, diluting with water"
+                fert_sensor_status = 'danger'
+            elif _e >= EC_HIGH:
+                fert_reason = f"EC {_e:.0f} µS/cm too high (≥ {EC_HIGH:.0f}) — pump OFF"
+                fert_sensor_status = 'warn'
+            elif _e > EC_ABOVE_WARN:
+                fert_reason = f"EC {_e:.0f} µS/cm above safe range (> {EC_ABOVE_WARN:.0f}) — pump OFF"
+                fert_sensor_status = 'warn'
+            elif _e >= sp_ec:
+                fert_reason = f"EC {_e:.0f} µS/cm at/above target {sp_ec:.0f} µS/cm — pump OFF"
+                fert_sensor_status = 'ok'
+            elif _e >= ec_close:
+                fert_reason = f"EC {_e:.0f} µS/cm in acceptable band ({ec_close:.0f}–{sp_ec:.0f}) — pump OFF"
+                fert_sensor_status = 'ok'
+            elif _e >= ec_pulse_1s:
+                fert_reason = f"EC {_e:.0f} µS/cm low — 1 s fertilizer pulse scheduled"
+                fert_sensor_status = 'warn'
+            else:
+                fert_reason = f"EC {_e:.0f} µS/cm very low (< {ec_pulse_1s:.0f}) — 1.5 s fertilizer pulse scheduled"
+                fert_sensor_status = 'warn'
+
+            # ── LED reason ────────────────────────────────────────────────────
+            _l = light_lux
+            if sp_light == 0:
+                led_reason = "Light setpoint is 0 — grow light OFF"
+            elif _l is None:
+                led_reason = "Light sensor unavailable — PID running open-loop"
+            elif _l >= sp_light * 1.05:
+                led_reason = f"Light {_l:.0f} lux above target {sp_light:.0f} — PID dimming"
+            elif _l >= sp_light * 0.95:
+                led_reason = f"Light {_l:.0f} lux near target {sp_light:.0f} — stable"
+            else:
+                led_reason = f"Light {_l:.0f} lux below target {sp_light:.0f} — PID increasing power"
+
+            # ── Fan reason ────────────────────────────────────────────────────
+            if sched_on:
+                fan_reason = (
+                    f"{'Day' if is_day else 'Night'} schedule ({now.strftime('%H:%M')}) — "
+                    f"fan at {dc_to_pct(fan_target_duty):.0f}%"
+                )
+            else:
+                _t = air_temp
+                if _t is None:
+                    fan_reason = "Temperature sensor unavailable — PID waiting"
+                elif _t > sp_temp + 1.0:
+                    fan_reason = f"Cooling: air {_t:.1f}°C above target {sp_temp:.1f}°C"
+                elif _t < sp_temp - 1.0:
+                    fan_reason = f"Air {_t:.1f}°C below target — fan idle (heater controls)"
+                else:
+                    fan_reason = f"Air {_t:.1f}°C near target {sp_temp:.1f}°C — stable"
+
+            # ── Heater reason ─────────────────────────────────────────────────
+            DEADBAND = 1.0
+            _t = air_temp
+            if _t is None:
+                heater_reason = "Temperature sensor unavailable — PID waiting"
+            elif abs(_t - sp_temp) < DEADBAND:
+                heater_reason = f"Air {_t:.1f}°C within ±{DEADBAND}°C deadband of target {sp_temp:.1f}°C — idle"
+            elif _t < sp_temp:
+                heater_reason = f"Heating: air {_t:.1f}°C below target {sp_temp:.1f}°C"
+            else:
+                heater_reason = f"Air {_t:.1f}°C above target {sp_temp:.1f}°C — heater OFF"
+
+            return jsonify({
+                'success':      True,
+                'last_updated': now.strftime('%Y-%m-%d %H:%M:%S'),
+                'data': {
+                    'water_pump': {
+                        'sensors': [
+                            {'label': 'Moisture', 'value': _safe(soil_moisture, 1), 'unit': '%',
+                             'status': water_sensor_status},
+                        ],
+                        'setpoints': [
+                            {'label': 'Target',     'value': round(sp_moisture, 1),  'unit': '%'},
+                            {'label': 'Deadband',   'value': f'±{sp_hysteresis:.1f}','unit': '%'},
+                            {'label': 'Absorb wait','value': round(ABSORB_WAIT_SEC / 3600, 1), 'unit': 'h'},
+                        ],
+                        'action':   _pump_action(last_water_log, ABSORB_WAIT_SEC, pump_dc),
+                        'reason':   water_reason,
+                    },
+                    'fertilizer_pump': {
+                        'sensors': [
+                            {'label': 'EC', 'value': _safe(soil_ec, 0), 'unit': 'µS/cm',
+                             'status': fert_sensor_status},
+                            {'label': 'pH', 'value': _safe(soil_ph, 2), 'unit': '',
+                             'status': ('warn' if soil_ph is not None and (soil_ph < 5.2 or soil_ph > 7.5) else 'ok')},
+                        ],
+                        'setpoints': [
+                            {'label': 'EC target',    'value': round(sp_ec, 0),       'unit': 'µS/cm'},
+                            {'label': 'pH range',     'value': '5.2 – 7.5',            'unit': ''},
+                            {'label': 'Settle wait',  'value': round(SETTLE_WAIT_SEC / 3600, 1), 'unit': 'h'},
+                        ],
+                        'action':   _pump_action(last_fert_log, SETTLE_WAIT_SEC, fert_dc),
+                        'reason':   fert_reason,
+                    },
+                    'light': {
+                        'sensors': [
+                            {'label': 'Light', 'value': _safe(light_lux, 0), 'unit': 'lux', 'status': 'ok'},
+                        ],
+                        'setpoints': [
+                            {'label': 'Target lux', 'value': round(sp_light, 0), 'unit': 'lux'},
+                        ],
+                        'action': {
+                            'state':      'on' if light_dc > 0 else 'off',
+                            'percentage': dc_to_pct(light_dc),
+                        },
+                        'reason': led_reason,
+                    },
+                    'fan': {
+                        'sensors': [
+                            {'label': 'Air Temp',  'value': _safe(air_temp, 1),     'unit': '°C', 'status': 'ok'},
+                            {'label': 'Humidity',  'value': _safe(air_humidity, 1), 'unit': '%',  'status': 'ok'},
+                        ],
+                        'setpoints': [
+                            {'label': 'Day power',   'value': dc_to_pct(sp_fan_day),   'unit': '%'},
+                            {'label': 'Night power', 'value': dc_to_pct(sp_fan_night), 'unit': '%'},
+                            {'label': 'Schedule',
+                             'value': f"{control_loops.FAN_DAY_START_HOUR:02d}:00 – {control_loops.FAN_NIGHT_START_HOUR:02d}:00",
+                             'unit': ''},
+                        ],
+                        'action': {
+                            'state':      'on' if fan_dc > 0 else 'off',
+                            'percentage': dc_to_pct(fan_dc),
+                            'phase':      fan_phase,
+                            'current_time': now.strftime('%H:%M'),
+                        },
+                        'reason': fan_reason,
+                    },
+                    'heater': {
+                        'sensors': [
+                            {'label': 'Air Temp',  'value': _safe(air_temp, 1),  'unit': '°C', 'status': 'ok'},
+                            {'label': 'Root Temp', 'value': _safe(soil_temp, 1), 'unit': '°C', 'status': 'ok'},
+                        ],
+                        'setpoints': [
+                            {'label': 'Target',   'value': round(sp_temp, 1), 'unit': '°C'},
+                            {'label': 'Deadband', 'value': f'±{DEADBAND}',   'unit': '°C'},
+                        ],
+                        'action': {
+                            'state':      'on' if heater_dc > 0 else 'off',
+                            'percentage': dc_to_pct(heater_dc),
+                        },
+                        'reason': heater_reason,
+                    },
+                },
+            })
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"[/api/actuators/dashboard] ERROR: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    # ── Notifications (UI bell + toast) ───────────────────────────────────────
+    @bp.route('/api/notifications', methods=['GET'])
+    def notifications_list():
+        """Return notifications (newest first) plus the current unread count.
+
+        Query params: since (ISO-8601), limit (default 50), unread_only (bool)."""
+        try:
+            since       = request.args.get('since') or None
+            limit       = int(request.args.get('limit', 50))
+            unread_only = request.args.get('unread_only', 'false').lower() == 'true'
+            items = mongo_db_handler.get_notifications(
+                since=since, limit=limit, unread_only=unread_only,
+            )
+            return jsonify({
+                'success':      True,
+                'notifications': items,
+                'unread_count': mongo_db_handler.get_unread_notification_count(),
+            }), 200
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @bp.route('/api/notifications/<notification_id>/read', methods=['POST'])
+    def notifications_mark_read(notification_id):
+        """Mark a single notification as read (mark-read on click)."""
+        try:
+            ok = mongo_db_handler.mark_notification_read(notification_id)
+            return jsonify({
+                'success':      ok,
+                'unread_count': mongo_db_handler.get_unread_notification_count(),
+            }), (200 if ok else 404)
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @bp.route('/api/notifications/read-all', methods=['POST'])
+    def notifications_mark_all_read():
+        """Mark all notifications as read."""
+        try:
+            updated = mongo_db_handler.mark_all_notifications_read()
+            return jsonify({'success': True, 'updated': updated, 'unread_count': 0}), 200
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @bp.route('/api/notifications/clear', methods=['DELETE'])
+    def notifications_clear():
+        """Delete all notifications (history)."""
+        try:
+            removed = mongo_db_handler.clear_notifications()
+            return jsonify({'success': True, 'removed': removed, 'unread_count': 0}), 200
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
 

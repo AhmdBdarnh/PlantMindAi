@@ -509,6 +509,7 @@ def app_task():
                         f'On at {heater_duty_cycle * 100 / 4095:.2f}%',
                     )
                 _mongo_db.upsert_actuator_data("heater", heater_duty_cycle)
+                _mongo_db.record_actuator_state('heater', heater_duty_cycle)
 
             if light_duty_cycle != prev_light_duty_cycle:
                 prev_light_duty_cycle = light_duty_cycle
@@ -522,6 +523,7 @@ def app_task():
                         f'On at {light_duty_cycle * 100 / 4095:.2f}%',
                     )
                 _mongo_db.upsert_actuator_data("light", light_duty_cycle)
+                _mongo_db.record_actuator_state('light', light_duty_cycle)
 
             if water_pump_duty_cycle != prev_water_pump_duty_cycle:
                 prev_water_pump_duty_cycle = water_pump_duty_cycle
@@ -535,6 +537,7 @@ def app_task():
                         f'On at {water_pump_duty_cycle * 100 / 4095:.2f}%',
                     )
                 _mongo_db.upsert_actuator_data("water pump", water_pump_duty_cycle)
+                _mongo_db.record_actuator_state('water_pump', water_pump_duty_cycle)
 
             if fertilizer_pump_duty_cycle != prev_fertilizer_pump_duty_cycle:
                 prev_fertilizer_pump_duty_cycle = fertilizer_pump_duty_cycle
@@ -548,6 +551,7 @@ def app_task():
                         f'On at {fertilizer_pump_duty_cycle * 100 / 4095:.2f}%',
                     )
                 _mongo_db.upsert_actuator_data("fertilizer pump", fertilizer_pump_duty_cycle)
+                _mongo_db.record_actuator_state('fertilizer_pump', fertilizer_pump_duty_cycle)
 
             if fan_duty_cycle != prev_fan_duty_cycle:
                 prev_fan_duty_cycle = fan_duty_cycle
@@ -561,6 +565,7 @@ def app_task():
                         f'On at {fan_duty_cycle * 100 / 4095:.2f}%',
                     )
                 _mongo_db.upsert_actuator_data("fan", fan_duty_cycle)
+                _mongo_db.record_actuator_state('fan', fan_duty_cycle)
 
         # Alert if sensor cache has not been updated for more than 5 minutes
         stale_seconds = (datetime.datetime.now() - last_sensor_update).total_seconds()

@@ -1,622 +1,445 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { API_BASE_URL } from '../api/config';
 import { fmtDate, fmtNum } from '../utils/format';
 
-// ── Status badge colours ──────────────────────────────────────────────────────
-const STATUS_STYLES = {
-  pending:             { bg: '#fef9c3', color: '#854d0e', border: '#fde047', label: 'Pending Review' },
-  approved:            { bg: '#dcfce7', color: '#166534', border: '#86efac', label: 'Approved' },
-  applied:             { bg: '#dbeafe', color: '#1e40af', border: '#93c5fd', label: 'Applied' },
-  rejected:            { bg: '#fee2e2', color: '#991b1b', border: '#fca5a5', label: 'Rejected' },
-  invalid:             { bg: '#fce7f3', color: '#9d174d', border: '#f9a8d4', label: 'Invalid' },
-  needs_manual_review: { bg: '#ffedd5', color: '#9a3412', border: '#fdba74', label: 'Needs Review' },
-};
+// ── Review status display ──────────────────────────────────────────────────────
+// Layer 2 only recommends — it never approves. This badge reflects whether the
+// recommendation is still awaiting review, or has already been decided by the
+// Budget Manager (Layer 3). The decision is always attributed to Layer 3.
 
-const PLANT_STATUS_COLOURS = {
-  healthy:          '#16a34a',
-  slightly_stressed:'#ca8a04',
-  stressed:         '#ea580c',
-  unhealthy:        '#dc2626',
-  unknown:          '#6b7280',
-};
+function layer3Status(status) {
+  switch (status) {
+    case 'approved':
+    case 'applied':
+      return { bg: '#dcfce7', color: '#166534', border: '#86efac', dot: '#16a34a', label: 'Reviewed · Approved by Budget Manager' };
+    case 'rejected':
+      return { bg: '#fee2e2', color: '#991b1b', border: '#fca5a5', dot: '#dc2626', label: 'Reviewed · Rejected by Budget Manager' };
+    case 'invalid':
+      return { bg: '#fce7f3', color: '#9d174d', border: '#f9a8d4', dot: '#db2777', label: 'Invalid Recommendation' };
+    // pending, needs_manual_review, and anything else → not yet reviewed
+    default:
+      return { bg: '#eef2ff', color: '#3730a3', border: '#c7d2fe', dot: '#4f46e5', label: 'Ready for Budget Review' };
+  }
+}
 
-const SEVERITY_COLOURS = {
-  none:   '#6b7280',
-  low:    '#16a34a',
-  medium: '#ca8a04',
-  high:   '#dc2626',
-};
+const PLANT_COLOR = { healthy: '#16a34a', slightly_stressed: '#ca8a04', stressed: '#ea580c', unhealthy: '#dc2626', unknown: '#6b7280' };
+const SEV_COLOR   = { none: '#6b7280', low: '#16a34a', medium: '#ca8a04', high: '#dc2626' };
 
-const RISK_COLOURS = {
-  low:    '#16a34a',
-  medium: '#ca8a04',
-  high:   '#dc2626',
-};
+// ── Icon helper ───────────────────────────────────────────────────────────────
 
-// ── Component: StatusBadge ────────────────────────────────────────────────────
-function StatusBadge({ status }) {
-  const s = STATUS_STYLES[status] || { bg: '#f3f4f6', color: '#374151', border: '#d1d5db', label: status };
+function Icon({ path, size = 16, color = 'currentColor', sw = 2 }) {
   return (
-    <span style={{
-      display: 'inline-block',
-      padding: '3px 10px',
-      borderRadius: 12,
-      fontSize: 12,
-      fontWeight: 700,
-      background: s.bg,
-      color: s.color,
-      border: `1px solid ${s.border}`,
-      letterSpacing: '0.03em',
-    }}>
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none"
+      stroke={color} strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round">
+      <path d={path} />
+    </svg>
+  );
+}
+
+const IC = {
+  ai:       'M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z',
+  run:      'M5 3l14 9-14 9V3z',
+  check:    'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z',
+  x:        'M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z',
+  warn:     'M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z',
+  info:     'M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z',
+  leaf:     'M17 8C8 10 5.9 16.17 3.82 19c3.15.6 6.41-.34 8.68-2.61 2.56-2.56 3.07-6.44 1.5-9.39zm0 0c-.2 4.17-2.69 7.78-6 10',
+  clock:    'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z',
+  arrow:    'M5 12h14M12 5l7 7-7 7',
+  budget:   'M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z',
+  brain:    'M9.5 2A2.5 2.5 0 017 4.5v0A2.5 2.5 0 014.5 7v0A2.5 2.5 0 017 9.5h.5M9.5 2A2.5 2.5 0 0112 4.5v0A2.5 2.5 0 0114.5 7v0A2.5 2.5 0 0112 9.5h-.5M9.5 2h5M14.5 9.5A2.5 2.5 0 0017 7v0A2.5 2.5 0 0019.5 4.5v0A2.5 2.5 0 0017 2h-2.5M7 9.5v5M17 9.5v5M7 14.5A2.5 2.5 0 004.5 17v0A2.5 2.5 0 007 19.5h10A2.5 2.5 0 0019.5 17v0A2.5 2.5 0 0017 14.5',
+  settings: 'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z M15 12a3 3 0 11-6 0 3 3 0 016 0z',
+  chart:    'M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z',
+  data:     'M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4',
+};
+
+// ── KPI stat card ─────────────────────────────────────────────────────────────
+
+function KpiCard({ label, value, icon, iconBg, iconColor, valueColor }) {
+  return (
+    <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, padding: '16px 18px', display: 'flex', alignItems: 'center', gap: 12 }}>
+      <div style={{ background: iconBg, borderRadius: 9, padding: 9, display: 'flex', flexShrink: 0 }}>
+        <Icon path={icon} size={17} color={iconColor} />
+      </div>
+      <div>
+        <div style={{ fontSize: 11, color: '#9ca3af', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 3 }}>{label}</div>
+        <div style={{ fontSize: 18, fontWeight: 800, color: valueColor || '#111827', lineHeight: 1 }}>{value || '—'}</div>
+      </div>
+    </div>
+  );
+}
+
+// ── Status badge ──────────────────────────────────────────────────────────────
+
+function StatusBadge({ status, size = 'md' }) {
+  const s = layer3Status(status);
+  const pad = size === 'sm' ? '3px 9px' : '4px 12px';
+  const fs  = size === 'sm' ? 11 : 12;
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: pad, borderRadius: 99, fontSize: fs, fontWeight: 700, background: s.bg, color: s.color, border: `1px solid ${s.border}` }}>
+      <span style={{ width: 7, height: 7, borderRadius: '50%', background: s.dot }} />
       {s.label}
     </span>
   );
 }
 
-// ── Component: DataQualityWarning ─────────────────────────────────────────────
-function DataQualityWarning({ recommendation }) {
-  if (!recommendation) return null;
-  const quality   = recommendation.data_quality;
-  const missing   = recommendation.context_summary?.missing_data || [];
-  const isWeak    = quality === 'weak' || quality === 'medium';
-  const hasMissing = missing.length > 0;
-  if (!isWeak && !hasMissing) return null;
-  return (
-    <div style={{
-      background: '#fff7ed',
-      border: '1px solid #fb923c',
-      borderRadius: 8,
-      padding: '12px 16px',
-      marginBottom: 16,
-    }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-        <svg width="18" height="18" fill="none" stroke="#ea580c" strokeWidth="2" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round"
-            d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
-        </svg>
-        <strong style={{ color: '#9a3412', fontSize: 13 }}>
-          Data Quality: {quality?.toUpperCase()}
-          {hasMissing ? ` — ${missing.length} data source(s) unavailable` : ''}
-        </strong>
-      </div>
-      {hasMissing && (
-        <ul style={{ margin: 0, paddingLeft: 20, color: '#7c2d12', fontSize: 12 }}>
-          {missing.map((m, i) => <li key={i}>{m}</li>)}
-        </ul>
-      )}
-      <p style={{ margin: '6px 0 0', color: '#9a3412', fontSize: 12 }}>
-        This recommendation may be conservative or incomplete due to missing data. Review carefully before approving.
-      </p>
-    </div>
-  );
-}
+// ── Compact change summary row ──────────────────────────────────────────────────
+// Layer 2 shows only a lightweight summary of WHAT is proposed (parameter and
+// current → proposed value). The full detail table — difference, risk level and
+// cost impact — lives in the Budget Manager (Layer 3), which decides.
 
-// ── Component: SetpointComparisonTable ────────────────────────────────────────
-function SetpointComparisonTable({ current, recommended, changes }) {
-  if (!current || !recommended) return null;
-
-  const UNITS = {
-    temperature:    '°C',    humidity:       '%',      light:        'lux',
-    soil_ph:        'pH',    soil_ec:        'µS/cm',  soil_temp:    '°C',
-    soil_moisture:  '%',     soil_hysteresis:'%',
-    water_flow:     'L/h',   fertilizer_flow:'L/h',
-  };
-
-  const AI_KEY_MAP = {
-    temperature:    'Temperature',    humidity:       'Humidity',
-    light:          'Light',          soil_ph:        'Soil pH',
-    soil_ec:        'Soil EC',        soil_temp:      'Soil Temp',
-    soil_moisture:  'Soil Moisture',  soil_hysteresis:'Soil Hysteresis',
-    water_flow:     'Water Flow',     fertilizer_flow:'Fertilizer Flow',
-  };
-
-  const changedParams = new Set((changes || []).map(c => c.parameter));
+function ChangeSummaryRow({ chg }) {
+  const diff = chg.difference != null
+    ? chg.difference
+    : (chg.recommended_value != null && chg.current_value != null
+        ? Number(chg.recommended_value) - Number(chg.current_value)
+        : null);
+  const arrowColor = diff > 0 ? '#16a34a' : diff < 0 ? '#dc2626' : '#9ca3af';
 
   return (
-    <div style={{ overflowX: 'auto' }}>
-      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
-        <thead>
-          <tr style={{ background: '#f8fafc' }}>
-            {['Parameter', 'Current', 'AI Recommended', 'Difference', 'Changed'].map(h => (
-              <th key={h} style={{ padding: '8px 12px', textAlign: 'left', borderBottom: '1px solid #e2e8f0', color: '#64748b', fontWeight: 600, fontSize: 11, textTransform: 'uppercase' }}>
-                {h}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {Object.entries(AI_KEY_MAP).map(([dbKey, aiKey]) => {
-            const curVal  = current[dbKey];
-            const recVal  = recommended[aiKey];
-            const unit    = UNITS[dbKey] || '';
-            const changed = changedParams.has(aiKey);
-            const diff    = (recVal != null && curVal != null) ? (Number(recVal) - Number(curVal)) : null;
-            const diffStr = diff != null ? (diff > 0 ? `+${fmtNum(diff)}` : fmtNum(diff)) : '—';
-            const diffColor = diff === null ? '#6b7280' : diff > 0 ? '#059669' : diff < 0 ? '#dc2626' : '#6b7280';
-            return (
-              <tr key={dbKey} style={{ background: changed ? '#f0fdf4' : 'transparent', borderBottom: '1px solid #f1f5f9' }}>
-                <td style={{ padding: '8px 12px', fontWeight: changed ? 700 : 400, color: changed ? '#166534' : '#334155' }}>
-                  {aiKey}
-                </td>
-                <td style={{ padding: '8px 12px', color: '#475569' }}>
-                  {curVal != null ? `${fmtNum(curVal)} ${unit}` : '—'}
-                </td>
-                <td style={{ padding: '8px 12px', fontWeight: changed ? 700 : 400, color: changed ? '#166534' : '#475569' }}>
-                  {recVal != null ? `${typeof recVal === 'string' ? recVal : fmtNum(recVal)} ${typeof recVal !== 'string' ? unit : ''}` : '—'}
-                </td>
-                <td style={{ padding: '8px 12px', color: diffColor, fontWeight: 600 }}>
-                  {changed ? diffStr : '—'}
-                </td>
-                <td style={{ padding: '8px 12px', textAlign: 'center' }}>
-                  {changed ? (
-                    <span style={{ background: '#dcfce7', color: '#166534', padding: '1px 8px', borderRadius: 8, fontSize: 11, fontWeight: 700 }}>YES</span>
-                  ) : (
-                    <span style={{ color: '#94a3b8', fontSize: 11 }}>no</span>
-                  )}
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-// ── Component: ChangesDetail ──────────────────────────────────────────────────
-function ChangesDetail({ changes }) {
-  if (!changes || changes.length === 0) {
-    return (
-      <div style={{ padding: '20px', textAlign: 'center', color: '#6b7280', background: '#f8fafc', borderRadius: 8 }}>
-        <p style={{ margin: 0 }}>No setpoint changes recommended — the AI suggests keeping all current values.</p>
-      </div>
-    );
-  }
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      {changes.map((chg, i) => {
-        const diff = chg.difference;
-        const diffStr = diff != null ? (diff > 0 ? `+${fmtNum(diff)}` : fmtNum(diff)) : '—';
-        const diffColor = diff > 0 ? '#059669' : diff < 0 ? '#dc2626' : '#6b7280';
-        const riskColor = RISK_COLOURS[chg.risk_level] || '#6b7280';
-        return (
-          <div key={i} style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '14px 16px' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-              <span style={{ fontWeight: 700, color: '#1e293b', fontSize: 14 }}>{chg.parameter}</span>
-              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                <span style={{ fontWeight: 700, color: diffColor, fontSize: 13 }}>
-                  {fmtNum(chg.current_value)} → {fmtNum(chg.recommended_value)} ({diffStr})
-                </span>
-                <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 8, background: riskColor + '22', color: riskColor, border: `1px solid ${riskColor}44` }}>
-                  {(chg.risk_level || 'low').toUpperCase()} RISK
-                </span>
-                {chg.clamped && (
-                  <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 8, background: '#fef9c3', color: '#854d0e', border: '1px solid #fde04788' }}>
-                    CLAMPED
-                  </span>
-                )}
-              </div>
-            </div>
-            <p style={{ margin: 0, color: '#475569', fontSize: 13, lineHeight: 1.5 }}>
-              {chg.reason || 'No reason provided.'}
-            </p>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-// ── Component: ValidationNotes ────────────────────────────────────────────────
-function ValidationNotes({ notes }) {
-  if (!notes || notes.length === 0) return null;
-  return (
-    <div style={{ background: '#fffbeb', border: '1px solid #fbbf24', borderRadius: 8, padding: '12px 16px' }}>
-      <p style={{ margin: '0 0 8px', fontWeight: 700, color: '#92400e', fontSize: 13 }}>
-        Safety Validation Notes ({notes.length})
-      </p>
-      <ul style={{ margin: 0, paddingLeft: 18, color: '#78350f', fontSize: 12, lineHeight: 1.6 }}>
-        {notes.map((n, i) => <li key={i}>{n}</li>)}
-      </ul>
-    </div>
-  );
-}
-
-// ── Component: ContextSummary ─────────────────────────────────────────────────
-function ContextSummary({ rec }) {
-  if (!rec) return null;
-  const s = rec.context_summary || {};
-  const items = [
-    { label: 'Plant Health Data',  ok: s.health_available,  icon: '🌿' },
-    { label: 'Growth Metrics',     ok: s.growth_available,  icon: '📏' },
-    { label: 'Sensor Readings',    ok: s.sensors_available, icon: '📡' },
-    { label: 'Growth Trend',       ok: s.trend_available,   icon: '📈' },
-  ];
-  return (
-    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-      {items.map(item => (
-        <div key={item.label} style={{
-          display: 'flex', alignItems: 'center', gap: 6,
-          padding: '5px 12px', borderRadius: 20,
-          background: item.ok ? '#f0fdf4' : '#fef2f2',
-          border: `1px solid ${item.ok ? '#86efac' : '#fca5a5'}`,
-          fontSize: 12, color: item.ok ? '#166534' : '#991b1b',
-        }}>
-          <span>{item.icon}</span>
-          <span>{item.label}</span>
-          <span>{item.ok ? '✓' : '✗'}</span>
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '11px 14px', background: '#f9fafb', border: '1px solid #f3f4f6', borderRadius: 10 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 9, minWidth: 0 }}>
+        <div style={{ background: '#f3f4f6', borderRadius: 7, padding: 6, display: 'flex', flexShrink: 0 }}>
+          <Icon path={IC.settings} size={13} color='#6b7280' />
         </div>
-      ))}
-      {s.collection_timestamp && (
-        <div style={{ padding: '5px 12px', borderRadius: 20, background: '#f8fafc', border: '1px solid #e2e8f0', fontSize: 12, color: '#64748b' }}>
-          📅 Collected: {fmtDate(s.collection_timestamp)}
-        </div>
-      )}
+        <span style={{ fontSize: 13.5, fontWeight: 700, color: '#111827', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{chg.parameter}</span>
+        {chg.clamped && (
+          <span style={{ fontSize: 9, fontWeight: 700, padding: '2px 7px', borderRadius: 99, background: '#fef9c3', color: '#854d0e', border: '1px solid #fde047', flexShrink: 0 }}>CLAMPED</span>
+        )}
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 14, fontWeight: 800, whiteSpace: 'nowrap', flexShrink: 0 }}>
+        <span style={{ color: '#6b7280' }}>{fmtNum(chg.current_value)}</span>
+        <Icon path={IC.arrow} size={13} color={arrowColor} />
+        <span style={{ color: '#15803d' }}>{fmtNum(chg.recommended_value)}</span>
+      </div>
     </div>
   );
 }
 
-// ── Main page component ───────────────────────────────────────────────────────
+// ── Main page ─────────────────────────────────────────────────────────────────
+
 export default function AISetpointAdvisor({ setpoints, onSetpointsRefresh }) {
   const [recommendation, setRecommendation] = useState(null);
   const [rateLimit,      setRateLimit]      = useState(null);
-  const [loading,    setLoading]    = useState(true);
-  const [runLoading, setRunLoading] = useState(false);
-  const [message,    setMessage]    = useState(null); // {type: 'success'|'error', text: string}
-  const [activeTab,  setActiveTab]  = useState('overview');
+  const [loading,        setLoading]        = useState(true);
+  const [runLoading,     setRunLoading]     = useState(false);
+  const [sendLoading,    setSendLoading]    = useState(false);
+  const [polling,        setPolling]        = useState(false);
+  const [pollElapsed,    setPollElapsed]    = useState(0);
+  const [message,        setMessage]        = useState(null);
+  const prevRecTimestampRef = useRef(null);
 
   const fetchLatest = useCallback(async () => {
     try {
-      const res  = await fetch(`${API_BASE_URL}/ai-advisor/latest`);
+      const res  = await fetch(`${API_BASE_URL}/ai-advisor/latest`, { cache: 'no-store' });
       const data = await res.json();
-      if (data.success) {
-        setRecommendation(data.recommendation);
-        setRateLimit(data.rate_limit);
-      }
+      if (data.success) { setRecommendation(data.recommendation); setRateLimit(data.rate_limit); }
     } catch (e) {
       setMessage({ type: 'error', text: 'Could not reach backend: ' + e.message });
-    } finally {
-      setLoading(false);
-    }
+    } finally { setLoading(false); }
   }, []);
 
+  // Initial load + periodic refresh so the Layer 3 status stays in sync
+  // (e.g. after the user approves/rejects in the Budget Manager page).
   useEffect(() => {
     fetchLatest();
+    const id = setInterval(fetchLatest, 15000);
+    return () => clearInterval(id);
   }, [fetchLatest]);
 
+  useEffect(() => {
+    if (!polling) return;
+    const startTime = Date.now();
+    const id = setInterval(async () => {
+      const elapsed = Date.now() - startTime;
+      setPollElapsed(Math.floor(elapsed / 1000));
+      if (elapsed > 3 * 60 * 1000) {
+        setPolling(false);
+        setMessage({ type: 'error', text: 'AI Advisor is taking longer than expected. Results will appear when ready.' });
+        return;
+      }
+      try {
+        const res  = await fetch(`${API_BASE_URL}/ai-advisor/latest`);
+        const data = await res.json();
+        if (data.success && data.recommendation) {
+          const newTs = data.recommendation.created_at;
+          if (newTs !== prevRecTimestampRef.current) {
+            setRecommendation(data.recommendation);
+            setRateLimit(data.rate_limit);
+            setPolling(false);
+            setMessage({ type: 'success', text: 'AI Advisor completed — results are ready.' });
+          }
+        }
+      } catch {}
+    }, 5000);
+    return () => clearInterval(id);
+  }, [polling]); // eslint-disable-line
+
   const handleRunNow = async () => {
-    setRunLoading(true);
-    setMessage(null);
+    setRunLoading(true); setMessage(null);
+    prevRecTimestampRef.current = recommendation?.created_at || null;
     try {
       const res  = await fetch(`${API_BASE_URL}/ai-advisor/run`, { method: 'POST' });
       const data = await res.json();
+      if (data.success) { setMessage({ type: 'success', text: 'AI Advisor is running — results will appear automatically…' }); setPollElapsed(0); setPolling(true); }
+      else setMessage({ type: 'error', text: data.error || 'Failed to start AI Advisor.' });
+    } catch (e) { setMessage({ type: 'error', text: 'Request failed: ' + e.message }); }
+    finally { setRunLoading(false); }
+  };
+
+  const handleSendToBudget = async () => {
+    setSendLoading(true); setMessage(null);
+    try {
+      const res  = await fetch(`${API_BASE_URL}/layer3/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ triggered_by: 'advisor' }),
+      });
+      const data = await res.json();
       if (data.success) {
-        setMessage({ type: 'success', text: data.message });
-        setTimeout(() => fetchLatest(), 35000); // refresh after ~35s
+        setMessage({ type: 'success', text: 'Sent to Budget Manager for review. Open the Budget Manager (Layer 3) page to approve or reject.' });
+        await fetchLatest();
       } else {
-        setMessage({ type: 'error', text: data.error || 'Failed to start AI Advisor.' });
+        setMessage({ type: 'error', text: data.error || 'Failed to send to Budget Manager.' });
       }
-    } catch (e) {
-      setMessage({ type: 'error', text: 'Request failed: ' + e.message });
-    } finally {
-      setRunLoading(false);
-    }
+    } catch (e) { setMessage({ type: 'error', text: 'Request failed: ' + e.message }); }
+    finally { setSendLoading(false); }
   };
 
   const rec    = recommendation;
   const status = rec?.status;
+  const ss     = layer3Status(status);
+  const decided = ['approved', 'applied', 'rejected', 'invalid'].includes(status);
 
-  const tabs = [
-    { id: 'overview',    label: 'Overview' },
-    { id: 'setpoints',   label: 'Setpoint Comparison' },
-    { id: 'changes',     label: `Changes (${rec?.changes?.length || 0})` },
-    { id: 'validation',  label: 'Validation' },
-    { id: 'context',     label: 'Data Context' },
-  ];
-
-  // ── Render ────────────────────────────────────────────────────────────────
+  const canRun = !runLoading && !polling && rateLimit?.remaining_today !== 0;
 
   return (
-    <div style={{ maxWidth: 960, margin: '0 auto', padding: '24px 0' }}>
+    <div style={{ maxWidth: 1400, margin: '0 auto', padding: '8px 0', fontSize: '0.88em' }}>
+      <style>{`@keyframes spin { to { transform: rotate(360deg) } }`}</style>
 
-      {/* Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 24, gap: 16, flexWrap: 'wrap' }}>
-        <div>
-          <h1 style={{ margin: '0 0 4px', fontSize: 24, fontWeight: 800, color: '#0f172a' }}>
-            AI Setpoint Advisor
-          </h1>
-          <p style={{ margin: 0, color: '#64748b', fontSize: 14 }}>
-            GPT-powered analysis of plant health & growth → setpoint recommendations
-          </p>
+      {/* ── Page header ──────────────────────────────────────────────────────── */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 24, flexWrap: 'wrap', gap: 14 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <div style={{ background: 'linear-gradient(135deg, #4f46e5, #7c3aed)', borderRadius: 12, padding: 10, display: 'flex' }}>
+            <Icon path={IC.ai} size={22} color='#fff' />
+          </div>
+          <div>
+            <h2 style={{ margin: 0, fontSize: 20, fontWeight: 800, color: '#111827' }}>AI Setpoint Advisor</h2>
+            <div style={{ fontSize: 12, color: '#9ca3af', marginTop: 2 }}>
+              Layer 2 · AI recommends setpoint changes — final approval happens in the Budget Manager (Layer 3) · runs daily at 15:30
+            </div>
+          </div>
         </div>
+
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
           {rateLimit && (
-            <span style={{ fontSize: 12, color: '#64748b', padding: '4px 10px', background: '#f1f5f9', borderRadius: 8 }}>
-              {rateLimit.remaining_today}/{rateLimit.max_per_day} runs left today
-            </span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '7px 14px', background: '#f5f3ff', border: '1px solid #ddd6fe', borderRadius: 99 }}>
+              <Icon path={IC.run} size={12} color='#7c3aed' />
+              <span style={{ fontSize: 12, fontWeight: 700, color: '#7c3aed' }}>
+                {rateLimit.remaining_today}/{rateLimit.max_per_day} runs left today
+              </span>
+            </div>
           )}
-          <button
-            onClick={fetchLatest}
-            style={{ padding: '6px 14px', borderRadius: 8, border: '1px solid #e2e8f0', background: '#fff', cursor: 'pointer', fontSize: 13, color: '#374151' }}
-          >
-            ↻ Refresh
-          </button>
-          <button
-            onClick={handleRunNow}
-            disabled={runLoading || (rateLimit?.remaining_today === 0)}
-            style={{
-              padding: '8px 18px', borderRadius: 8, border: 'none',
-              background: (runLoading || rateLimit?.remaining_today === 0) ? '#94a3b8' : '#4f46e5',
-              color: '#fff', cursor: (runLoading || rateLimit?.remaining_today === 0) ? 'not-allowed' : 'pointer',
-              fontWeight: 700, fontSize: 13,
-            }}
-          >
-            {runLoading ? 'Starting…' : '▶ Run AI Advisor Now'}
+          {polling && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '7px 14px', background: '#ede9fe', border: '1px solid #c4b5fd', borderRadius: 99 }}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#7c3aed" strokeWidth="2.5" style={{ animation: 'spin 0.8s linear infinite' }}>
+                <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" strokeLinecap="round"/>
+              </svg>
+              <span style={{ fontSize: 12, fontWeight: 700, color: '#7c3aed' }}>Analyzing… {pollElapsed}s</span>
+            </div>
+          )}
+          <button onClick={handleRunNow} disabled={!canRun}
+            style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '9px 18px', borderRadius: 10, border: 'none', background: canRun ? '#4f46e5' : '#a5b4fc', color: '#fff', cursor: canRun ? 'pointer' : 'not-allowed', fontWeight: 700, fontSize: 13 }}>
+            <Icon path={IC.run} size={13} color='#fff' />
+            {runLoading ? 'Starting…' : polling ? 'Running…' : 'Run Now'}
           </button>
         </div>
       </div>
 
-      {/* Feedback message */}
+      {/* ── Feedback banner ───────────────────────────────────────────────────── */}
       {message && (
-        <div style={{
-          padding: '12px 16px', borderRadius: 8, marginBottom: 16,
-          background: message.type === 'success' ? '#f0fdf4' : '#fef2f2',
-          border: `1px solid ${message.type === 'success' ? '#86efac' : '#fca5a5'}`,
-          color: message.type === 'success' ? '#166534' : '#991b1b',
-          fontSize: 13,
-        }}>
-          {message.text}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 16px', borderRadius: 10, marginBottom: 16, background: message.type === 'success' ? '#f0fdf4' : '#fef2f2', border: `1px solid ${message.type === 'success' ? '#86efac' : '#fca5a5'}`, color: message.type === 'success' ? '#166534' : '#991b1b', fontSize: 13 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Icon path={message.type === 'success' ? IC.check : IC.warn} size={15} color={message.type === 'success' ? '#16a34a' : '#dc2626'} />
+            {message.text}
+          </div>
+          <button onClick={() => setMessage(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 18, color: 'inherit', lineHeight: 1 }}>×</button>
         </div>
       )}
 
-      {/* Loading */}
+      {/* ── Loading ───────────────────────────────────────────────────────────── */}
       {loading && (
-        <div style={{ padding: '40px', textAlign: 'center', color: '#64748b' }}>
-          Loading AI recommendation…
+        <div style={{ textAlign: 'center', padding: '60px', color: '#9ca3af' }}>
+          <div style={{ width: 36, height: 36, border: '3px solid #e5e7eb', borderTopColor: '#4f46e5', borderRadius: '50%', animation: 'spin 0.8s linear infinite', margin: '0 auto 14px' }} />
+          <div style={{ fontSize: 14 }}>Loading AI recommendation…</div>
         </div>
       )}
 
-      {/* No recommendation yet */}
+      {/* ── No recommendation ────────────────────────────────────────────────── */}
       {!loading && !rec && (
-        <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 12, padding: '48px 24px', textAlign: 'center' }}>
-          <div style={{ fontSize: 48, marginBottom: 12 }}>🤖</div>
-          <h3 style={{ margin: '0 0 8px', color: '#334155' }}>No Recommendation Yet</h3>
-          <p style={{ color: '#64748b', margin: '0 0 20px', fontSize: 14 }}>
+        <div style={{ background: '#f9fafb', border: '1px dashed #d1d5db', borderRadius: 16, padding: '60px 32px', textAlign: 'center' }}>
+          <div style={{ background: '#ede9fe', borderRadius: '50%', width: 64, height: 64, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 18px' }}>
+            <Icon path={IC.ai} size={28} color='#7c3aed' />
+          </div>
+          <h3 style={{ margin: '0 0 10px', color: '#374151', fontSize: 18 }}>No Recommendation Yet</h3>
+          <p style={{ color: '#9ca3af', margin: '0 0 22px', fontSize: 14, lineHeight: 1.6 }}>
             The AI Advisor runs automatically every day at 15:30.<br />
-            You can also trigger it manually using the button above.
+            You can also trigger it manually using the Run Now button.
           </p>
+          <button onClick={handleRunNow} disabled={!canRun}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '10px 22px', borderRadius: 10, border: 'none', background: '#4f46e5', color: '#fff', cursor: 'pointer', fontWeight: 700, fontSize: 14 }}>
+            <Icon path={IC.run} size={14} color='#fff' /> Run AI Advisor
+          </button>
         </div>
       )}
 
-      {/* Recommendation card */}
+
+      {/* ── Main recommendation ───────────────────────────────────────────────── */}
       {!loading && rec && (
-        <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12, overflow: 'hidden' }}>
-
-          {/* Card header */}
-          <div style={{ padding: '20px 24px', borderBottom: '1px solid #f1f5f9', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 12 }}>
-            <div>
-              <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 6, flexWrap: 'wrap' }}>
-                <StatusBadge status={status} />
-                <span style={{ fontSize: 12, color: '#64748b' }}>
-                  {fmtDate(rec.created_at)}
+        <>
+          {/* Status banner — single Layer-3-synced status, shown once */}
+          <div style={{ background: ss.bg, border: `1px solid ${ss.border}`, borderRadius: 14, padding: '14px 20px', marginBottom: 16, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+              <StatusBadge status={status} />
+              <span style={{ fontSize: 12, color: '#6b7280', display: 'flex', alignItems: 'center', gap: 5 }}>
+                <Icon path={IC.clock} size={12} color='#9ca3af' />
+                Last run: {fmtDate(rec.created_at)}
+              </span>
+              {rec.openai_model && (
+                <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 99, background: '#f5f3ff', border: '1px solid #ddd6fe', color: '#7c3aed' }}>
+                  {rec.openai_model}
                 </span>
-                {rec.triggered_by && (
-                  <span style={{ fontSize: 11, color: '#94a3b8', padding: '1px 8px', background: '#f1f5f9', borderRadius: 8 }}>
-                    {rec.triggered_by}
-                  </span>
-                )}
-                {rec.openai_model && (
-                  <span style={{ fontSize: 11, color: '#7c3aed', padding: '1px 8px', background: '#f5f3ff', border: '1px solid #ddd6fe', borderRadius: 8 }}>
-                    {rec.openai_model}
-                  </span>
-                )}
-              </div>
-              <p style={{ margin: 0, fontSize: 13, color: '#475569', fontStyle: 'italic', maxWidth: 600 }}>
-                {rec.summary || '—'}
-              </p>
+              )}
             </div>
-
-            {/* KPI chips */}
-            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ fontSize: 20, fontWeight: 800, color: PLANT_STATUS_COLOURS[rec.plant_status] || '#6b7280' }}>
-                  {(rec.plant_status || 'unknown').replace('_', ' ').toUpperCase()}
-                </div>
-                <div style={{ fontSize: 10, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Plant Status</div>
-              </div>
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ fontSize: 20, fontWeight: 800, color: SEVERITY_COLOURS[rec.severity] || '#6b7280' }}>
-                  {(rec.severity || 'none').toUpperCase()}
-                </div>
-                <div style={{ fontSize: 10, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Severity</div>
-              </div>
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ fontSize: 20, fontWeight: 800, color: '#0f172a' }}>
-                  {rec.confidence != null ? `${Math.round(rec.confidence * 100)}%` : '—'}
-                </div>
-                <div style={{ fontSize: 10, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Confidence</div>
-              </div>
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ fontSize: 20, fontWeight: 800, color: '#0f172a' }}>
-                  {rec.changes?.length || 0}
-                </div>
-                <div style={{ fontSize: 10, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Changes</div>
-              </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              {status === 'rejected' && rec.rejection_reason && (
+                <span style={{ fontSize: 12, color: '#991b1b', fontWeight: 600 }}>Reason: {rec.rejection_reason}</span>
+              )}
+              {!decided && rec.changes?.length > 0 && (
+                <button onClick={handleSendToBudget} disabled={sendLoading}
+                  style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '9px 18px', borderRadius: 10, border: 'none', background: sendLoading ? '#a5b4fc' : '#4f46e5', color: '#fff', cursor: sendLoading ? 'not-allowed' : 'pointer', fontWeight: 700, fontSize: 13 }}>
+                  <Icon path={IC.arrow} size={14} color='#fff' />
+                  {sendLoading ? 'Sending…' : 'Send to Budget Manager'}
+                </button>
+              )}
             </div>
           </div>
 
-          {/* Problem detected banner */}
-          {rec.problem_detected && rec.main_problem && rec.main_problem !== 'none' && (
-            <div style={{ padding: '10px 24px', background: '#fef2f2', borderBottom: '1px solid #fca5a5' }}>
-              <span style={{ fontWeight: 700, color: '#991b1b', fontSize: 13 }}>
-                ⚠ Problem Detected:
-              </span>
-              <span style={{ color: '#991b1b', fontSize: 13, marginLeft: 8 }}>
-                {rec.main_problem}
-              </span>
-            </div>
-          )}
+          {/* Two main areas: LEFT Overview · RIGHT Changes */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, alignItems: 'start' }}>
 
-          {/* Applied info */}
-          {status === 'applied' && (
-            <div style={{ padding: '10px 24px', background: '#dbeafe', borderBottom: '1px solid #93c5fd' }}>
-              <span style={{ fontWeight: 700, color: '#1e40af', fontSize: 13 }}>
-                ✓ Applied at {fmtDate(rec.applied_at)} — approved via Budget Manager (Layer 3).
-              </span>
-            </div>
-          )}
-
-          {/* Rejected info */}
-          {status === 'rejected' && rec.rejection_reason && (
-            <div style={{ padding: '10px 24px', background: '#fee2e2', borderBottom: '1px solid #fca5a5' }}>
-              <span style={{ fontWeight: 700, color: '#991b1b', fontSize: 13 }}>
-                ✗ Rejected: {rec.rejection_reason}
-              </span>
-            </div>
-          )}
-
-          {/* Invalid / API-failure info */}
-          {status === 'invalid' && rec.rejection_reason && (
-            <div style={{ padding: '12px 24px', background: '#fce7f3', borderBottom: '1px solid #f9a8d4' }}>
-              <span style={{ fontWeight: 700, color: '#9d174d', fontSize: 13 }}>
-                ⚠ Failed: {rec.rejection_reason}
-              </span>
-            </div>
-          )}
-
-          {/* Data quality warning */}
-          <div style={{ padding: '0 24px', paddingTop: 16 }}>
-            <DataQualityWarning recommendation={rec} />
-          </div>
-
-          {/* Tabs */}
-          <div style={{ padding: '0 24px', borderBottom: '1px solid #f1f5f9', display: 'flex', gap: 0, overflowX: 'auto' }}>
-            {tabs.map(tab => (
-              <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                style={{
-                  padding: '10px 16px',
-                  border: 'none',
-                  borderBottom: activeTab === tab.id ? '2px solid #4f46e5' : '2px solid transparent',
-                  background: 'transparent',
-                  cursor: 'pointer',
-                  fontSize: 13,
-                  fontWeight: activeTab === tab.id ? 700 : 400,
-                  color: activeTab === tab.id ? '#4f46e5' : '#64748b',
-                  whiteSpace: 'nowrap',
-                }}
-              >
-                {tab.label}
-              </button>
-            ))}
-          </div>
-
-          {/* Tab content */}
-          <div style={{ padding: '20px 24px' }}>
-
-            {/* Overview tab */}
-            {activeTab === 'overview' && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-                <div>
-                  <h4 style={{ margin: '0 0 8px', color: '#334155', fontSize: 14 }}>AI Explanation</h4>
-                  <p style={{ margin: 0, color: '#475569', fontSize: 13, lineHeight: 1.7, background: '#f8fafc', padding: '12px 16px', borderRadius: 8, border: '1px solid #e2e8f0' }}>
-                    {rec.detailed_explanation || 'No explanation provided.'}
-                  </p>
+            {/* ── LEFT: Overview ── */}
+            <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 14, overflow: 'hidden' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '13px 18px', borderBottom: '1px solid #e5e7eb', background: '#fafafa' }}>
+                <div style={{ background: '#f5f3ff', borderRadius: 8, padding: 7, display: 'flex' }}>
+                  <Icon path={IC.brain} size={14} color='#7c3aed' />
                 </div>
-                <ContextSummary rec={rec} />
+                <span style={{ fontSize: 14, fontWeight: 800, color: '#111827' }}>Overview</span>
               </div>
-            )}
 
-            {/* Setpoint comparison tab */}
-            {activeTab === 'setpoints' && (
-              <SetpointComparisonTable
-                current={rec.current_setpoints}
-                recommended={rec.recommended_setpoints}
-                changes={rec.changes}
-              />
-            )}
+              <div style={{ padding: '16px 18px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+                {/* Stat grid: plant status / severity / confidence / data quality */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 10 }}>
+                  <KpiCard label="Plant Status"     icon={IC.leaf}     iconBg='#f0fdf4' iconColor='#16a34a'
+                    value={(rec.plant_status || 'unknown').replace(/_/g,' ').toUpperCase()} valueColor={PLANT_COLOR[rec.plant_status]} />
+                  <KpiCard label="Problem Severity" icon={IC.warn}     iconBg={rec.severity === 'none' ? '#f0fdf4' : '#fffbeb'} iconColor={SEV_COLOR[rec.severity] || '#9ca3af'}
+                    value={(rec.severity || 'none').toUpperCase()} valueColor={SEV_COLOR[rec.severity]} />
+                  <KpiCard label="AI Confidence"    icon={IC.brain}    iconBg='#f5f3ff' iconColor='#7c3aed'
+                    value={rec.confidence != null ? `${Math.round(rec.confidence * 100)}%` : '—'} />
+                  <KpiCard label="Data Quality"     icon={IC.data}     iconBg={rec.data_quality === 'high' ? '#f0fdf4' : '#fffbeb'} iconColor={rec.data_quality === 'high' ? '#16a34a' : '#d97706'}
+                    value={(rec.data_quality || '—').toUpperCase()} valueColor={rec.data_quality === 'high' ? '#16a34a' : rec.data_quality === 'medium' ? '#d97706' : '#dc2626'} />
+                </div>
 
-            {/* Changes tab */}
-            {activeTab === 'changes' && (
-              <ChangesDetail changes={rec.changes} />
-            )}
-
-            {/* Validation tab */}
-            {activeTab === 'validation' && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <ValidationNotes notes={rec.validation_notes} />
-                {(!rec.validation_notes || rec.validation_notes.length === 0) && (
-                  <div style={{ padding: '20px', textAlign: 'center', color: '#6b7280', background: '#f8fafc', borderRadius: 8 }}>
-                    All validation checks passed — no issues found.
+                {/* Problem banner */}
+                {rec.problem_detected && rec.main_problem && rec.main_problem !== 'none' && (
+                  <div style={{ display: 'flex', alignItems: 'flex-start', gap: 9, padding: '11px 14px', background: '#fef2f2', border: '1px solid #fca5a5', borderRadius: 10 }}>
+                    <Icon path={IC.warn} size={15} color='#dc2626' />
+                    <div style={{ fontSize: 13, color: '#991b1b' }}>
+                      <strong>Problem Detected: </strong>{rec.main_problem}
+                    </div>
                   </div>
                 )}
-              </div>
-            )}
 
-            {/* Context tab */}
-            {activeTab === 'context' && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-                <ContextSummary rec={rec} />
-                {rec.context_summary?.missing_data?.length > 0 && (
+                {/* AI analysis text */}
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 800, color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>AI Analysis</div>
+                  <p style={{ margin: 0, color: '#1f2937', fontSize: 13.5, lineHeight: 1.75, background: '#f9fafb', padding: '14px 16px', borderRadius: 10, border: '1px solid #f3f4f6' }}>
+                    {rec.detailed_explanation || rec.summary || 'No explanation provided.'}
+                  </p>
+                </div>
+
+                {/* Environment issues */}
+                {rec.environment_issues?.length > 0 && (
                   <div>
-                    <h4 style={{ margin: '0 0 8px', color: '#334155', fontSize: 14 }}>Missing Data Sources</h4>
-                    <ul style={{ margin: 0, paddingLeft: 18, color: '#dc2626', fontSize: 13 }}>
-                      {rec.context_summary.missing_data.map((m, i) => <li key={i}>{m}</li>)}
+                    <div style={{ fontSize: 11, fontWeight: 800, color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>
+                      Environment Issues ({rec.environment_issues.length})
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {rec.environment_issues.map((issue, i) => (
+                        <div key={i} style={{ background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 9, padding: '10px 13px' }}>
+                          <div style={{ fontSize: 13, fontWeight: 700, color: '#92400e', marginBottom: issue.current_value != null ? 3 : 0 }}>{issue.description}</div>
+                          {issue.current_value != null && (
+                            <div style={{ fontSize: 12, color: '#92400e' }}>
+                              Current: <strong>{issue.current_value}</strong>
+                              {issue.optimal_range && <> · Optimal: <strong>{issue.optimal_range}</strong></>}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Warnings */}
+                {rec.warnings?.length > 0 && (
+                  <div>
+                    <div style={{ fontSize: 11, fontWeight: 800, color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>Warnings</div>
+                    <ul style={{ margin: 0, paddingLeft: 20, color: '#6b7280', fontSize: 13, lineHeight: 1.7 }}>
+                      {rec.warnings.map((w, i) => <li key={i}>{w}</li>)}
                     </ul>
                   </div>
                 )}
               </div>
-            )}
-          </div>
+            </div>
 
-          {/* Layer 3 routing banner — single approval point */}
-          <div style={{ padding: '14px 24px', borderTop: '1px solid #f1f5f9', background: '#eff6ff', borderBottomLeftRadius: 12, borderBottomRightRadius: 12 }}>
-            {(status === 'pending' || status === 'needs_manual_review') && (
-              <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2563eb" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, marginTop: 1 }}>
-                  <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
-                </svg>
-                <div style={{ fontSize: 13, color: '#1e40af', lineHeight: 1.6 }}>
-                  <strong>Waiting for Layer 3 review.</strong> This Layer 2 recommendation is reviewed by the Budget Manager (Layer 3),
-                  which checks sensor safety, plant health, and daily budget before presenting a final decision.
-                  <br />
-                  <span style={{ fontWeight: 700 }}>To approve or reject, go to the <span style={{ textDecoration: 'underline', cursor: 'default' }}>Budget Manager</span> page.</span>
-                  {status === 'needs_manual_review' && (
-                    <div style={{ marginTop: 6, padding: '6px 10px', background: '#fef3c7', border: '1px solid #fcd34d', borderRadius: 6, color: '#92400e', fontSize: 12 }}>
-                      Note: Some recommended changes exceeded normal limits and were clamped. Layer 3 will factor this into its decision.
-                    </div>
-                  )}
+            {/* ── RIGHT: Changes ── */}
+            <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 14, overflow: 'hidden' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '13px 18px', borderBottom: '1px solid #e5e7eb', background: '#fafafa' }}>
+                <div style={{ background: '#eff6ff', borderRadius: 8, padding: 7, display: 'flex' }}>
+                  <Icon path={IC.settings} size={14} color='#2563eb' />
                 </div>
+                <span style={{ fontSize: 14, fontWeight: 800, color: '#111827' }}>Recommended Changes</span>
+                <span style={{ fontSize: 10, fontWeight: 700, color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.04em' }}>summary</span>
+                <span style={{ marginLeft: 'auto', fontSize: 11, fontWeight: 700, padding: '2px 9px', borderRadius: 99, background: '#eff6ff', color: '#2563eb', border: '1px solid #bfdbfe' }}>
+                  {rec.changes?.length || 0}
+                </span>
               </div>
-            )}
-            {status === 'applied' && (
-              <div style={{ fontSize: 13, color: '#166534' }}>
-                ✓ Recommendation applied via Budget Manager at {rec.applied_at ? new Date(rec.applied_at).toLocaleString() : '—'}.
+
+              <div style={{ padding: '16px 18px' }}>
+                {rec.changes?.length > 0 ? (
+                  <>
+                    <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 14 }}>
+                      {rec.changes.length} setpoint change{rec.changes.length !== 1 ? 's' : ''} recommended.
+                      This is a proposal only — the full detail (difference, risk, cost impact) and final approval are in the Budget Manager (Layer 3).
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {rec.changes.map((chg, i) => <ChangeSummaryRow key={i} chg={chg} />)}
+                    </div>
+                  </>
+                ) : (
+                  <div style={{ textAlign: 'center', padding: '40px 20px', background: '#f9fafb', borderRadius: 10 }}>
+                    <Icon path={IC.check} size={32} color='#d1d5db' />
+                    <div style={{ color: '#6b7280', marginTop: 12, fontSize: 13.5, fontWeight: 600 }}>No setpoint changes recommended</div>
+                    <div style={{ color: '#9ca3af', marginTop: 4, fontSize: 12 }}>AI agrees with all current setpoints.</div>
+                  </div>
+                )}
               </div>
-            )}
-            {status === 'rejected' && (
-              <div style={{ fontSize: 13, color: '#991b1b' }}>
-                ✗ Recommendation rejected. {rec.rejection_reason ? `Reason: ${rec.rejection_reason}` : ''}
-              </div>
-            )}
-            {status === 'invalid' && (
-              <div style={{ fontSize: 13, color: '#9d174d' }}>
-                ⚠ This recommendation was invalid and cannot be applied.
-              </div>
-            )}
+            </div>
+
           </div>
-        </div>
+        </>
       )}
 
-      {/* Info footer */}
-      <div style={{ marginTop: 24, padding: '16px', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8 }}>
-        <p style={{ margin: 0, fontSize: 12, color: '#64748b', lineHeight: 1.7 }}>
-          <strong>How it works:</strong> Every day at 15:30 the AI Advisor (Layer 2) collects plant health data, growth metrics, 24-hour sensor statistics, and current setpoints, then sends them to GPT for analysis. The AI returns a recommendation validated against safety limits and saved here as "Pending Review".
-          After Layer 2 finishes, Layer 3 (Budget Manager) automatically reviews the recommendation against sensor safety, plant health, and daily budget constraints before presenting a final decision.
-          <strong> Approval happens only in the Budget Manager page</strong> — setpoints are <strong>never changed automatically</strong>.
-        </p>
-      </div>
     </div>
   );
 }

@@ -101,7 +101,18 @@ else:
         "Light sensor disabled. Water pump and fertilizer pump are NOT affected "
         "(they use the RS485 soil sensor)."
     )
-env_sensors.set_dht22_pin(DHT22_PIN)
+try:
+    env_sensors.set_dht22_pin(DHT22_PIN)
+except RuntimeError as _dht_err:
+    _CUSTOM_PRINT_FUNC(f"[Warning] DHT22 init failed ({_dht_err}) — killing orphan libgpiod_pulsein and retrying...")
+    import subprocess as _sp
+    _sp.run(["pkill", "-f", "libgpiod_pulsein"], check=False)
+    time.sleep(1)
+    try:
+        env_sensors.set_dht22_pin(DHT22_PIN)
+        _CUSTOM_PRINT_FUNC("[STARTUP] DHT22 OK after orphan cleanup.")
+    except RuntimeError as _dht_err2:
+        _CUSTOM_PRINT_FUNC(f"[Warning] DHT22 init failed again ({_dht_err2}) — continuing without temperature/humidity sensor.")
 env_sensors.set_soil_moisture_ads1115_channel(ADS1115_SOIL_CH)
 env_sensors.set_light_intensity_ads1115_channel(ADS1115_LIGHT_CH)
 env_sensors.calibrate_soil_moisture_ads1115(ADS1115_SOIL_DRY_VAL, ADS1115_SOIL_WET_VAL)
@@ -348,6 +359,30 @@ if __name__ == "__main__":
     flask_thread.daemon = True
     flask_thread.start()
 
+    # ── Control-loop supervisor ────────────────────────────────────────────────
+    # Wraps each control loop so a thread can NEVER die silently. If a loop
+    # raises an unhandled exception, the supervisor forces ALL actuators OFF
+    # (so a crash can never leave a pump running), logs the traceback, waits a
+    # few seconds, and restarts the loop. This is the top-level safety net that
+    # keeps the system alive even if a sensor/DB/hardware call fails unexpectedly.
+    def _supervised(name, target, *t_args, **t_kwargs):
+        import traceback as _tb
+        def _runner():
+            while True:
+                try:
+                    target(*t_args, **t_kwargs)
+                    _CUSTOM_PRINT_FUNC(f"[Supervisor] {name} returned unexpectedly — restarting in 5s")
+                except Exception as _e:
+                    _CUSTOM_PRINT_FUNC(f"[Supervisor] {name} CRASHED: {_e} — forcing actuators OFF, restarting in 5s")
+                    _CUSTOM_PRINT_FUNC(_tb.format_exc())
+                # Never leave an actuator/pump running after a crash
+                try:
+                    env_actuators.stop_all_actuators()
+                except Exception:
+                    pass
+                time.sleep(5)
+        return _runner
+
     serial_logger_thread = threading.Thread(
         target=serial_logger_task,
         args=(
@@ -358,21 +393,21 @@ if __name__ == "__main__":
     )
 
     temperature_thread = threading.Thread(
-        target=control_loops.temperature_sp_adjustment_task,
-        args=(env_sensors, env_actuators, setpoints, temperature_semaphore, temperature_pause_event),
+        target=_supervised("Temperature loop", control_loops.temperature_sp_adjustment_task,
+                           env_sensors, env_actuators, setpoints, temperature_semaphore, temperature_pause_event),
     )
     light_thread = threading.Thread(
-        target=control_loops.light_sp_adjustment_task,
-        args=(env_sensors, env_actuators, setpoints, light_semaphore, light_pause_event),
+        target=_supervised("Light loop", control_loops.light_sp_adjustment_task,
+                           env_sensors, env_actuators, setpoints, light_semaphore, light_pause_event),
     )
     soil_thread = threading.Thread(
-        target=control_loops.set_soil_moisture_setpoint_task,
-        args=(env_sensors, env_actuators, setpoints, soil_semaphore, soil_pause_event, mongo_db_handler, light_pause_event),
+        target=_supervised("Water pump loop", control_loops.set_soil_moisture_setpoint_task,
+                           env_sensors, env_actuators, setpoints, soil_semaphore, soil_pause_event, mongo_db_handler, light_pause_event),
     )
     fertilizer_thread = threading.Thread(
-        target=control_loops.fertilizer_pump_control_task,
-        args=(env_sensors, env_actuators, setpoints, soil_semaphore, fertilizer_pause_event, mongo_db_handler),
-        kwargs={'light_pause_event': light_pause_event},
+        target=_supervised("Fertilizer pump loop", control_loops.fertilizer_pump_control_task,
+                           env_sensors, env_actuators, setpoints, soil_semaphore, fertilizer_pause_event, mongo_db_handler,
+                           light_pause_event=light_pause_event),
     )
     app_thread = threading.Thread(target=app_loop.app_task)
 

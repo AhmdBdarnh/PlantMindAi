@@ -1,27 +1,41 @@
 """
-telegram_alerts.py — Telegram notification system for PlantMind AI.
+telegram_alerts.py — Email notification system for PlantMind AI.
 
-Sends alerts to your Telegram when abnormal events occur in sensors,
-actuators, or the backend system.
+Sends alert emails when abnormal events occur in sensors, actuators, or the
+backend system.  (The module keeps its original name so the rest of the
+codebase — which imports `send_telegram_alert` and the `alert_*` helpers —
+keeps working unchanged.  Internally it now delivers email instead of Telegram.)
 
 Configuration (from .env):
-    TELEGRAM_BOT_TOKEN=your_bot_token
-    TELEGRAM_CHAT_ID=902586320
+    ALERT_EMAIL_FROM=your_sender@gmail.com        # Gmail account that SENDS the alerts
+    ALERT_EMAIL_APP_PASSWORD=xxxxxxxxxxxxxxxx      # 16-char Gmail App Password (NOT the login password)
+    ALERT_EMAIL_TO=ahmds3b@gmail.com               # recipient (default already set)
+    SMTP_HOST=smtp.gmail.com                        # optional override
+    SMTP_PORT=587                                   # optional override (587 = STARTTLS)
 
 All logic is here — other files only call the helper functions.
 """
 
 import os
 import time
+import smtplib
 import threading
-import requests
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
-TELEGRAM_CHAT_ID   = os.getenv('TELEGRAM_CHAT_ID', '902586320')
-TELEGRAM_ENABLED   = bool(TELEGRAM_BOT_TOKEN)
+SMTP_HOST                = os.getenv('SMTP_HOST', 'smtp.gmail.com')
+SMTP_PORT                = int(os.getenv('SMTP_PORT', '587'))
+ALERT_EMAIL_FROM         = os.getenv('ALERT_EMAIL_FROM', '').strip()
+# Gmail shows App Passwords grouped with spaces (e.g. "aflj ueqj tdve lcwy");
+# strip all whitespace so login works whether or not the spaces are kept.
+ALERT_EMAIL_APP_PASSWORD = os.getenv('ALERT_EMAIL_APP_PASSWORD', '').replace(' ', '')
+ALERT_EMAIL_TO           = os.getenv('ALERT_EMAIL_TO', 'ahmds3b@gmail.com').strip()
+
+# Email is only active when a sender account + app password are configured.
+EMAIL_ENABLED = bool(ALERT_EMAIL_FROM and ALERT_EMAIL_APP_PASSWORD)
 
 # ── Cooldown settings ─────────────────────────────────────────────────────────
 # Same alert will not be re-sent until the cooldown expires.
@@ -53,12 +67,34 @@ def send_telegram_alert(
     data:            dict = None,
 ) -> bool:
     """
-    Send a Telegram message with cooldown and full error handling.
-    Returns True if sent, False if skipped (cooldown) or failed.
-    The backend will NEVER crash if Telegram fails.
+    Send an alert EMAIL with cooldown and full error handling.
+
+    (Name kept as `send_telegram_alert` for backward compatibility — it now
+    delivers email instead of a Telegram message.)
+
+    Returns True if the email was dispatched, False if skipped (cooldown /
+    disabled) or failed.  The backend will NEVER crash if email sending fails.
     """
-    if not TELEGRAM_ENABLED:
-        print(f"[Telegram] DISABLED (no token). Would send [{severity}] {title}: {message}")
+    # UI notification (bell/toast) — UI only, independent of email, never raises.
+    # Its own dedup window mirrors the email cooldown to avoid spam.
+    try:
+        import notifications
+        notifications.create_notification(
+            'sensor_warning',
+            'critical' if severity.upper() in ('CRITICAL', 'DANGER') else 'warning',
+            title, message,
+            category='sensor', link='environment',
+            meta={'component': component, 'value': current_value},
+            dedup_key=f"sensor:{title}|{component or ''}",
+            dedup_window_sec=COOLDOWN_SEC.get(severity.upper(), 600),
+            already_emailed=EMAIL_ENABLED,
+        )
+    except Exception as _ntf_err:
+        print(f"[Notifications] sensor alert skipped: {_ntf_err}")
+
+    if not EMAIL_ENABLED:
+        print(f"[Email] DISABLED (set ALERT_EMAIL_FROM + ALERT_EMAIL_APP_PASSWORD in .env). "
+              f"Would send [{severity}] {title}: {message}")
         return False
 
     alert_key = f"{title}|{component or ''}"
@@ -70,67 +106,93 @@ def send_telegram_alert(
             return False   # still on cooldown — skip silently
         _last_sent[alert_key] = time.time()
 
-    text = _build_message(
+    subject = _build_subject(title, severity)
+    body    = _build_message(
         title, message, severity, component,
         current_value, allowed_range, action_taken, recommendation, data,
     )
 
+    # Send in a background thread so a slow SMTP handshake never blocks the
+    # control loops. The cooldown above is already recorded synchronously.
+    threading.Thread(
+        target=_send_email_safe,
+        args=(subject, body, severity, title),
+        daemon=True,
+        name='EmailAlert',
+    ).start()
+    return True
+
+
+# Backward/forward-compatible aliases — same behavior, clearer name.
+def send_email_alert(*args, **kwargs) -> bool:
+    return send_telegram_alert(*args, **kwargs)
+
+
+def send_alert(*args, **kwargs) -> bool:
+    return send_telegram_alert(*args, **kwargs)
+
+
+def _send_email_safe(subject: str, body: str, severity: str, title: str) -> None:
+    """Open an SMTP connection and deliver one email. Never raises."""
     try:
-        url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        resp = requests.post(
-            url,
-            json={'chat_id': TELEGRAM_CHAT_ID, 'text': text, 'parse_mode': 'Markdown'},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            print(f"[Telegram] Sent [{severity}] {title}")
-            return True
-        print(f"[Telegram] HTTP {resp.status_code}: {resp.text[:200]}")
-        return False
+        msg = MIMEMultipart()
+        msg['From']    = ALERT_EMAIL_FROM
+        msg['To']      = ALERT_EMAIL_TO
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(ALERT_EMAIL_FROM, ALERT_EMAIL_APP_PASSWORD)
+            server.sendmail(ALERT_EMAIL_FROM, [ALERT_EMAIL_TO], msg.as_string())
+
+        print(f"[Email] Sent [{severity}] {title} → {ALERT_EMAIL_TO}")
     except Exception as e:
-        print(f"[Telegram] ERROR (backend continues): {e}")
-        return False
+        print(f"[Email] ERROR (backend continues): {e}")
 
 
-def _md_escape(text) -> str:
-    """Escape Telegram Markdown v1 special characters in dynamic/user-generated text."""
-    s = str(text) if not isinstance(text, str) else text
-    for ch in ('_', '*', '`', '['):
-        s = s.replace(ch, f'\\{ch}')
-    return s
+def _build_subject(title: str, severity: str) -> str:
+    icons = {'INFO': 'ℹ️', 'WARNING': '⚠️', 'CRITICAL': '🚨', 'DANGER': '🔴'}
+    icon  = icons.get(severity.upper(), '⚠️')
+    return f"{icon} PlantMind AI [{severity.upper()}] — {title}"
 
 
 def _build_message(
     title, message, severity, component,
     current_value, allowed_range, action_taken, recommendation, data,
 ) -> str:
-    icons = {'INFO': 'ℹ️', 'WARNING': '⚠️', 'CRITICAL': '🚨', 'DANGER': '🔴'}
-    icon  = icons.get(severity.upper(), '⚠️')
-    ts    = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     lines = [
-        f"{icon} *PlantMind AI Alert*",
+        "PlantMind AI Alert",
+        "==================",
         "",
-        f"*Severity:* {severity.upper()}",
-        f"*Time:* {ts}",
+        f"Title:      {title}",
+        f"Severity:   {severity.upper()}",
+        f"Time:       {ts}",
     ]
     if component:
-        lines.append(f"*Component:* {_md_escape(component)}")
-    lines.append(f"*Problem:* {_md_escape(message)}")
+        lines.append(f"Component:  {component}")
+    lines.append(f"Problem:    {message}")
     if current_value is not None:
-        lines.append(f"*Current Value:* {_md_escape(current_value)}")
+        lines.append(f"Current Value:  {current_value}")
     if allowed_range:
-        lines.append(f"*Allowed Range:* {_md_escape(allowed_range)}")
+        lines.append(f"Allowed Range:  {allowed_range}")
     if action_taken:
-        lines.append(f"*Action Taken:* {_md_escape(action_taken)}")
+        lines.append(f"Action Taken:   {action_taken}")
     if recommendation:
-        lines.append(f"*Recommendation:* {_md_escape(recommendation)}")
+        lines.append(f"Recommendation: {recommendation}")
     if data:
         lines.append("")
-        lines.append("*Details:*")
+        lines.append("Details:")
         for k, v in data.items():
-            lines.append(f"  • {k}: {_md_escape(v)}")
+            lines.append(f"  - {k}: {v}")
 
+    lines.append("")
+    lines.append("—")
+    lines.append("This is an automated message from your PlantMind AI greenhouse system.")
     return "\n".join(lines)
 
 

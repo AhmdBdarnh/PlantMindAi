@@ -10,10 +10,32 @@ from simple_pid import PID
 from utils.utils import _CUSTOM_PRINT_FUNC
 from telegram_alerts import (
     alert_sensor_error, alert_sensor_lock, alert_actuator_failure,
-    alert_pump_rate_limit, alert_dangerous_ec, alert_ec_high,
+    alert_dangerous_ec, alert_ec_high,
     alert_ec_above_target, alert_ec_low, alert_ph_warning, alert_ph_critical,
     alert_moisture_critical, alert_moisture_high, alert_temperature_error,
 )
+
+
+def _interruptible_sleep(pause_event, seconds):
+    """
+    Sleep for up to `seconds`, returning early ONLY if the mode switches to
+    manual (pause_event gets cleared).
+
+    Why this exists: the control loops use `pause_event` as a manual/auto gate.
+    In autonomous mode the event is SET, so `pause_event.wait(timeout=X)` returns
+    INSTANTLY instead of waiting — which made the pump loops spin and fire the
+    pump back-to-back (hitting the 4-per-hour safety cap). This helper actually
+    waits the full duration in autonomous mode. The pump is always OFF during
+    these waits, so waking early on a manual switch is safe.
+    """
+    end = time.time() + seconds
+    while True:
+        remaining = end - time.time()
+        if remaining <= 0:
+            return
+        if not pause_event.is_set():
+            return  # switched to manual — stop waiting; loop-top gate will block
+        time.sleep(min(1.0, remaining))
 
 # ── Fan schedule mode ─────────────────────────────────────────────────────────
 # Renamed from FAN_SCHEDULE_TEST_ENABLED → FAN_SCHEDULE_ENABLED (Step 8).
@@ -29,7 +51,6 @@ FAN_NIGHT_START_HOUR = 20  # 20:00 — fan at reduced night duty
 # These constants are the safety net; the live values come from GH_Setpoints.
 FAN_DAY_DUTY   = 4095            # 100%  (4095 = max on ESP32 PWM)
 FAN_NIGHT_DUTY = int(4095 * 0.25)  # 25%  ≈ 1024
-
 
 def temperature_sp_adjustment_task(
     env_sensors, env_actuators, setpoints,
@@ -147,7 +168,7 @@ def light_sp_adjustment_task(
     KD_LIGHT = 0.1  # Derivative gain
 
     OUTPUT_LIMITS = (0, 4095)
-    SAMPLE_TIME = 0.1
+    SAMPLE_TIME = 1.0
 
     light_pid = PID(
         KP_LIGHT, KI_LIGHT, KD_LIGHT,
@@ -161,6 +182,14 @@ def light_sp_adjustment_task(
 
     while True:
         light_pause_event.wait()
+
+        # Guard: the pump code calls light_pause_event.set() after each pulse to
+        # re-enable the light in auto mode.  If the mode is manual, that call
+        # would wake this thread and let the PID override the user's manual setting.
+        # Checking mode here means any spurious wake-up is ignored in manual mode.
+        if setpoints.get_operation_mode() != 'autonomous':
+            time.sleep(SAMPLE_TIME)
+            continue
 
         light_set_point = setpoints.get_light_setpoint()
         light_pid.setpoint = light_set_point
@@ -225,87 +254,122 @@ def set_soil_moisture_setpoint_task(
       - 3s hard cap on any single pump pulse
     """
     PUMP_DC          = 1800
-    ABSORB_WAIT_SEC  = 7200   # 2 hours after any pump pulse
+    ABSORB_WAIT_SEC  = 10800  # 3 hours
     CHECK_INTERVAL   = 30     # seconds between moisture checks
 
     MOISTURE_MIN_PLAUSIBLE   = 5.0    # below this is a sensor error, not dry soil
     MAX_FAILURES_BEFORE_LOCK = 3   # consecutive bad reads before locking pump
-    MAX_PUMPS_PER_HOUR    = 4      # safety cap on activations per hour
     SENSOR_LOCK_SEC       = 3600   # lock pump for 1 hour after repeated failures
     MAX_PUMP_SEC          = 3      # hard safety cap: pump never runs longer than this
 
+    # ── Manual → Auto settle guard ────────────────────────────────────────────
+    # After a manual→auto switch, observe this many fresh valid reads before the
+    # pump may fire, so it confirms the real current state instead of acting blind.
+    SETTLE_READS_AFTER_SWITCH = 2
+    SETTLE_INTERVAL_SEC       = 30
+
     first_valid_read = False       # pump is blocked until first valid sensor reading
     consecutive_failures = 0
-    pump_activation_times = []    # timestamps of recent pump activations
+    _prev_mode = None              # tracks mode transitions for startup log
+    settle_required = SETTLE_READS_AFTER_SWITCH   # also settle on first auto start
 
-    def _fire_pump(pulse_sec):
-        nonlocal pump_activation_times
-        pulse_sec = min(pulse_sec, MAX_PUMP_SEC)  # hard safety cap
+    def _fire_pump(pulse_sec, reason=''):
+        # Hard safety cap on pulse length — can never exceed MAX_PUMP_SEC.
+        pulse_sec = min(pulse_sec, MAX_PUMP_SEC)
         now = datetime.datetime.now()
-
-        # Remove activations older than 1 hour
-        pump_activation_times = [t for t in pump_activation_times
-                                  if (now - t).total_seconds() < 3600]
-
-        if len(pump_activation_times) >= MAX_PUMPS_PER_HOUR:
-            _CUSTOM_PRINT_FUNC(
-                f"[Soil] SAFETY: pump fired {len(pump_activation_times)} times in the last hour "
-                f"(max={MAX_PUMPS_PER_HOUR}). Skipping activation."
-            )
-            alert_pump_rate_limit("Water Pump", len(pump_activation_times), MAX_PUMPS_PER_HOUR)
-            return False
 
         if light_pause_event is not None:
             light_pause_event.clear()
             time.sleep(0.2)
 
-        _CUSTOM_PRINT_FUNC(
-            f"[Soil] Pump ON — {pulse_sec}s pulse at {now.strftime('%H:%M:%S')}"
-        )
-        env_actuators.set_water_pump_duty_cycle(PUMP_DC)
-        env_actuators.set_mqtt_dc_value_water_pump(PUMP_DC)
-        time.sleep(pulse_sec)
-        # Retry pump OFF — must succeed; I2C failure cannot leave pump running
-        for _att in range(5):
-            if env_actuators.set_water_pump_duty_cycle(0):
-                break
-            _CUSTOM_PRINT_FUNC(f"[Soil] WARNING: pump OFF command failed (attempt {_att+1}/5) — retrying")
-            time.sleep(0.2)
-        env_actuators.set_mqtt_dc_value_water_pump(0)
-        _CUSTOM_PRINT_FUNC(
-            f"[Soil] Pump OFF — finished {pulse_sec}s pulse at "
-            f"{datetime.datetime.now().strftime('%H:%M:%S')}"
-        )
-
-        if light_pause_event is not None:
-            light_pause_event.set()
-
-        pump_activation_times.append(now)
-
+        fired     = False
         flow_rate = 0.0
         try:
-            flow_rate = env_sensors.get_water_flow_rate()
-        except Exception:
-            pass
+            _CUSTOM_PRINT_FUNC(
+                f"[Soil] Pump ON — {pulse_sec}s pulse at {now.strftime('%H:%M:%S')}"
+            )
+            env_actuators.set_water_pump_duty_cycle(PUMP_DC)
+            env_actuators.set_mqtt_dc_value_water_pump(PUMP_DC)
+            fired = True
+            time.sleep(pulse_sec)
 
-        db_handler.insert_pump_log('water', pulse_sec, PUMP_DC, flow_rate)
-        _CUSTOM_PRINT_FUNC(
-            f"[Soil] Waiting {ABSORB_WAIT_SEC}s for water to absorb..."
-        )
-        return True
+            try:
+                flow_rate = env_sensors.get_water_flow_rate()
+            except Exception:
+                pass
+            return True
+        finally:
+            # ── GUARANTEED OFF ──────────────────────────────────────────────
+            # Runs no matter what happened above. The water pump can NEVER be
+            # left running because of a crash, hang, or sensor error mid-pulse.
+            _off_ok = False
+            for _att in range(10):
+                try:
+                    if env_actuators.set_water_pump_duty_cycle(0):
+                        _off_ok = True
+                        break
+                except Exception:
+                    pass
+                _CUSTOM_PRINT_FUNC(f"[Soil] WARNING: pump OFF command failed (attempt {_att+1}/10) — retrying")
+                time.sleep(0.2)
+
+            try:
+                env_actuators.set_mqtt_dc_value_water_pump(0)
+            except Exception:
+                pass
+
+            if _off_ok:
+                _CUSTOM_PRINT_FUNC(
+                    f"[Soil] Pump OFF confirmed at {datetime.datetime.now().strftime('%H:%M:%S')}"
+                )
+            else:
+                _CUSTOM_PRINT_FUNC(
+                    "[Soil] CRITICAL: water pump OFF NOT confirmed after 10 tries — "
+                    "check hardware immediately!"
+                )
+                try:
+                    alert_actuator_failure("Water Pump", "OFF", 10)
+                except Exception:
+                    pass
+
+            if light_pause_event is not None:
+                light_pause_event.set()
+
+            if fired:
+                try:
+                    db_handler.insert_pump_log('water', pulse_sec, PUMP_DC, flow_rate, reason=reason)
+                except Exception:
+                    pass
+                _CUSTOM_PRINT_FUNC(f"[Soil] Waiting {ABSORB_WAIT_SEC}s for water to absorb...")
 
     while True:
         soil_pause_event.wait()
+
+        # Detect transition into autonomous mode — force pumps OFF and require
+        # a settle period (fresh valid reads) before the pump may fire again.
+        current_mode = setpoints.get_operation_mode()
+        if current_mode != _prev_mode:
+            if current_mode == 'autonomous':
+                _CUSTOM_PRINT_FUNC(
+                    "[Water Pump] Auto mode started — pump forced OFF, "
+                    f"waiting for {SETTLE_READS_AFTER_SWITCH} valid sensor read(s) before any action"
+                )
+                env_actuators.set_water_pump_duty_cycle(0)
+                settle_required = SETTLE_READS_AFTER_SWITCH
+            _prev_mode = current_mode
+
+        _CUSTOM_PRINT_FUNC("[Water Pump] Reading sensors before actuator decision...")
 
         soil_semaphore.acquire()
         try:
             _, _, soil_humidity, _ = env_sensors.get_soil_values()
         except Exception as e:
             _CUSTOM_PRINT_FUNC(f"[Soil] ERROR reading sensor (I2C/RS485?): {e} — pump forced OFF.")
+            _CUSTOM_PRINT_FUNC("[Water Pump] Sensor data invalid — pumps blocked")
             alert_sensor_error("Soil Moisture Sensor", None, str(e))
             env_actuators.set_water_pump_duty_cycle(0)
             consecutive_failures += 1
-            soil_pause_event.wait(timeout=CHECK_INTERVAL)
+            _interruptible_sleep(soil_pause_event,CHECK_INTERVAL)
             continue
         finally:
             soil_semaphore.release()
@@ -324,6 +388,7 @@ def set_soil_moisture_setpoint_task(
                 f"treating as sensor failure, NOT dry soil. "
                 f"Consecutive failures: {consecutive_failures}/{MAX_FAILURES_BEFORE_LOCK}."
             )
+            _CUSTOM_PRINT_FUNC("[Water Pump] Sensor data invalid — pumps blocked")
             if consecutive_failures >= MAX_FAILURES_BEFORE_LOCK:
                 _CUSTOM_PRINT_FUNC(
                     f"[Soil] SAFETY LOCK: {consecutive_failures} consecutive bad reads. "
@@ -331,10 +396,10 @@ def set_soil_moisture_setpoint_task(
                 )
                 alert_sensor_lock("Soil Moisture Sensor", SENSOR_LOCK_SEC // 60)
                 env_actuators.set_water_pump_duty_cycle(0)
-                soil_pause_event.wait(timeout=SENSOR_LOCK_SEC)
+                _interruptible_sleep(soil_pause_event,SENSOR_LOCK_SEC)
                 consecutive_failures = 0
             else:
-                soil_pause_event.wait(timeout=CHECK_INTERVAL)
+                _interruptible_sleep(soil_pause_event,CHECK_INTERVAL)
             continue
 
         # Successful read — reset failure counter
@@ -342,6 +407,19 @@ def set_soil_moisture_setpoint_task(
         if not first_valid_read:
             first_valid_read = True
             _CUSTOM_PRINT_FUNC("[Water Pump] First valid moisture read confirmed. Automatic pump control enabled.")
+
+        _CUSTOM_PRINT_FUNC(f"[Water Pump] Sensor data valid — moisture={soil_humidity:.1f}%")
+
+        # ── Settle guard: after a manual→auto switch, observe a few valid reads
+        # before the pump is allowed to fire (confirm the real current state).
+        if settle_required > 0:
+            settle_required -= 1
+            _CUSTOM_PRINT_FUNC(
+                f"[Water Pump] Settling after mode switch — observing sensors "
+                f"(moisture={soil_humidity:.1f}%). {settle_required} more valid read(s) before pump may fire."
+            )
+            _interruptible_sleep(soil_pause_event, SETTLE_INTERVAL_SEC)
+            continue
 
         # ── Read live setpoints every cycle ───────────────────────────────────
         # setpoints object is updated in-memory the moment AI Advisor Confirm runs,
@@ -368,12 +446,13 @@ def set_soil_moisture_setpoint_task(
             alert_moisture_high(soil_humidity)
 
         # ── Pump decision based on dynamic bands ───────────────────────────────
+        _CUSTOM_PRINT_FUNC("[Water Pump] Water pump condition checked — evaluating moisture bands...")
         if soil_humidity >= band_ok:
             _CUSTOM_PRINT_FUNC(
                 f"[Water Pump] Decision=OFF  "
                 f"moisture {soil_humidity:.1f}% >= target {band_ok:.1f}%"
             )
-            soil_pause_event.wait(timeout=CHECK_INTERVAL)
+            _interruptible_sleep(soil_pause_event,CHECK_INTERVAL)
 
         elif soil_humidity >= band_acceptable:
             _CUSTOM_PRINT_FUNC(
@@ -381,27 +460,27 @@ def set_soil_moisture_setpoint_task(
                 f"moisture {soil_humidity:.1f}% in acceptable band "
                 f"{band_acceptable:.1f}–{band_ok:.1f}%"
             )
-            soil_pause_event.wait(timeout=CHECK_INTERVAL)
+            _interruptible_sleep(soil_pause_event,CHECK_INTERVAL)
 
         elif soil_humidity >= band_1s:
             _CUSTOM_PRINT_FUNC(
                 f"[Water Pump] Decision=1s pulse  "
                 f"moisture {soil_humidity:.1f}% in band {band_1s:.1f}–{band_acceptable:.1f}%"
             )
-            if _fire_pump(1):
-                soil_pause_event.wait(timeout=ABSORB_WAIT_SEC)
+            if _fire_pump(1, reason=f"Moisture {soil_humidity:.1f}% low — 1 s pulse"):
+                _interruptible_sleep(soil_pause_event,ABSORB_WAIT_SEC)
             else:
-                soil_pause_event.wait(timeout=CHECK_INTERVAL)
+                _interruptible_sleep(soil_pause_event,CHECK_INTERVAL)
 
         elif soil_humidity >= band_1_5s:
             _CUSTOM_PRINT_FUNC(
                 f"[Water Pump] Decision=1.5s pulse  "
                 f"moisture {soil_humidity:.1f}% in band {band_1_5s:.1f}–{band_1s:.1f}%"
             )
-            if _fire_pump(1.5):
-                soil_pause_event.wait(timeout=ABSORB_WAIT_SEC)
+            if _fire_pump(1.5, reason=f"Moisture {soil_humidity:.1f}% very low — 1.5 s pulse"):
+                _interruptible_sleep(soil_pause_event,ABSORB_WAIT_SEC)
             else:
-                soil_pause_event.wait(timeout=CHECK_INTERVAL)
+                _interruptible_sleep(soil_pause_event,CHECK_INTERVAL)
 
         else:
             _CUSTOM_PRINT_FUNC(
@@ -409,10 +488,10 @@ def set_soil_moisture_setpoint_task(
                 f"moisture {soil_humidity:.1f}% < {band_1_5s:.1f}%"
             )
             alert_moisture_critical(soil_humidity)
-            if _fire_pump(2):
-                soil_pause_event.wait(timeout=ABSORB_WAIT_SEC)
+            if _fire_pump(2, reason=f"Moisture {soil_humidity:.1f}% critically low — 2 s pulse"):
+                _interruptible_sleep(soil_pause_event,ABSORB_WAIT_SEC)
             else:
-                soil_pause_event.wait(timeout=CHECK_INTERVAL)
+                _interruptible_sleep(soil_pause_event,CHECK_INTERVAL)
 
 
 def fertilizer_pump_control_task(
@@ -444,7 +523,7 @@ def fertilizer_pump_control_task(
     FERT_DC         = 2662   # fertilizer pump duty cycle (~65%)
     WATER_DC        = 1800
     WATER_PULSE_SEC = 1
-    SETTLE_WAIT_SEC = 14400  # 4 hours after any fertilizer pulse
+    SETTLE_WAIT_SEC = 18000  # 5 hours
     CHECK_INTERVAL  = 3600
 
     # ── Absolute safety limits (never relative to setpoint) ───────────────────
@@ -465,12 +544,19 @@ def fertilizer_pump_control_task(
 
     MAX_FAILURES_BEFORE_LOCK = 3
     SENSOR_LOCK_SEC          = 3600
-    MAX_PUMPS_PER_HOUR       = 3
     MAX_PULSE_SEC            = 2   # hard safety cap on fertilizer pump pulse length
+
+    # ── Manual → Auto settle guard ────────────────────────────────────────────
+    # When the operator switches from MANUAL to AUTONOMOUS, the pump must NOT
+    # fire on the very first cycle. It first observes this many fresh, VALID
+    # sensor reads to confirm the real current state before it is allowed to act.
+    SETTLE_READS_AFTER_SWITCH = 2
+    SETTLE_INTERVAL_SEC       = 30
 
     first_valid_read = False       # pump blocked until first valid EC reading
     consecutive_failures  = 0
-    pump_activation_times = []
+    _prev_mode = None              # tracks mode transitions for startup log
+    settle_required = SETTLE_READS_AFTER_SWITCH   # also settle on first auto start
 
     def _alert(msg):
         _CUSTOM_PRINT_FUNC(f"[Fertilizer] ALERT: {msg}")
@@ -479,82 +565,125 @@ def fertilizer_pump_control_task(
         if light_pause_event is not None:
             light_pause_event.clear()
             time.sleep(0.2)
-        _CUSTOM_PRINT_FUNC(f"[Fertilizer] Water pump ON — dilution pulse {WATER_PULSE_SEC}s")
-        env_actuators.set_water_pump_duty_cycle(WATER_DC)
-        time.sleep(WATER_PULSE_SEC)
-        env_actuators.set_water_pump_duty_cycle(0)
-        _CUSTOM_PRINT_FUNC("[Fertilizer] Water pump OFF — dilution done.")
-        if light_pause_event is not None:
-            light_pause_event.set()
+        try:
+            _CUSTOM_PRINT_FUNC(f"[Fertilizer] Water pump ON — dilution pulse {WATER_PULSE_SEC}s")
+            env_actuators.set_water_pump_duty_cycle(WATER_DC)
+            time.sleep(WATER_PULSE_SEC)
+        finally:
+            # GUARANTEED OFF — the dilution water pump can never be left running.
+            _off_ok = False
+            for _att in range(10):
+                try:
+                    if env_actuators.set_water_pump_duty_cycle(0):
+                        _off_ok = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.2)
+            if _off_ok:
+                _CUSTOM_PRINT_FUNC("[Fertilizer] Water pump OFF — dilution done.")
+            else:
+                _CUSTOM_PRINT_FUNC("[Fertilizer] CRITICAL: dilution water pump OFF NOT confirmed — check hardware!")
+            if light_pause_event is not None:
+                light_pause_event.set()
 
-    def _fire_fertilizer(pulse_sec):
-        nonlocal pump_activation_times
-        pulse_sec = min(pulse_sec, MAX_PULSE_SEC)  # hard safety cap
+    def _fire_fertilizer(pulse_sec, reason=''):
+        # Hard safety cap on pulse length — can never exceed MAX_PULSE_SEC.
+        pulse_sec = min(pulse_sec, MAX_PULSE_SEC)
         now = datetime.datetime.now()
-
-        # Remove activations older than 1 hour
-        pump_activation_times = [t for t in pump_activation_times
-                                  if (now - t).total_seconds() < 3600]
-
-        if len(pump_activation_times) >= MAX_PUMPS_PER_HOUR:
-            _CUSTOM_PRINT_FUNC(
-                f"[Fertilizer] SAFETY: pump fired {len(pump_activation_times)}x in last hour "
-                f"(max={MAX_PUMPS_PER_HOUR}). Skipping activation."
-            )
-            alert_pump_rate_limit("Fertilizer Pump", len(pump_activation_times), MAX_PUMPS_PER_HOUR)
-            return False
 
         if light_pause_event is not None:
             light_pause_event.clear()
             time.sleep(0.2)
 
-        _CUSTOM_PRINT_FUNC(
-            f"[Fertilizer] Pump ON — {pulse_sec}s pulse at {now.strftime('%H:%M:%S')}"
-        )
-        pump_on_ok = False
-        for _att in range(10):
-            if env_actuators.set_fertilizer_pump_duty_cycle(FERT_DC):
-                pump_on_ok = True
-                break
-            _CUSTOM_PRINT_FUNC(f"[Fertilizer] WARNING: pump ON failed (attempt {_att+1}/10)")
-            time.sleep(0.1)
-        if not pump_on_ok:
-            _CUSTOM_PRINT_FUNC("[Fertilizer] ERROR: Could not turn ON fertilizer pump — aborting pulse.")
-            alert_actuator_failure("Fertilizer Pump", "ON", 10)
-            env_actuators.set_fertilizer_pump_duty_cycle(0)
-            if light_pause_event is not None:
-                light_pause_event.set()
-            return False
-        time.sleep(pulse_sec)
-
+        fired          = False
         fert_flow_rate = 0.0
         try:
-            fert_flow_rate = env_sensors.get_fertilizer_flow_rate()
-        except Exception:
-            pass
+            _CUSTOM_PRINT_FUNC(
+                f"[Fertilizer] Pump ON — {pulse_sec}s pulse at {now.strftime('%H:%M:%S')}"
+            )
+            pump_on_ok = False
+            for _att in range(10):
+                if env_actuators.set_fertilizer_pump_duty_cycle(FERT_DC):
+                    pump_on_ok = True
+                    break
+                _CUSTOM_PRINT_FUNC(f"[Fertilizer] WARNING: pump ON failed (attempt {_att+1}/10)")
+                time.sleep(0.1)
+            if not pump_on_ok:
+                _CUSTOM_PRINT_FUNC("[Fertilizer] ERROR: Could not turn ON fertilizer pump — aborting pulse.")
+                alert_actuator_failure("Fertilizer Pump", "ON", 10)
+                return False
 
-        # Retry pump OFF — must succeed; I2C failure cannot leave pump running
-        for _att in range(10):
-            if env_actuators.set_fertilizer_pump_duty_cycle(0):
-                break
-            _CUSTOM_PRINT_FUNC(f"[Fertilizer] WARNING: pump OFF failed (attempt {_att+1}/10) — retrying")
-            time.sleep(0.1)
+            fired = True
+            time.sleep(pulse_sec)
 
-        _CUSTOM_PRINT_FUNC(
-            f"[Fertilizer] Pump OFF — finished {pulse_sec}s at "
-            f"{datetime.datetime.now().strftime('%H:%M:%S')}. "
-            f"Cooldown {SETTLE_WAIT_SEC}s."
-        )
+            try:
+                fert_flow_rate = env_sensors.get_fertilizer_flow_rate()
+            except Exception:
+                pass
+            return True
+        finally:
+            # ── GUARANTEED OFF ──────────────────────────────────────────────
+            # This runs no matter what happened above (normal return, early
+            # return, or an exception mid-pulse). The fertilizer pump can NEVER
+            # be left running because of a crash, hang, or sensor error.
+            _off_ok = False
+            for _att in range(10):
+                try:
+                    if env_actuators.set_fertilizer_pump_duty_cycle(0):
+                        _off_ok = True
+                        break
+                except Exception:
+                    pass
+                _CUSTOM_PRINT_FUNC(f"[Fertilizer] WARNING: pump OFF failed (attempt {_att+1}/10) — retrying")
+                time.sleep(0.1)
 
-        if light_pause_event is not None:
-            light_pause_event.set()
+            try:
+                env_actuators.set_mqtt_dc_value_fertilizer_pump(0)
+            except Exception:
+                pass
 
-        pump_activation_times.append(now)
-        db_handler.insert_pump_log('fertilizer', pulse_sec, FERT_DC, fert_flow_rate)
-        return True
+            if _off_ok:
+                _CUSTOM_PRINT_FUNC(
+                    f"[Fertilizer] Pump OFF confirmed at "
+                    f"{datetime.datetime.now().strftime('%H:%M:%S')}."
+                )
+            else:
+                _CUSTOM_PRINT_FUNC(
+                    "[Fertilizer] CRITICAL: pump OFF NOT confirmed after 10 tries — "
+                    "check hardware immediately!"
+                )
+                try:
+                    alert_actuator_failure("Fertilizer Pump", "OFF", 10)
+                except Exception:
+                    pass
+
+            if light_pause_event is not None:
+                light_pause_event.set()
+
+            if fired:
+                try:
+                    db_handler.insert_pump_log('fertilizer', pulse_sec, FERT_DC, fert_flow_rate, reason=reason)
+                except Exception:
+                    pass
 
     while True:
         fertilizer_pause_event.wait()
+
+        # Detect transition into autonomous mode — force pumps OFF and require
+        # a settle period (fresh valid reads) before the pump may fire again.
+        current_mode = setpoints.get_operation_mode()
+        if current_mode != _prev_mode:
+            if current_mode == 'autonomous':
+                _CUSTOM_PRINT_FUNC(
+                    "[Fertilizer Pump] Auto mode started — pump forced OFF, "
+                    f"waiting for {SETTLE_READS_AFTER_SWITCH} valid sensor read(s) before any action"
+                )
+                env_actuators.set_fertilizer_pump_duty_cycle(0)
+                settle_required = SETTLE_READS_AFTER_SWITCH
+            _prev_mode = current_mode
+
+        _CUSTOM_PRINT_FUNC("[Fertilizer Pump] Reading sensors before actuator decision...")
 
         # ── Read sensors ───────────────────────────────────────────────────────
         soil_semaphore.acquire()
@@ -562,10 +691,11 @@ def fertilizer_pump_control_task(
             soil_ph, soil_ec, _, _ = env_sensors.get_soil_values()
         except Exception as e:
             _CUSTOM_PRINT_FUNC(f"[Fertilizer] ERROR reading sensor: {e} — pump disabled this cycle.")
+            _CUSTOM_PRINT_FUNC("[Fertilizer Pump] Sensor data invalid — pumps blocked")
             alert_sensor_error("EC/pH Sensor", None, str(e))
             env_actuators.set_fertilizer_pump_duty_cycle(0)
             consecutive_failures += 1
-            fertilizer_pause_event.wait(timeout=CHECK_INTERVAL)
+            _interruptible_sleep(fertilizer_pause_event,CHECK_INTERVAL)
             continue
         finally:
             soil_semaphore.release()
@@ -580,6 +710,7 @@ def fertilizer_pump_control_task(
                 f"Fertilizer pump disabled. "
                 f"Consecutive failures: {consecutive_failures}/{MAX_FAILURES_BEFORE_LOCK}"
             )
+            _CUSTOM_PRINT_FUNC("[Fertilizer Pump] Sensor data invalid — pumps blocked")
             env_actuators.set_fertilizer_pump_duty_cycle(0)
             if consecutive_failures >= MAX_FAILURES_BEFORE_LOCK:
                 _CUSTOM_PRINT_FUNC(
@@ -587,10 +718,10 @@ def fertilizer_pump_control_task(
                     f"Pump disabled for {SENSOR_LOCK_SEC}s."
                 )
                 alert_sensor_lock("EC/pH Sensor", SENSOR_LOCK_SEC // 60)
-                fertilizer_pause_event.wait(timeout=SENSOR_LOCK_SEC)
+                _interruptible_sleep(fertilizer_pause_event,SENSOR_LOCK_SEC)
                 consecutive_failures = 0
             else:
-                fertilizer_pause_event.wait(timeout=CHECK_INTERVAL)
+                _interruptible_sleep(fertilizer_pause_event,CHECK_INTERVAL)
             continue
 
         ec_valid = EC_MIN_VALID <= soil_ec <= EC_MAX_VALID
@@ -603,16 +734,17 @@ def fertilizer_pump_control_task(
                 f"{EC_MIN_VALID}–{EC_MAX_VALID}). Fertilizer pump disabled. "
                 f"Consecutive failures: {consecutive_failures}/{MAX_FAILURES_BEFORE_LOCK}"
             )
+            _CUSTOM_PRINT_FUNC("[Fertilizer Pump] Sensor data invalid — pumps blocked")
             env_actuators.set_fertilizer_pump_duty_cycle(0)
             if consecutive_failures >= MAX_FAILURES_BEFORE_LOCK:
                 _CUSTOM_PRINT_FUNC(
                     f"[Fertilizer] SAFETY LOCK: {consecutive_failures} bad EC reads. "
                     f"Pump disabled for {SENSOR_LOCK_SEC}s."
                 )
-                fertilizer_pause_event.wait(timeout=SENSOR_LOCK_SEC)
+                _interruptible_sleep(fertilizer_pause_event,SENSOR_LOCK_SEC)
                 consecutive_failures = 0
             else:
-                fertilizer_pause_event.wait(timeout=CHECK_INTERVAL)
+                _interruptible_sleep(fertilizer_pause_event,CHECK_INTERVAL)
             continue
 
         if not ph_valid:
@@ -625,6 +757,19 @@ def fertilizer_pump_control_task(
         if not first_valid_read:
             first_valid_read = True
             _CUSTOM_PRINT_FUNC("[Fertilizer Pump] First valid EC/pH read confirmed. Automatic fertilizer control enabled.")
+
+        _CUSTOM_PRINT_FUNC(f"[Fertilizer Pump] Sensor data valid — EC={soil_ec:.1f} µS/cm  pH={soil_ph:.2f}")
+
+        # ── Settle guard: after a manual→auto switch, observe a few valid reads
+        # before the pump is allowed to fire (confirm the real current state).
+        if settle_required > 0:
+            settle_required -= 1
+            _CUSTOM_PRINT_FUNC(
+                f"[Fertilizer Pump] Settling after mode switch — observing sensors "
+                f"(EC={soil_ec:.1f} µS/cm). {settle_required} more valid read(s) before pump may fire."
+            )
+            _interruptible_sleep(fertilizer_pause_event, SETTLE_INTERVAL_SEC)
+            continue
 
         # ── Read live EC setpoint every cycle ─────────────────────────────────
         # setpoints object is updated in-memory when AI Advisor Confirm runs,
@@ -663,6 +808,9 @@ def fertilizer_pump_control_task(
         if soil_ec < EC_LOW_ALERT:
             alert_ec_low(soil_ec)
 
+        # ── EC decision chain ─────────────────────────────────────────────────
+        _CUSTOM_PRINT_FUNC("[Fertilizer Pump] Fertilizer pump condition checked — evaluating EC bands...")
+
         # ── 1. EC DANGER (absolute >= 2000 — root burn risk) ──────────────────
         if soil_ec >= EC_DANGER:
             env_actuators.set_fertilizer_pump_duty_cycle(0)
@@ -672,7 +820,7 @@ def fertilizer_pump_control_task(
             )
             alert_dangerous_ec(soil_ec)
             _dilute_with_water()
-            fertilizer_pause_event.wait(timeout=CHECK_INTERVAL)
+            _interruptible_sleep(fertilizer_pause_event,CHECK_INTERVAL)
             continue
 
         # ── 2. EC too high (absolute >= 1600) ─────────────────────────────────
@@ -683,7 +831,7 @@ def fertilizer_pump_control_task(
                 f"EC={soil_ec:.1f} too high (>= {EC_HIGH:.0f}). Pump OFF."
             )
             alert_ec_high(soil_ec)
-            fertilizer_pause_event.wait(timeout=CHECK_INTERVAL)
+            _interruptible_sleep(fertilizer_pause_event,CHECK_INTERVAL)
             continue
 
         # ── 3. EC above safe range (absolute > 1000) ──────────────────────────
@@ -694,7 +842,7 @@ def fertilizer_pump_control_task(
                 f"EC={soil_ec:.1f} > {EC_ABOVE_WARN:.0f} — above safe range. Pump OFF."
             )
             alert_ec_above_target(soil_ec)
-            fertilizer_pause_event.wait(timeout=CHECK_INTERVAL)
+            _interruptible_sleep(fertilizer_pause_event,CHECK_INTERVAL)
             continue
 
         # ── 4. EC at or above live target — pump OFF, no alert ────────────────
@@ -704,7 +852,7 @@ def fertilizer_pump_control_task(
                 f"[Fertilizer Pump] Decision=OFF  "
                 f"EC={soil_ec:.1f} >= target {ec_target:.0f}."
             )
-            fertilizer_pause_event.wait(timeout=CHECK_INTERVAL)
+            _interruptible_sleep(fertilizer_pause_event,CHECK_INTERVAL)
             continue
 
         # ── 5. EC acceptable (target-200 to target) — pump OFF, no alert ──────
@@ -714,7 +862,7 @@ def fertilizer_pump_control_task(
                 f"[Fertilizer Pump] Decision=OFF  "
                 f"EC={soil_ec:.1f} in acceptable band {ec_close:.0f}–{ec_target:.0f}."
             )
-            fertilizer_pause_event.wait(timeout=CHECK_INTERVAL)
+            _interruptible_sleep(fertilizer_pause_event,CHECK_INTERVAL)
             continue
 
         # ── 6. EC low (target-400 to target-200) → 1s pulse ──────────────────
@@ -723,10 +871,10 @@ def fertilizer_pump_control_task(
                 f"[Fertilizer Pump] Decision=1s pulse  "
                 f"EC={soil_ec:.1f} in band {ec_pulse_1s:.0f}–{ec_close:.0f}."
             )
-            if _fire_fertilizer(1):
-                fertilizer_pause_event.wait(timeout=SETTLE_WAIT_SEC)
+            if _fire_fertilizer(1, reason=f"EC {soil_ec:.0f} µS/cm low — 1 s pulse"):
+                _interruptible_sleep(fertilizer_pause_event,SETTLE_WAIT_SEC)
             else:
-                fertilizer_pause_event.wait(timeout=CHECK_INTERVAL)
+                _interruptible_sleep(fertilizer_pause_event,CHECK_INTERVAL)
             continue
 
         # ── 7. EC very low (< target-400) → 1.5s pulse ───────────────────────
@@ -734,10 +882,10 @@ def fertilizer_pump_control_task(
             f"[Fertilizer Pump] Decision=1.5s pulse  "
             f"EC={soil_ec:.1f} very low (< {ec_pulse_1s:.0f})."
         )
-        if _fire_fertilizer(1.5):
-            fertilizer_pause_event.wait(timeout=SETTLE_WAIT_SEC)
+        if _fire_fertilizer(1.5, reason=f"EC {soil_ec:.0f} µS/cm very low — 1.5 s pulse"):
+            _interruptible_sleep(fertilizer_pause_event,SETTLE_WAIT_SEC)
         else:
-            fertilizer_pause_event.wait(timeout=CHECK_INTERVAL)
+            _interruptible_sleep(fertilizer_pause_event,CHECK_INTERVAL)
 
 
 def fan_schedule_task(env_actuators, setpoints, check_interval_sec=60):

@@ -1,23 +1,22 @@
 """
-layer3_budget_manager.py — Layer 3 Resource / Budget Manager for PlantMind AI.
+layer3_budget_manager.py — Layer 3 Budget Manager for PlantMind AI.
 
-Layer 3 reviews Layer 2 recommendations and checks them against three gates:
-  1. Sensor Safety Gate  — live sensor values vs. hard-coded safety floors
-  2. Plant Health Gate   — plant_stability_score and growth_assessment from Layer 2
-  3. Budget Gate         — today's costs (Step 1 daily baseline) vs. budget_config
+Layer 3 is the budget governance layer only.
+It evaluates resource costs vs. configured budgets and proposes
+cost-saving setpoint modifications when spending is too high.
 
-Final decisions:
-  APPROVE    — Safe and affordable.  Apply Layer 2 as-is after user approval.
-  MODIFY     — Safe but expensive.   Apply modified version after user approval.
-  BLOCK      — Unsafe.               Do NOT apply.  Approve button disabled in frontend.
-  ALERT_ONLY — No changes.           Only warn the user.
+Layer 3 does NOT check plant health   — Layer 2 already does this.
+Layer 3 does NOT check sensor safety  — Layer 1 handles real-time safety.
+
+Decisions:
+  APPROVE    — All costs within budget. Apply Layer 2 recommendation as-is.
+  MODIFY     — One or more costs near / over budget. Propose cost reductions.
+  ALERT_ONLY — Budget pressure detected but no safe modifications available.
+  BLOCK      — Layer 2 recommendation is missing, invalid, or too stale to act on.
 
 Layer 3 NEVER fires actuators directly.
 Layer 3 NEVER changes pump power or pulse durations.
-Layer 3 NEVER stops live sensor readings.
 All changes require explicit user approval via the frontend.
-
-Approved changes are applied in a later step (Step 5+) via GH_Setpoints setters.
 """
 
 import datetime
@@ -33,7 +32,6 @@ try:
         FERTILIZER_PRICE_PER_5_LITERS_NIS,
     )
 except ImportError:
-    # Safe fallback values if config.py is unavailable (e.g. in isolated tests)
     WATER_PRICE_PER_LITER_NIS         = 0.00851
     ELECTRICITY_PRICE_PER_KWH_NIS     = 0.6432
     FERTILIZER_PRICE_PER_5_LITERS_NIS = 1.0
@@ -63,14 +61,8 @@ DECISION_MODIFY     = "MODIFY"
 DECISION_BLOCK      = "BLOCK"
 DECISION_ALERT_ONLY = "ALERT_ONLY"
 
-# ── Gate status constants ─────────────────────────────────────────────────────
+# ── Budget status constants ───────────────────────────────────────────────────
 
-GATE_PASS     = "pass"
-GATE_WARN     = "warn"
-GATE_FAIL     = "fail"
-GATE_MARGINAL = "marginal"
-
-# Budget sub-statuses
 BUDGET_OK          = "ok"
 BUDGET_WARNING     = "warning"
 BUDGET_OVER_BUDGET = "over_budget"
@@ -78,46 +70,22 @@ BUDGET_OVER_BUDGET = "over_budget"
 # ── Decision document status constants ───────────────────────────────────────
 
 STATUS_PENDING    = "pending_approval"   # APPROVE or MODIFY — user can act
-STATUS_APPROVED   = "approved"           # set later when user confirms
-STATUS_REJECTED   = "rejected"           # set later when user rejects
+STATUS_APPROVED   = "approved"           # set when user confirms
+STATUS_REJECTED   = "rejected"           # set when user rejects
 STATUS_CANCELLED  = "cancelled"          # replaced by a newer cycle
 STATUS_BLOCKED    = "blocked"            # BLOCK — approve button disabled
 STATUS_ALERT_ONLY = "alert_only"         # ALERT_ONLY — informational only
 
-# ── Hard-coded sensor safety floors ──────────────────────────────────────────
-# Python constants — NOT stored in DB.
-# Budget logic can NEVER override these.  They mirror Layer 1 thresholds.
-#
-# Reference (control_loops.py):
-#   MOISTURE_MIN_PLAUSIBLE = 5.0    (sensor-error floor, not safety floor)
-#   EC_DANGER              = 2000.0 (root burn — absolute)
-#   PH_CRITICAL_LOW        = 4.8    (critical alert)
-#   PH_LOW_WARN            = 5.2    (warning alert)
-#   PH_HIGH_WARN           = 7.5    (warning alert)
-#
-# Layer 3 uses slightly wider margins so it catches problems before Layer 1 alerts fire.
-
-SAFETY_FLOOR_SOIL_MOISTURE_MIN = 20.0    # % — below this → BLOCK (dangerously dry)
-SAFETY_FLOOR_EC_MAX            = 2500.0  # µS/cm — above this → BLOCK (root burn margin)
-SAFETY_FLOOR_PH_MIN            = 4.5    # — below this → BLOCK (below Layer 1 critical)
-SAFETY_FLOOR_PH_MAX            = 8.0    # — above this → BLOCK
-SAFETY_FLOOR_AIR_TEMP_MAX      = 35.0   # °C — above this → BLOCK
-
-# ── Plant Health Gate thresholds ──────────────────────────────────────────────
-
-HEALTH_SCORE_STABLE_MIN   = 0.70  # stability_score >= 0.7 → PASS (budget gate runs)
-HEALTH_SCORE_MARGINAL_MIN = 0.40  # stability_score >= 0.4 → MARGINAL (no MODIFY)
-#                                   stability_score <  0.4 → FAIL → BLOCK
-
-LAYER2_MAX_AGE_HOURS = 48   # Layer 2 data older than this is too stale to act on
-
 # ── Modification safety floors ────────────────────────────────────────────────
 # Layer 3 never proposes values outside these bounds.
 
-MOISTURE_SETPOINT_FLOOR = 35.0          # % — minimum allowed soil moisture target
-LED_POWER_MIN_PCT       = 40            # % — never propose LED below 40% of current setpoint
-FAN_DAY_DUTY_MIN        = int(4095 * 0.60)   # 60% of max
-FAN_NIGHT_DUTY_MIN      = int(4095 * 0.15)   # 15% of max
+MOISTURE_SETPOINT_FLOOR = 35.0         # % — minimum allowed soil moisture target
+LED_POWER_MIN_PCT       = 40           # % — never propose LED below 40% of current
+FAN_NIGHT_DUTY_MIN      = int(4095 * 0.15)  # 15% of max PWM
+
+# ── Layer 2 staleness limit ───────────────────────────────────────────────────
+
+LAYER2_MAX_AGE_HOURS = 48   # Layer 2 data older than this → BLOCK (run Layer 2 again)
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -128,69 +96,12 @@ def _doc_age_hours(doc: dict) -> float | None:
         ts = doc.get(field)
         if ts is not None:
             try:
-                if hasattr(ts, 'timestamp'):   # datetime object
+                if hasattr(ts, 'timestamp'):
                     delta = (datetime.datetime.now() - ts).total_seconds()
                     return round(delta / 3600, 1)
             except Exception:
                 pass
     return None
-
-
-def _get_sensor_snapshot() -> dict:
-    """
-    Return live sensor values as a normalised dict.
-
-    Strategy:
-      1. Try app_loop._sensor_cache — always fresh (updated every 5 s) when app is running.
-         Importing app_loop has no side effects; no threads start on import.
-      2. Fallback: query MongoDB sensors_data for the latest reading of each sensor.
-         Used when Layer 3 is called from a test script or before the sensor loop starts.
-
-    Returns a dict with keys:
-      soil_moisture, soil_ec, soil_ph, air_temperature, air_humidity, soil_temperature
-      source: 'sensor_cache' | 'mongodb' | 'unavailable'
-    """
-    # ── Try app_loop sensor cache ──────────────────────────────────────────
-    try:
-        import app_loop
-        with app_loop._sensor_cache_lock:
-            cache = dict(app_loop._sensor_cache)
-        if cache and cache.get('soil_humidity') is not None:
-            return {
-                'soil_moisture':    cache.get('soil_humidity'),
-                'soil_ec':          cache.get('soil_ec'),
-                'soil_ph':          cache.get('soil_ph'),
-                'air_temperature':  cache.get('air_temperature'),
-                'air_humidity':     cache.get('air_humidity'),
-                'soil_temperature': cache.get('soil_temperature'),
-                'source':           'sensor_cache',
-            }
-    except Exception as e:
-        _CUSTOM_PRINT_FUNC(f"[Layer3] sensor_cache unavailable ({e}) — falling back to MongoDB")
-
-    # ── Fallback: MongoDB latest readings ──────────────────────────────────
-    if _mongo_db is None:
-        return {'source': 'unavailable'}
-
-    # Sensor IDs match what app.py registers via create_collection()
-    # (confirmed from ai_setpoint_advisor.py get_sensor_stats calls)
-    sensor_id_map = {
-        'air_temperature':  'dht22.temperature',
-        'air_humidity':     'dht22.humidity',
-        'soil_ph':          'soil_ph',
-        'soil_ec':          'soil_ec',
-        'soil_moisture':    'soil_humidity',
-        'soil_temperature': 'soil_temp',
-    }
-    snapshot = {'source': 'mongodb'}
-    for field, sid in sensor_id_map.items():
-        try:
-            doc = _mongo_db.get_latest_doc_where('sensors_data', {'sensor_id': sid})
-            if doc:
-                snapshot[field] = doc.get('sensor_value')
-        except Exception:
-            pass
-    return snapshot
 
 
 def _get_latest_layer2_doc() -> dict | None:
@@ -204,198 +115,31 @@ def _get_latest_layer2_doc() -> dict | None:
         return None
 
 
-# ── Gate 1: Sensor Safety Gate ────────────────────────────────────────────────
-
-def _run_sensor_safety_gate(sensor_snapshot: dict) -> dict:
-    """
-    Gate 1 — Sensor Safety Gate.
-
-    Checks live sensor values against hard-coded SAFETY_FLOOR_* constants.
-    This gate always runs FIRST. Budget logic never runs if this gate fails.
-
-    Thresholds are conservative extensions of the Layer 1 alert values:
-      soil_moisture < 20%        → FAIL  (dangerously dry, pump emergency imminent)
-      soil_ec       > 2500 µS/cm → FAIL  (above EC_DANGER=2000 in Layer 1)
-      soil_ph       < 4.5        → FAIL  (below PH_CRITICAL_LOW=4.8 in Layer 1)
-      soil_ph       > 8.0        → FAIL
-      air_temp      > 35°C       → FAIL  (heat stress threshold)
-      soil_moisture or soil_ec missing → FAIL (cannot make safe decisions without them)
-
-    Air humidity and soil temperature are checked but their absence is not a hard block.
-
-    Returns:
-      {"status": "pass"|"fail", "reason": str, "failed_sensors": list}
-    """
-    # No data at all
-    if not sensor_snapshot or sensor_snapshot.get('source') == 'unavailable':
-        return {
-            "status":         GATE_FAIL,
-            "reason":         "No sensor data available — cannot verify plant safety.",
-            "failed_sensors": [{"sensor": "all", "value": None, "issue": "no data source"}],
-        }
-
-    source  = sensor_snapshot.get('source', 'unknown')
-    failed  = []
-
-    def _check(field, label, low=None, high=None, critical=False):
-        val = sensor_snapshot.get(field)
-        if val is None:
-            if critical:
-                failed.append({"sensor": label, "value": None, "issue": "missing — required for safety check"})
-            return
-        try:
-            v = float(val)
-        except (TypeError, ValueError):
-            failed.append({"sensor": label, "value": val, "issue": "not a numeric value"})
-            return
-        if low  is not None and v < low:
-            failed.append({"sensor": label, "value": round(v, 2),
-                           "issue": f"{v:.2f} below safety floor {low}"})
-        if high is not None and v > high:
-            failed.append({"sensor": label, "value": round(v, 2),
-                           "issue": f"{v:.2f} above safety ceiling {high}"})
-
-    _check('soil_moisture',   "Soil Moisture",   low=SAFETY_FLOOR_SOIL_MOISTURE_MIN,
-           critical=True)
-    _check('soil_ec',         "Soil EC",          high=SAFETY_FLOOR_EC_MAX,
-           critical=True)
-    _check('soil_ph',         "Soil pH",          low=SAFETY_FLOOR_PH_MIN,
-           high=SAFETY_FLOOR_PH_MAX)
-    _check('air_temperature', "Air Temperature",  high=SAFETY_FLOOR_AIR_TEMP_MAX)
-    # air_humidity and soil_temperature are informational — not a hard block if missing
-
-    if failed:
-        reasons = "; ".join(f"{f['sensor']}: {f['issue']}" for f in failed)
-        return {
-            "status":         GATE_FAIL,
-            "reason":         f"Sensor safety check failed — {reasons}",
-            "failed_sensors": failed,
-        }
-
-    return {
-        "status":         GATE_PASS,
-        "reason":         f"All sensors within safe ranges (source={source})",
-        "failed_sensors": [],
-    }
 
 
-# ── Gate 2: Plant Health Gate ─────────────────────────────────────────────────
-
-def _run_plant_health_gate(layer2_doc: dict | None) -> dict:
-    """
-    Gate 2 — Plant Health Gate.
-
-    Reads plant_stability_score, growth_assessment, and data age from the
-    latest Layer 2 recommendation document.
-
-    Scoring rules:
-      No Layer 2 doc                            → FAIL
-      Data age > LAYER2_MAX_AGE_HOURS (48h)     → FAIL (too stale)
-      plant_stability_score < 0.40              → FAIL (poor condition)
-      plant_stability_score in [0.40, 0.70)     → MARGINAL (no MODIFY allowed)
-      plant_stability_score >= 0.70             → PASS
-      growth_assessment == 'declining'          → demote one level:
-                                                   PASS → MARGINAL
-                                                   MARGINAL → FAIL
-      growth_assessment == 'stagnating'         → demote only if already MARGINAL → FAIL
-
-    Returns:
-      {"status": "pass"|"marginal"|"fail", "reason": str,
-       "stability_score": float|None, "growth_trend": str|None, "data_age_hours": float|None}
-    """
-    if layer2_doc is None:
-        return {
-            "status":          GATE_FAIL,
-            "reason":          "No Layer 2 recommendation found — cannot assess plant health.",
-            "stability_score": None,
-            "growth_trend":    None,
-            "data_age_hours":  None,
-        }
-
-    age_h  = _doc_age_hours(layer2_doc)
-    growth = layer2_doc.get('growth_assessment', 'insufficient_data')
-    score  = layer2_doc.get('plant_stability_score')
-
-    # Stale data check
-    if age_h is not None and age_h > LAYER2_MAX_AGE_HOURS:
-        return {
-            "status":          GATE_FAIL,
-            "reason":          (f"Layer 2 data is {age_h:.1f}h old (limit: {LAYER2_MAX_AGE_HOURS}h). "
-                                "Run AI Advisor again to get fresh plant assessment."),
-            "stability_score": float(score) if score is not None else None,
-            "growth_trend":    growth,
-            "data_age_hours":  age_h,
-        }
-
-    # Score-based status
-    if score is None:
-        # No score — conservative: treat as marginal
-        base_status = GATE_MARGINAL
-        base_reason = "plant_stability_score not present — treating as marginal (conservative)"
-    else:
-        s = float(score)
-        if s < HEALTH_SCORE_MARGINAL_MIN:
-            base_status = GATE_FAIL
-            base_reason = f"plant_stability_score={s:.2f} — poor condition (threshold: {HEALTH_SCORE_MARGINAL_MIN})"
-        elif s < HEALTH_SCORE_STABLE_MIN:
-            base_status = GATE_MARGINAL
-            base_reason = f"plant_stability_score={s:.2f} — marginal (stable threshold: {HEALTH_SCORE_STABLE_MIN})"
-        else:
-            base_status = GATE_PASS
-            base_reason = f"plant_stability_score={s:.2f} — plant is stable"
-
-    # Growth trend modifier
-    demote_reason = None
-    final_status  = base_status
-
-    if growth == 'declining':
-        if base_status == GATE_PASS:
-            final_status = GATE_MARGINAL
-            demote_reason = "declining growth trend — demoted from PASS to MARGINAL"
-        elif base_status == GATE_MARGINAL:
-            final_status = GATE_FAIL
-            demote_reason = "declining growth trend while health already marginal — demoted to FAIL"
-    elif growth == 'stagnating' and base_status == GATE_MARGINAL:
-        final_status = GATE_FAIL
-        demote_reason = "stagnating growth trend while health is already marginal — demoted to FAIL"
-
-    reason_parts = [base_reason, f"growth_assessment={growth}"]
-    if demote_reason:
-        reason_parts.append(demote_reason)
-    if age_h is not None:
-        reason_parts.append(f"data age={age_h:.1f}h")
-
-    return {
-        "status":          final_status,
-        "reason":          " | ".join(reason_parts),
-        "stability_score": float(score) if score is not None else None,
-        "growth_trend":    growth,
-        "data_age_hours":  age_h,
-    }
-
-
-# ── Gate 3: Budget Gate ───────────────────────────────────────────────────────
+# ── Budget Evaluation ─────────────────────────────────────────────────────────
 
 def _run_budget_gate(today_costs: dict, budget_config: dict) -> dict:
     """
-    Gate 3 — Budget Gate.
+    Compare today's resource costs against configured daily budget limits.
 
-    Compares today's costs (from get_today_costs() daily baseline) against
-    the configured daily budget limits from budget_config.
+    Checks two levels:
+      1. Total:        total_cost_nis vs daily_budget
+      2. Per-resource: water vs water_budget, electricity vs electricity_budget,
+                       fertilizer vs fertilizer_budget
+
+    Effective status = worst of total + per-resource checks.
 
     Budget states:
-      usage_pct < warning_threshold_pct%  → BUDGET_OK
-      warning_threshold_pct% <= usage_pct <= 100%  → BUDGET_WARNING
-      usage_pct > 100%                    → BUDGET_OVER_BUDGET
-
-    Main cost driver: whichever resource (water / electricity / fertilizer)
-    has the highest daily cost in NIS.
+      usage_pct < warning_threshold_pct  → ok
+      warning_threshold_pct <= usage_pct <= 100  → warning
+      usage_pct > 100                    → over_budget
 
     Returns:
-      {"status": "ok"|"warning"|"over_budget",
-       "reason": str, "usage_pct": float,
-       "main_cost_driver": str|None,
-       "today_costs": dict, "daily_budget": float}
+      {"status": "ok"|"warning"|"over_budget", "reason": str,
+       "usage_pct": float, "main_cost_driver": str|None,
+       "today_costs": dict, "daily_budget": float,
+       "resource_breakdown": list}
     """
     daily_budget = float(budget_config.get('daily_budget', 10.0))
     warn_pct     = float(budget_config.get('warning_threshold_pct', 80))
@@ -405,66 +149,107 @@ def _run_budget_gate(today_costs: dict, budget_config: dict) -> dict:
     elec_cost  = float(today_costs.get('electricity_cost_nis',  0.0))
     fert_cost  = float(today_costs.get('fertilizer_cost_nis',   0.0))
 
-    # Guard: unconfigured budget
     if daily_budget <= 0:
         return {
-            "status":           BUDGET_OK,
-            "reason":           "Daily budget not configured (value <= 0) — budget gate skipped.",
-            "usage_pct":        0.0,
-            "main_cost_driver": None,
-            "today_costs":      today_costs,
-            "daily_budget":     daily_budget,
+            "status":             BUDGET_OK,
+            "reason":             "Daily budget not configured (value <= 0) — budget evaluation skipped.",
+            "usage_pct":          0.0,
+            "main_cost_driver":   None,
+            "today_costs":        today_costs,
+            "daily_budget":       daily_budget,
+            "resource_breakdown": [],
         }
 
-    usage_pct = round((total_cost / daily_budget) * 100.0, 1)
-
-    # Identify main cost driver (highest absolute cost today)
-    costs = {'electricity': elec_cost, 'water': water_cost, 'fertilizer': fert_cost}
+    usage_pct   = round((total_cost / daily_budget) * 100.0, 1)
+    costs       = {'electricity': elec_cost, 'water': water_cost, 'fertilizer': fert_cost}
     main_driver = max(costs, key=costs.get) if any(v > 0 for v in costs.values()) else None
 
-    if usage_pct > 100.0:
-        status = BUDGET_OVER_BUDGET
-        reason = (f"OVER BUDGET: {usage_pct:.1f}% of daily budget used "
+    _status_rank = {BUDGET_OK: 0, BUDGET_WARNING: 1, BUDGET_OVER_BUDGET: 2}
+
+    def _resource_status(cost: float, sub_budget: float):
+        if sub_budget <= 0:
+            return None, None
+        pct = round((cost / sub_budget) * 100.0, 1)
+        if pct > 100.0:
+            return BUDGET_OVER_BUDGET, pct
+        elif pct >= warn_pct:
+            return BUDGET_WARNING, pct
+        return BUDGET_OK, pct
+
+    resource_checks = [
+        ('water',       water_cost, float(budget_config.get('water_budget',       0.0))),
+        ('electricity', elec_cost,  float(budget_config.get('electricity_budget', 0.0))),
+        ('fertilizer',  fert_cost,  float(budget_config.get('fertilizer_budget',  0.0))),
+    ]
+
+    resource_breakdown  = []
+    per_resource_worst  = BUDGET_OK
+    triggered_resources = []
+
+    for res_name, res_cost, res_budget in resource_checks:
+        res_status, res_pct = _resource_status(res_cost, res_budget)
+        resource_breakdown.append({
+            'resource':         res_name,
+            'daily_budget_nis': res_budget,
+            'current_cost_nis': res_cost,
+            'usage_pct':        res_pct,
+            'threshold_pct':    warn_pct,
+            'status':           res_status if res_status is not None else 'no_budget_set',
+        })
+        if res_status is not None:
+            if _status_rank.get(res_status, 0) > _status_rank.get(per_resource_worst, 0):
+                per_resource_worst = res_status
+            if res_status in (BUDGET_WARNING, BUDGET_OVER_BUDGET):
+                triggered_resources.append(f"{res_name}={res_pct:.0f}% of sub-budget")
+
+    total_rank     = _status_rank.get(
+        BUDGET_OVER_BUDGET if usage_pct > 100.0
+        else (BUDGET_WARNING if usage_pct >= warn_pct else BUDGET_OK), 0
+    )
+    effective_rank = max(total_rank, _status_rank.get(per_resource_worst, 0))
+    status         = [BUDGET_OK, BUDGET_WARNING, BUDGET_OVER_BUDGET][effective_rank]
+
+    if status == BUDGET_OVER_BUDGET:
+        reason = (f"OVER BUDGET: total {usage_pct:.1f}% used "
                   f"({total_cost:.4f} ₪ / {daily_budget:.2f} ₪). "
                   f"Main driver: {main_driver}.")
-    elif usage_pct >= warn_pct:
-        status = BUDGET_WARNING
-        reason = (f"Budget WARNING: {usage_pct:.1f}% used "
-                  f"({total_cost:.4f} ₪ / {daily_budget:.2f} ₪). "
-                  f"Main driver: {main_driver}.")
+    elif status == BUDGET_WARNING:
+        parts = [f"Budget WARNING: total {usage_pct:.1f}% used "
+                 f"({total_cost:.4f} ₪ / {daily_budget:.2f} ₪). "
+                 f"Main driver: {main_driver}."]
+        if triggered_resources:
+            parts.append(
+                "Per-resource threshold reached — " + ", ".join(triggered_resources) + "."
+            )
+        reason = " ".join(parts)
     else:
-        status = BUDGET_OK
-        reason = (f"Budget OK: {usage_pct:.1f}% used "
-                  f"({total_cost:.4f} ₪ / {daily_budget:.2f} ₪).")
+        reason = f"Budget OK: total {usage_pct:.1f}% used ({total_cost:.4f} ₪ / {daily_budget:.2f} ₪)."
 
     return {
-        "status":           status,
-        "reason":           reason,
-        "usage_pct":        usage_pct,
-        "main_cost_driver": main_driver,
-        "today_costs":      today_costs,
-        "daily_budget":     daily_budget,
+        "status":             status,
+        "reason":             reason,
+        "usage_pct":          usage_pct,
+        "main_cost_driver":   main_driver,
+        "today_costs":        today_costs,
+        "daily_budget":       daily_budget,
+        "resource_breakdown": resource_breakdown,
     }
 
 
 # ── Proposed modifications builder ────────────────────────────────────────────
 
 def _build_proposed_modifications(
-    budget_gate:     dict,
-    sensor_snapshot: dict,
-    layer2_doc:      dict | None,
+    budget_gate: dict,
+    layer2_doc:  dict | None,
 ) -> tuple:
     """
-    Build a list of proposed_modifications and a runtime_constraints dict
-    based on budget gate result, current sensor values, and active setpoints.
+    Build cost-saving setpoint modifications based on budget evaluation.
 
     Rules:
       - Never change pump power or pulse durations.
       - Never propose soil moisture target below MOISTURE_SETPOINT_FLOOR (35%).
       - Never propose LED below LED_POWER_MIN_PCT (40%) of current setpoint.
-      - Never fire actuators.
-      - Never stop sensor readings.
-      - Scale aggressiveness: WARNING → 15% reduction, OVER_BUDGET → 25%.
+      - Scale: WARNING → 15% reduction, OVER_BUDGET → 25% reduction.
 
     Returns:
       (modifications_list, runtime_constraints_dict)
@@ -475,11 +260,9 @@ def _build_proposed_modifications(
     budget_status = budget_gate.get('status', BUDGET_OK)
     main_driver   = budget_gate.get('main_cost_driver')
     usage_pct     = budget_gate.get('usage_pct', 0.0)
+    reduction     = 0.25 if budget_status == BUDGET_OVER_BUDGET else 0.15
 
-    # Scale: WARNING = conservative, OVER_BUDGET = stronger
-    reduction = 0.25 if budget_status == BUDGET_OVER_BUDGET else 0.15
-
-    # ── LED power reduction (electricity driver) ───────────────────────────
+    # ── LED power reduction (electricity driver) ──────────────────────────────
     if main_driver in ('electricity', None) or budget_status == BUDGET_OVER_BUDGET:
         current_light = None
         if _setpoints is not None:
@@ -505,14 +288,13 @@ def _build_proposed_modifications(
                 })
                 constraints['led_power_cap'] = round((proposed_light / current_light) * 100.0, 1)
 
-    # ── Night fan duty reduction (electricity driver) ──────────────────────
+    # ── Night fan duty reduction (electricity driver) ─────────────────────────
     if main_driver in ('electricity', None) or budget_status == BUDGET_OVER_BUDGET:
         try:
             import control_loops
             current_night_duty = control_loops.FAN_NIGHT_DUTY
         except Exception:
-            current_night_duty = 1024   # fallback: 25% of 4095 (default value)
-
+            current_night_duty = 1024   # fallback: 25% of 4095
         proposed_night_duty = max(FAN_NIGHT_DUTY_MIN, int(current_night_duty * (1.0 - reduction)))
         if proposed_night_duty < current_night_duty:
             current_pct  = round((current_night_duty  / 4095) * 100, 1)
@@ -523,14 +305,14 @@ def _build_proposed_modifications(
                 "current_value":  current_night_duty,
                 "proposed_value": proposed_night_duty,
                 "unit":           "PWM duty (0–4095)",
-                "reason":         (f"Night fan reduction is safe and conserves electricity. "
+                "reason":         (f"Night fan reduction conserves electricity. "
                                    f"Proposed: {current_pct:.0f}% → {proposed_pct:.0f}%. "
                                    f"Budget at {usage_pct:.1f}%."),
                 "savings_impact": "low",
             })
             constraints['fan_night_duty'] = proposed_night_duty
 
-    # ── Soil moisture target reduction (water driver) ──────────────────────
+    # ── Soil moisture target reduction (water driver) ─────────────────────────
     if main_driver == 'water' or budget_status == BUDGET_OVER_BUDGET:
         current_moisture = None
         if _setpoints is not None:
@@ -538,9 +320,8 @@ def _build_proposed_modifications(
                 current_moisture = _setpoints.get_soil_humidity_setpoint()
             except Exception:
                 pass
-        # Only reduce if well above the floor (at least 5% buffer)
         if current_moisture is not None and current_moisture > MOISTURE_SETPOINT_FLOOR + 5.0:
-            reduce_by = 5.0 if budget_status == BUDGET_OVER_BUDGET else 3.0
+            reduce_by         = 5.0 if budget_status == BUDGET_OVER_BUDGET else 3.0
             proposed_moisture = max(MOISTURE_SETPOINT_FLOOR, round(current_moisture - reduce_by, 1))
             if proposed_moisture < current_moisture:
                 modifications.append({
@@ -552,31 +333,11 @@ def _build_proposed_modifications(
                     "reason":         (f"Water is main cost driver at {usage_pct:.1f}% of daily budget. "
                                        f"Lowering moisture target by {reduce_by:.0f}% reduces irrigation frequency. "
                                        f"Safety floor: {MOISTURE_SETPOINT_FLOOR}%."),
+                    "safety":         ("Pump power and pulse durations are unchanged. "
+                                       "Layer 1 will still water when needed — only frequency changes."),
                     "savings_impact": "medium",
                 })
                 constraints['moisture_target'] = proposed_moisture
-
-    # ── Fertilizer delay (fertilizer driver, only if EC is already sufficient) ──
-    if main_driver == 'fertilizer':
-        soil_ec = sensor_snapshot.get('soil_ec')
-        if soil_ec is not None:
-            try:
-                ec_val = float(soil_ec)
-                # EC >= 700 means the plant has adequate nutrition — safe to delay
-                if ec_val >= 700:
-                    modifications.append({
-                        "type":           "fertilizer_delay",
-                        "parameter":      "fertilizer_pump_action",
-                        "current_value":  "active",
-                        "proposed_value": "delayed_non_critical",
-                        "unit":           None,
-                        "reason":         (f"Fertilizer is main cost driver. Current EC={ec_val:.0f} µS/cm "
-                                           f"is sufficient — delay non-critical fertilization until EC drops below 700."),
-                        "savings_impact": "low",
-                    })
-                    constraints['fertilizer_delay'] = True
-            except (TypeError, ValueError):
-                pass
 
     return modifications, constraints
 
@@ -584,165 +345,129 @@ def _build_proposed_modifications(
 # ── Decision document assembler ───────────────────────────────────────────────
 
 def _assemble_doc(
-    decision_id:     str,
-    layer2_doc:      dict | None,
-    sensor_gate:     dict,
-    health_gate:     dict,
-    budget_gate:     dict,
-    sensor_snapshot: dict,
-    decision:        str,
-    status:          str,
-    reason:          str,
-    mods:            list,
-    constraints:     dict,
+    decision_id:  str,
+    layer2_doc:   dict | None,
+    budget_gate:  dict,
+    decision:     str,
+    status:       str,
+    reason:       str,
+    mods:         list,
+    constraints:  dict,
 ) -> dict:
     """Build the complete layer3_decisions document."""
-    rec_id = layer2_doc.get('recommendation_id', '') if layer2_doc else ''
+    rec_id       = layer2_doc.get('recommendation_id', '') if layer2_doc else ''
     plant_status = layer2_doc.get('plant_status', 'unknown') if layer2_doc else 'unknown'
-    clean_snapshot = {k: v for k, v in sensor_snapshot.items() if k != 'source'}
 
     return {
         "decision_id":              decision_id,
         "timestamp":                datetime.datetime.now(),
         "layer2_recommendation_id": rec_id,
         "gate_results": {
-            "sensor_safety": sensor_gate,
-            "plant_health":  health_gate,
-            "budget":        budget_gate,
+            "budget": budget_gate,
         },
-        "decision":                 decision,
-        "reason":                   reason,
-        "proposed_modifications":   mods,
-        "runtime_constraints":      constraints,
-        "budget_usage_pct":         budget_gate.get("usage_pct", 0.0),
-        "main_cost_driver":         budget_gate.get("main_cost_driver"),
-        "plant_status":             plant_status,
-        "sensor_snapshot":          clean_snapshot,
-        "status":                   status,
-        "user_action":              None,
-        "user_action_timestamp":    None,
-        "previous_values":          {},
-        "approved_values":          {},
+        "decision":               decision,
+        "reason":                 reason,
+        "proposed_modifications": mods,
+        "runtime_constraints":    constraints,
+        "budget_usage_pct":       budget_gate.get("usage_pct", 0.0),
+        "main_cost_driver":       budget_gate.get("main_cost_driver"),
+        "plant_status":           plant_status,
+        "status":                 status,
+        "user_action":            None,
+        "user_action_timestamp":  None,
+        "previous_values":        {},
+        "approved_values":        {},
     }
 
 
-# ── Decision engine ───────────────────────────────────────────────────────────
+# ── Decision engine (budget-only) ─────────────────────────────────────────────
 
-def _make_decision(
-    layer2_doc:      dict | None,
-    sensor_gate:     dict,
-    health_gate:     dict,
-    budget_gate:     dict,
-    sensor_snapshot: dict,
-) -> dict:
+def _make_decision(layer2_doc: dict | None, budget_gate: dict) -> dict:
     """
-    Combine the three gate results into a final Layer 3 decision document.
+    Make a Layer 3 decision based solely on budget evaluation.
 
-    Decision logic (in priority order):
-      1. sensor_gate FAIL                          → BLOCK
-      2. health_gate FAIL                          → BLOCK
-      3. health_gate MARGINAL + budget not OK      → ALERT_ONLY (protect stressed plant)
-      4. health_gate MARGINAL + budget OK          → APPROVE   (as-is, no modifications)
-      5. health_gate PASS + budget OK              → APPROVE
-      6. health_gate PASS + budget WARNING         → MODIFY (conservative modifications)
-      7. health_gate PASS + budget OVER_BUDGET     → MODIFY (stronger modifications)
-
-    Status assigned:
-      APPROVE / MODIFY  → pending_approval  (user can act)
-      BLOCK             → blocked           (user cannot approve)
-      ALERT_ONLY        → alert_only        (informational only)
+    Decision logic:
+      1. No Layer 2 doc found            → BLOCK (nothing to evaluate)
+      2. Layer 2 status == 'invalid'     → BLOCK (invalid recommendation)
+      3. Layer 2 age > LAYER2_MAX_AGE_HOURS → BLOCK (too stale, run Layer 2 again)
+      4. Budget OK                        → APPROVE
+      5. Budget WARNING or OVER_BUDGET    → MODIFY (propose cost reductions)
+      6. Budget pressure but no safe mods → ALERT_ONLY
     """
-    did   = str(uuid.uuid4())
-    sg    = sensor_gate.get('status')
-    hg    = health_gate.get('status')
-    bg    = budget_gate.get('status', BUDGET_OK)
-    score = health_gate.get('stability_score')
+    did = str(uuid.uuid4())
+    bg  = budget_gate.get('status', BUDGET_OK)
 
-    # ── 1. Sensor safety failure → BLOCK ──────────────────────────────────
-    if sg == GATE_FAIL:
+    # ── 1. No Layer 2 recommendation ─────────────────────────────────────────
+    if layer2_doc is None:
         return _assemble_doc(
-            did, layer2_doc, sensor_gate, health_gate, budget_gate, sensor_snapshot,
+            did, layer2_doc, budget_gate,
             decision    = DECISION_BLOCK,
             status      = STATUS_BLOCKED,
-            reason      = f"BLOCK — Sensor Safety Gate failed: {sensor_gate.get('reason', '')}",
+            reason      = "BLOCK — No Layer 2 recommendation found. Run the AI Advisor first.",
             mods        = [],
             constraints = {},
         )
 
-    # ── 2. Plant health failure → BLOCK ───────────────────────────────────
-    if hg == GATE_FAIL:
+    # ── 2. Invalid Layer 2 recommendation ────────────────────────────────────
+    if layer2_doc.get('status') == 'invalid':
         return _assemble_doc(
-            did, layer2_doc, sensor_gate, health_gate, budget_gate, sensor_snapshot,
+            did, layer2_doc, budget_gate,
             decision    = DECISION_BLOCK,
             status      = STATUS_BLOCKED,
-            reason      = f"BLOCK — Plant Health Gate failed: {health_gate.get('reason', '')}",
+            reason      = ("BLOCK — Layer 2 recommendation is marked invalid. "
+                           "Run the AI Advisor again to get a valid recommendation."),
             mods        = [],
             constraints = {},
         )
 
-    # ── 3. Marginal health + budget pressure → ALERT_ONLY ─────────────────
-    if hg == GATE_MARGINAL and bg != BUDGET_OK:
+    # ── 3. Stale Layer 2 recommendation ──────────────────────────────────────
+    age_h = _doc_age_hours(layer2_doc)
+    if age_h is not None and age_h > LAYER2_MAX_AGE_HOURS:
         return _assemble_doc(
-            did, layer2_doc, sensor_gate, health_gate, budget_gate, sensor_snapshot,
-            decision    = DECISION_ALERT_ONLY,
-            status      = STATUS_ALERT_ONLY,
-            reason      = (f"ALERT_ONLY — Plant health is marginal (score={score}) "
-                           f"and budget status is {bg}. "
-                           "No modifications applied to an already-stressed plant. "
-                           "Review budget and plant health before taking action."),
+            did, layer2_doc, budget_gate,
+            decision    = DECISION_BLOCK,
+            status      = STATUS_BLOCKED,
+            reason      = (f"BLOCK — Layer 2 recommendation is {age_h:.1f}h old "
+                           f"(limit: {LAYER2_MAX_AGE_HOURS}h). "
+                           "Run the AI Advisor again to get a fresh recommendation."),
             mods        = [],
             constraints = {},
         )
 
-    # ── 4. Marginal health + budget OK → APPROVE (no modifications) ───────
-    if hg == GATE_MARGINAL and bg == BUDGET_OK:
-        return _assemble_doc(
-            did, layer2_doc, sensor_gate, health_gate, budget_gate, sensor_snapshot,
-            decision    = DECISION_APPROVE,
-            status      = STATUS_PENDING,
-            reason      = (f"APPROVE — Plant health is marginal (score={score}) "
-                           "but budget is OK. Layer 2 recommendation approved as-is "
-                           "with no budget modifications. Monitor plant closely."),
-            mods        = [],
-            constraints = {},
-        )
-
-    # ── 5. All gates pass + budget OK → APPROVE ───────────────────────────
+    # ── 4. Budget OK → APPROVE ────────────────────────────────────────────────
     if bg == BUDGET_OK:
         return _assemble_doc(
-            did, layer2_doc, sensor_gate, health_gate, budget_gate, sensor_snapshot,
+            did, layer2_doc, budget_gate,
             decision    = DECISION_APPROVE,
             status      = STATUS_PENDING,
-            reason      = (f"APPROVE — All gates passed. Sensors safe, plant stable (score={score}), "
-                           f"budget at {budget_gate.get('usage_pct', 0):.1f}% (OK). "
+            reason      = (f"APPROVE — All resource costs are within budget "
+                           f"({budget_gate.get('usage_pct', 0):.1f}% of daily budget used). "
                            "Layer 2 recommendation approved as-is."),
             mods        = [],
             constraints = {},
         )
 
-    # ── 6–7. All gates pass + budget under pressure → MODIFY ──────────────
-    mods, constraints = _build_proposed_modifications(budget_gate, sensor_snapshot, layer2_doc)
+    # ── 5. Budget WARNING or OVER_BUDGET → try MODIFY ────────────────────────
+    mods, constraints = _build_proposed_modifications(budget_gate, layer2_doc)
 
     if not mods:
-        # No actionable modifications available → fall back to ALERT_ONLY
         return _assemble_doc(
-            did, layer2_doc, sensor_gate, health_gate, budget_gate, sensor_snapshot,
+            did, layer2_doc, budget_gate,
             decision    = DECISION_ALERT_ONLY,
             status      = STATUS_ALERT_ONLY,
             reason      = (f"ALERT_ONLY — Budget is {bg} at {budget_gate.get('usage_pct', 0):.1f}% "
-                           "but no safe modifications are available given current setpoints. "
-                           "Manual review recommended."),
+                           "but no safe cost-saving modifications are available given current setpoints. "
+                           "Review your budget configuration or current setpoints manually."),
             mods        = [],
             constraints = {},
         )
 
     return _assemble_doc(
-        did, layer2_doc, sensor_gate, health_gate, budget_gate, sensor_snapshot,
+        did, layer2_doc, budget_gate,
         decision    = DECISION_MODIFY,
         status      = STATUS_PENDING,
         reason      = (f"MODIFY — Budget is {bg} at {budget_gate.get('usage_pct', 0):.1f}%. "
-                       f"Sensors safe, plant stable (score={score}). "
-                       f"{len(mods)} budget modification(s) proposed. "
+                       f"{len(mods)} cost-saving modification(s) proposed. "
                        "Review and approve if acceptable."),
         mods        = mods,
         constraints = constraints,
@@ -753,84 +478,54 @@ def _make_decision(
 
 def run(layer2_recommendation_id: str = None) -> dict:
     """
-    Entry point for a Layer 3 review cycle.
-    Called automatically after Layer 2 saves a recommendation (wired in Step 4+).
-    Can also be triggered manually via the API.
+    Entry point for a Layer 3 budget evaluation cycle.
+    Called automatically after Layer 2 saves a recommendation.
+    Can also be triggered manually via POST /api/layer3/run.
 
     Steps:
       1. Cancel stale pending Layer 3 decisions
       2. Update layer3_status → running
       3. Load latest Layer 2 recommendation from MongoDB
-      4. Collect live sensor snapshot (cache → MongoDB fallback)
-      5. Run Gate 1 — Sensor Safety Gate
-      6. Run Gate 2 — Plant Health Gate
-      7. Run Gate 3 — Budget Gate (always runs for data — decision logic gates it)
-      8. Build final decision document
-      9. Insert into layer3_decisions collection
-      10. Update layer3_status
-      11. Return summary dict
+      4. Get today's costs and budget config
+      5. Run budget evaluation
+      6. Make decision
+      7. Save decision to layer3_decisions collection
+      8. Update layer3_status
+      9. Return summary
 
-    Does NOT apply any changes to setpoints, actuators, or MongoDB setpoints.
-    All changes require user approval (Step 5+).
+    Does NOT fire actuators. Does NOT apply setpoints.
+    All changes require explicit user approval via the frontend.
     """
     if _mongo_db is None:
         return {"success": False, "error": "Layer 3 not initialized — call init() first."}
 
     with _run_lock:
-        _CUSTOM_PRINT_FUNC("[Layer3] ── Starting review cycle ──────────────────────")
+        _CUSTOM_PRINT_FUNC("[Layer3] ── Starting budget evaluation ──────────────────")
 
-        # ── Step 1: Cancel stale pending decisions ─────────────────────────
+        # ── Step 1: Cancel stale pending decisions ────────────────────────
         cancelled = _mongo_db.cancel_pending_layer3_decisions()
         if cancelled:
             _CUSTOM_PRINT_FUNC(f"[Layer3] Cancelled {cancelled} stale pending decision(s).")
 
-        # ── Step 2: Mark running ───────────────────────────────────────────
+        # ── Step 2: Mark running ──────────────────────────────────────────
         _mongo_db.update_layer3_status({
             'current_status': 'running',
             'last_run_at':    datetime.datetime.now(),
         })
 
         try:
-            # ── Step 3: Load Layer 2 doc ───────────────────────────────────
+            # ── Step 3: Load Layer 2 recommendation ───────────────────────
             layer2_doc = _get_latest_layer2_doc()
             if layer2_doc:
-                score = layer2_doc.get('plant_stability_score')
                 _CUSTOM_PRINT_FUNC(
-                    f"[Layer3] Layer 2: status={layer2_doc.get('status')}  "
+                    f"[Layer3] Layer 2 doc: status={layer2_doc.get('status')}  "
                     f"plant={layer2_doc.get('plant_status')}  "
-                    f"score={score}  "
-                    f"growth={layer2_doc.get('growth_assessment')}"
+                    f"age={_doc_age_hours(layer2_doc)}h"
                 )
             else:
                 _CUSTOM_PRINT_FUNC("[Layer3] No Layer 2 recommendation found in MongoDB.")
 
-            # ── Step 4: Sensor snapshot ────────────────────────────────────
-            sensor_snapshot = _get_sensor_snapshot()
-            _CUSTOM_PRINT_FUNC(
-                f"[Layer3] Sensors (source={sensor_snapshot.get('source')}): "
-                f"moisture={sensor_snapshot.get('soil_moisture')}%  "
-                f"EC={sensor_snapshot.get('soil_ec')} µS/cm  "
-                f"pH={sensor_snapshot.get('soil_ph')}  "
-                f"airTemp={sensor_snapshot.get('air_temperature')}°C"
-            )
-
-            # ── Step 5: Gate 1 — Sensor Safety ────────────────────────────
-            sensor_gate = _run_sensor_safety_gate(sensor_snapshot)
-            _CUSTOM_PRINT_FUNC(
-                f"[Layer3] Gate 1 Sensor Safety  → {sensor_gate['status'].upper()}  "
-                f"| {sensor_gate['reason']}"
-            )
-
-            # ── Step 6: Gate 2 — Plant Health ─────────────────────────────
-            health_gate = _run_plant_health_gate(layer2_doc)
-            _CUSTOM_PRINT_FUNC(
-                f"[Layer3] Gate 2 Plant Health    → {health_gate['status'].upper()}  "
-                f"| {health_gate['reason']}"
-            )
-
-            # ── Step 7: Gate 3 — Budget ───────────────────────────────────
-            # Always collect budget data (even if earlier gates blocked)
-            # so the decision document always has full cost information.
+            # ── Step 4 & 5: Budget evaluation ─────────────────────────────
             today_costs   = _mongo_db.get_today_costs(
                 WATER_PRICE_PER_LITER_NIS,
                 ELECTRICITY_PRICE_PER_KWH_NIS,
@@ -839,40 +534,62 @@ def run(layer2_recommendation_id: str = None) -> dict:
             budget_config = _mongo_db.get_budget_config()
             budget_gate   = _run_budget_gate(today_costs, budget_config)
             _CUSTOM_PRINT_FUNC(
-                f"[Layer3] Gate 3 Budget          → {budget_gate['status'].upper()}  "
+                f"[Layer3] Budget → {budget_gate['status'].upper()}  "
                 f"| {budget_gate['reason']}"
             )
 
-            # ── Step 8: Decision engine ────────────────────────────────────
-            decision_doc = _make_decision(
-                layer2_doc, sensor_gate, health_gate, budget_gate, sensor_snapshot
-            )
+            # ── Step 6: Decision ───────────────────────────────────────────
+            decision_doc = _make_decision(layer2_doc, budget_gate)
             _CUSTOM_PRINT_FUNC(
                 f"[Layer3] Decision: {decision_doc['decision']}  "
                 f"status={decision_doc['status']}  "
                 f"mods={len(decision_doc.get('proposed_modifications', []))}"
             )
 
-            # ── Step 9: Save to MongoDB ────────────────────────────────────
+            # ── Step 7: Save to MongoDB ────────────────────────────────────
             _mongo_db.insert_layer3_decision(decision_doc)
 
-            # ── Step 10: Update layer3_status ──────────────────────────────
+            # ── Step 8: Update layer3_status ──────────────────────────────
             ui_status = (
                 'waiting_approval' if decision_doc['status'] == STATUS_PENDING
                 else decision_doc['status']
             )
             _mongo_db.update_layer3_status({
-                'current_status':       ui_status,
-                'last_run_at':          decision_doc['timestamp'],
-                'latest_decision_id':   decision_doc['decision_id'],
-                'budget_status':        budget_gate.get('status', 'unknown'),
-                'sensor_safety_status': sensor_gate.get('status', 'unknown'),
-                'plant_health_status':  health_gate.get('status', 'unknown'),
+                'current_status':     ui_status,
+                'last_run_at':        decision_doc['timestamp'],
+                'latest_decision_id': decision_doc['decision_id'],
+                'budget_status':      budget_gate.get('status', 'unknown'),
                 'blocked_reason': (
                     decision_doc.get('reason')
                     if decision_doc['decision'] == DECISION_BLOCK else None
                 ),
             })
+
+            # ── Step 8b: UI notification (bell/toast) — UI only, never email ──
+            try:
+                import notifications
+                _dec = decision_doc['decision']
+                _did = decision_doc['decision_id']
+                if decision_doc['status'] == STATUS_PENDING:
+                    notifications.create_notification(
+                        'approval_required', 'warning',
+                        'Approval required',
+                        f"Budget Manager decision '{_dec}' is waiting for your approval.",
+                        category='workflow', link='layer3',
+                        meta={'decision_id': _did, 'decision': _dec},
+                        dedup_key=f"layer3_approval:{_did}", dedup_window_sec=86400,
+                    )
+                else:
+                    notifications.create_notification(
+                        'budget_decision_ready', 'info',
+                        'Budget decision ready',
+                        f"Budget Manager completed its review: {_dec}.",
+                        category='workflow', link='layer3',
+                        meta={'decision_id': _did, 'decision': _dec},
+                        dedup_key=f"layer3_decision:{_did}", dedup_window_sec=86400,
+                    )
+            except Exception as _ntf_err:
+                _CUSTOM_PRINT_FUNC(f"[Notifications] layer3 decision skipped: {_ntf_err}")
 
             _CUSTOM_PRINT_FUNC(
                 f"[Layer3] ── Cycle complete: {decision_doc['decision']}  "
@@ -891,9 +608,87 @@ def run(layer2_recommendation_id: str = None) -> dict:
             }
 
         except Exception as e:
-            _CUSTOM_PRINT_FUNC(f"[Layer3] ERROR in review cycle: {e}")
+            _CUSTOM_PRINT_FUNC(f"[Layer3] ERROR in budget evaluation: {e}")
             _mongo_db.update_layer3_status({
                 'current_status': 'error',
                 'blocked_reason': str(e),
             })
             return {"success": False, "error": str(e)}
+
+
+# ── Test-mode entry point ─────────────────────────────────────────────────────
+
+def run_test(injected_sensors: dict = None, injected_costs: dict = None) -> dict:
+    """
+    Test-mode Layer 3 budget evaluation.
+    Does NOT write to MongoDB. Does NOT cancel pending decisions.
+    Inject cost values to test budget decisions without affecting the live system.
+
+    Parameters:
+      injected_costs   — override today_costs dict (water_cost_nis, electricity_cost_nis,
+                         fertilizer_cost_nis, total_cost_nis).
+                         If None, uses zero costs (budget OK).
+      injected_sensors — unused by decision logic; accepted for API compatibility.
+    """
+    _CUSTOM_PRINT_FUNC("[Layer3-TEST] ── Starting test cycle (no DB writes) ──────")
+
+    default_costs = {
+        'date':                    'test',
+        'water_liters_today':      0.0,
+        'energy_wh_today':         0.0,
+        'fertilizer_liters_today': 0.0,
+        'water_cost_nis':          0.0,
+        'electricity_cost_nis':    0.0,
+        'fertilizer_cost_nis':     0.0,
+        'total_cost_nis':          0.0,
+    }
+    today_costs = {**default_costs, **(injected_costs or {})}
+    if injected_costs and 'total_cost_nis' not in injected_costs:
+        today_costs['total_cost_nis'] = round(
+            today_costs['water_cost_nis'] +
+            today_costs['electricity_cost_nis'] +
+            today_costs['fertilizer_cost_nis'], 4
+        )
+
+    # Minimal fake Layer 2 doc — budget evaluation only needs status and age
+    fake_layer2 = {
+        'recommendation_id': 'test_layer2',
+        'plant_status':      'healthy',
+        'created_at':        datetime.datetime.now(),
+        'status':            'pending',
+    }
+
+    budget_config = {}
+    if _mongo_db is not None:
+        try:
+            budget_config = _mongo_db.get_budget_config()
+        except Exception:
+            pass
+
+    budget_gate = _run_budget_gate(today_costs, budget_config)
+    _CUSTOM_PRINT_FUNC(
+        f"[Layer3-TEST] Budget → {budget_gate['status'].upper()} | {budget_gate['reason']}"
+    )
+
+    decision_doc = _make_decision(fake_layer2, budget_gate)
+    decision_doc['test_mode']           = True
+    decision_doc['test_injected_costs'] = today_costs
+
+    _CUSTOM_PRINT_FUNC(
+        f"[Layer3-TEST] Decision: {decision_doc['decision']}  "
+        f"mods={len(decision_doc.get('proposed_modifications', []))}"
+    )
+
+    return {
+        "success":                True,
+        "test_mode":              True,
+        "decision":               decision_doc['decision'],
+        "status":                 decision_doc['status'],
+        "reason":                 decision_doc['reason'],
+        "budget_pct":             decision_doc.get('budget_usage_pct'),
+        "main_driver":            decision_doc.get('main_cost_driver'),
+        "resource_breakdown":     budget_gate.get('resource_breakdown', []),
+        "proposed_modifications": decision_doc.get('proposed_modifications', []),
+        "gate_results":           decision_doc.get('gate_results'),
+        "today_costs":            today_costs,
+    }

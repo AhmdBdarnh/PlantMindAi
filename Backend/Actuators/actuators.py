@@ -37,8 +37,12 @@ class GH_Actuators:
 
     def restart_esp32(self) -> bool:
         try:
+            _lock_deadline = time.time() + 5.0
             while not self.__i2c_bus.try_lock():
-                time.sleep(0.1)
+                if time.time() > _lock_deadline:
+                    _CUSTOM_PRINT_FUNC("[Actuators] I2C bus lock timeout (5s) — aborting command to avoid hang")
+                    return False
+                time.sleep(0.05)
             # create the frame to send to esp32
             frame = b''
             # create the first byte to send to esp32
@@ -58,8 +62,12 @@ class GH_Actuators:
     
     def toggle_esp32_onboard_led(self) -> bool:
         try:
+            _lock_deadline = time.time() + 5.0
             while not self.__i2c_bus.try_lock():
-                time.sleep(0.1)
+                if time.time() > _lock_deadline:
+                    _CUSTOM_PRINT_FUNC("[Actuators] I2C bus lock timeout (5s) — aborting command to avoid hang")
+                    return False
+                time.sleep(0.05)
             # create the frame to send to esp32
             frame = b''
             # create the first byte to send to esp32
@@ -78,8 +86,12 @@ class GH_Actuators:
 
     def __send_init_request(self, pin: int, channel: int, timer_src: int, frequency: int, duty_cycle: int, device_name: str) -> bool:
         try:
+            _lock_deadline = time.time() + 5.0
             while not self.__i2c_bus.try_lock():
-                time.sleep(0.1)
+                if time.time() > _lock_deadline:
+                    _CUSTOM_PRINT_FUNC("[Actuators] I2C bus lock timeout (5s) — aborting command to avoid hang")
+                    return False
+                time.sleep(0.05)
             # create the frame to send to esp32
             frame = (frequency.to_bytes(4, self.__frame_endianes) + duty_cycle.to_bytes(2, self.__frame_endianes) + pin.to_bytes(1, self.__frame_endianes) + channel.to_bytes(1, self.__frame_endianes) + timer_src.to_bytes(1, self.__frame_endianes))
             # send command and frame size
@@ -98,8 +110,12 @@ class GH_Actuators:
 
     def __send_duty_cycle_update_request(self, duty_cycle: int, pin: int, channel: int, device_name: str) -> bool:
         try:
+            _lock_deadline = time.time() + 5.0
             while not self.__i2c_bus.try_lock():
-                time.sleep(0.1)
+                if time.time() > _lock_deadline:
+                    _CUSTOM_PRINT_FUNC("[Actuators] I2C bus lock timeout (5s) — aborting command to avoid hang")
+                    return False
+                time.sleep(0.05)
             if duty_cycle < 0 or duty_cycle > 4096:
                 _CUSTOM_PRINT_FUNC("Duty cycle must be between 0 and 4096")
                 self.__i2c_bus.unlock()
