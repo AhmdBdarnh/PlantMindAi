@@ -2,7 +2,7 @@ import React from 'react';
 
 /**
  * Lightweight SVG line chart — no external dependencies.
- * Used by PlantEnvironment and ResourceConsumption.
+ * Used by ResourceConsumption.
  *
  * Props:
  *   data     — array of objects (sensorHistory entries)

@@ -53,6 +53,12 @@ def init_routes(
     except Exception as _ntf_init_err:
         _CUSTOM_PRINT_FUNC(f"[Notifications] WARNING: init failed at startup: {_ntf_init_err}")
 
+    # ── Growth cycle backfill (one-time, idempotent) ──────────────────────────
+    try:
+        mongo_db_handler.backfill_growth_cycle_ids()
+    except Exception as _bf_err:
+        _CUSTOM_PRINT_FUNC(f"[Growth] WARNING: cycle backfill failed at startup: {_bf_err}")
+
     # ── Sensor endpoints ──────────────────────────────────────────────────────
 
     @bp.route('/api/sensors', methods=['GET'])
@@ -157,42 +163,33 @@ def init_routes(
             },
         })
 
-    # ── Sensor 24 h time-series ───────────────────────────────────────────────
+    # ── Daily cost history (per-day expense graph) ────────────────────────────
 
-    @bp.route('/api/sensors/history', methods=['GET'])
-    def get_sensors_history():
+    @bp.route('/api/resources/daily-history', methods=['GET'])
+    def get_resources_daily_history():
         """
-        Return time-series [{time, value}] for all environment sensors over
-        the last N hours (default 24, max 48).
+        Return per-day resource costs for the last N days (default 14, max 60),
+        derived from the daily_costs baseline documents. Used by the Dashboard
+        Expenses section's daily graph and the 'yesterday vs today' delta.
 
         Response shape:
-          {success: true, hours: 24, data: {air_temperature: [...], ...}}
+          {success: true, days: 14,
+           history: [{date, water_cost_nis, electricity_cost_nis,
+                      fertilizer_cost_nis, total_cost_nis}, ...]}  (newest last)
         """
         try:
-            hours = min(int(request.args.get('hours', 24)), 48)
-
-            # Maps frontend key → sensor_id stored in sensors_data collection
-            SENSOR_MAP = {
-                'air_temperature':  'dht22.temperature',
-                'air_humidity':     'dht22.humidity',
-                'light_intensity':  'ads1115.light_intensity',
-                'soil_ph':          'soil_ph',
-                'soil_ec':          'soil_ec',
-                'soil_temperature': 'soil_temp',
-                'soil_humidity':    'soil_humidity',
-            }
-
-            data = {}
-            for key, sensor_id in SENSOR_MAP.items():
-                data[key] = mongo_db_handler.get_sensor_history(
-                    sensor_id, hours=hours, max_points=150
-                )
-
-            resp = jsonify({'success': True, 'hours': hours, 'data': data})
+            days = min(int(request.args.get('days', 14)), 60)
+            history = mongo_db_handler.get_daily_cost_history(
+                water_price_per_liter     = WATER_PRICE_PER_LITER_NIS,
+                electricity_price_per_kwh = ELECTRICITY_PRICE_PER_KWH_NIS,
+                fertilizer_price_per_5l   = FERTILIZER_PRICE_PER_5_LITERS_NIS,
+                days                      = days,
+            )
+            resp = jsonify({'success': True, 'days': days, 'history': history})
             resp.headers['Cache-Control'] = 'no-store'
             return resp
         except Exception as e:
-            _CUSTOM_PRINT_FUNC(f"[/api/sensors/history] ERROR: {e}")
+            _CUSTOM_PRINT_FUNC(f"[/api/resources/daily-history] ERROR: {e}")
             return jsonify({'success': False, 'error': str(e)}), 500
 
     # ── Health endpoint ───────────────────────────────────────────────────────
@@ -445,6 +442,11 @@ def init_routes(
           ai_setpoint_recommendations, layer3_decisions history,
           plant_health_results, growth_measurements, capture_sessions,
           budget_config, setpoints, all hardware control loops
+
+        Note: this writes a new cycle_started_at, which becomes the plant-cycle
+        boundary. Growth analysis/history is scoped to the current cycle, so the
+        new plant never reuses the previous plant's growth data or images, while
+        the old measurements and images remain stored (just not used).
         """
         import datetime as _dt
         try:

@@ -390,24 +390,41 @@ class MongoDBHandler:
 
     # ── Growth measurements ───────────────────────────────────────────────────
 
+    def _growth_cycle_query(self, current_cycle_only: bool) -> dict:
+        """Build the growth_measurements query, optionally scoped to the active
+        plant cycle. The cycle boundary is the 'cycle_started_at' system_state
+        value set by a New-Plant-Cycle / resource reset. When no cycle has ever
+        been set, no filter is applied (legacy behaviour)."""
+        if not current_cycle_only:
+            return {}
+        cid = self.get_state('cycle_started_at')
+        return {'cycle_id': cid} if cid else {}
+
     def insert_growth_measurement(self, doc: dict) -> bool:
         """
         Insert a growth measurement document into the growth_measurements collection.
         The doc should follow the schema produced by growth_metrics.py.
+
+        Each measurement is stamped with the active plant cycle (cycle_id) so a new
+        plant never reuses the previous plant's growth data. Old measurements stay
+        in the collection; they are simply scoped out of the current plant.
         """
         try:
+            if 'cycle_id' not in doc:
+                doc['cycle_id'] = self.get_state('cycle_started_at')
             self.__db['growth_measurements'].insert_one(doc)
             return True
         except Exception as e:
             _CUSTOM_PRINT_FUNC(f"Error inserting growth measurement: {e}")
             return False
 
-    def get_latest_growth_measurement(self) -> dict:
-        """Return the most recent growth measurement, or None if none exist."""
+    def get_latest_growth_measurement(self, current_cycle_only: bool = True) -> dict:
+        """Return the most recent growth measurement for the current plant cycle
+        (or overall if current_cycle_only=False), or None if none exist."""
         try:
             cursor = (
                 self.__db['growth_measurements']
-                .find({}, {'_id': 0})
+                .find(self._growth_cycle_query(current_cycle_only), {'_id': 0})
                 .sort('created_at', pymongo.DESCENDING)
                 .limit(1)
             )
@@ -418,12 +435,13 @@ class MongoDBHandler:
             _CUSTOM_PRINT_FUNC(f"Error fetching latest growth measurement: {e}")
             return None
 
-    def get_growth_history(self, limit: int = 50) -> list:
-        """Return the most recent growth measurements, newest first."""
+    def get_growth_history(self, limit: int = 50, current_cycle_only: bool = True) -> list:
+        """Return the most recent growth measurements for the current plant cycle
+        (or overall if current_cycle_only=False), newest first."""
         try:
             cursor = (
                 self.__db['growth_measurements']
-                .find({}, {'_id': 0})
+                .find(self._growth_cycle_query(current_cycle_only), {'_id': 0})
                 .sort('created_at', pymongo.DESCENDING)
                 .limit(limit)
             )
@@ -431,6 +449,30 @@ class MongoDBHandler:
         except Exception as e:
             _CUSTOM_PRINT_FUNC(f"Error fetching growth history: {e}")
             return []
+
+    def backfill_growth_cycle_ids(self) -> int:
+        """One-time, idempotent migration: stamp existing growth measurements that
+        predate the cycle feature (no cycle_id field) with the current cycle, so the
+        current plant's history stays visible. After the next reset, freshly stamped
+        measurements get the new cycle and these become the previous plant.
+        No-op when no cycle has been set. Returns the number of documents updated."""
+        try:
+            cid = self.get_state('cycle_started_at')
+            if not cid:
+                return 0
+            result = self.__db['growth_measurements'].update_many(
+                {'cycle_id': {'$exists': False}},
+                {'$set': {'cycle_id': cid}},
+            )
+            if result.modified_count:
+                _CUSTOM_PRINT_FUNC(
+                    f"[Growth] Backfilled cycle_id on {result.modified_count} "
+                    f"existing measurement(s) → current cycle."
+                )
+            return result.modified_count
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error backfilling growth cycle ids: {e}")
+            return 0
 
     # ── Plant health results ──────────────────────────────────────────────────
 
@@ -478,46 +520,6 @@ class MongoDBHandler:
             return []
 
     # ── Sensor time-series history ────────────────────────────────────────────
-
-    def get_sensor_history(self, sensor_id: str, hours: int = 24,
-                           max_points: int = 150) -> list:
-        """
-        Return time-series [{time, value}] for one sensor over the last N hours.
-        Sampled down to max_points so the frontend chart stays fast.
-        """
-        try:
-            since  = datetime.datetime.now() - datetime.timedelta(hours=hours)
-            cursor = (
-                self.__db['sensors_data']
-                .find(
-                    {'sensor_id': sensor_id, 'timestamp': {'$gte': since}},
-                    {'sensor_value': 1, 'timestamp': 1, '_id': 0},
-                )
-                .sort('timestamp', pymongo.ASCENDING)
-            )
-            docs = list(cursor)
-            if not docs:
-                return []
-            # Uniform sampling
-            if len(docs) > max_points:
-                step = len(docs) / max_points
-                docs = [docs[int(i * step)] for i in range(max_points)]
-            result = []
-            for d in docs:
-                ts  = d.get('timestamp')
-                val = d.get('sensor_value')
-                if ts and val is not None:
-                    try:
-                        result.append({
-                            'time':  ts.isoformat(),
-                            'value': round(float(val), 4),
-                        })
-                    except (TypeError, ValueError):
-                        pass
-            return result
-        except Exception as e:
-            _CUSTOM_PRINT_FUNC(f"Error fetching sensor history for '{sensor_id}': {e}")
-            return []
 
     # ── Sensor statistics (for AI Advisor) ───────────────────────────────────
 
@@ -772,6 +774,88 @@ class MongoDBHandler:
             'baseline_created_at':     baseline_doc.get('created_at'),
             'is_new_baseline':         is_new_baseline,
         }
+
+    def get_daily_cost_history(
+        self,
+        water_price_per_liter: float,
+        electricity_price_per_kwh: float,
+        fertilizer_price_per_5l: float,
+        days: int = 14,
+    ) -> list:
+        """
+        Return per-day resource costs derived from the daily_costs baseline docs.
+
+        Each daily_costs doc stores the cumulative totals at the START of that
+        calendar day. Therefore the usage *on* day D equals
+            baseline(D+1) - baseline(D)
+        and for the most recent day (today) it is
+            current_cumulative - baseline(today).
+
+        Negative deltas (a mid-day plant-cycle reset dropped the cumulative
+        totals) are clamped to 0 — consistent with get_today_costs().
+
+        Returns newest-last list of:
+          {date, water_cost_nis, electricity_cost_nis,
+           fertilizer_cost_nis, total_cost_nis}
+        Limited to the last `days` entries.
+        """
+        try:
+            col = self.__db['daily_costs']
+            # Only real per-day baseline docs have a YYYY-MM-DD _id string.
+            docs = [
+                d for d in col.find().sort('_id', pymongo.ASCENDING)
+                if isinstance(d.get('_id'), str) and len(d.get('_id')) == 10
+            ]
+            if not docs:
+                return []
+
+            def _state_float(key: str) -> float:
+                doc = self.__db['system_state'].find_one({'key': key})
+                if doc and doc.get('value') is not None:
+                    try:
+                        return float(doc['value'])
+                    except (TypeError, ValueError):
+                        pass
+                return 0.0
+
+            current_water  = _state_float('total_water_liters')
+            current_energy = _state_float('total_energy_wh')
+            current_fert   = _state_float('total_fertilizer_liters')
+
+            result = []
+            for i, doc in enumerate(docs):
+                bw = float(doc.get('baseline_water_liters',      0.0))
+                be = float(doc.get('baseline_energy_wh',         0.0))
+                bf = float(doc.get('baseline_fertilizer_liters', 0.0))
+
+                if i < len(docs) - 1:
+                    nxt = docs[i + 1]
+                    nw = float(nxt.get('baseline_water_liters',      0.0))
+                    ne = float(nxt.get('baseline_energy_wh',         0.0))
+                    nf = float(nxt.get('baseline_fertilizer_liters', 0.0))
+                else:
+                    nw, ne, nf = current_water, current_energy, current_fert
+
+                water_used  = max(0.0, nw - bw)
+                energy_used = max(0.0, ne - be)
+                fert_used   = max(0.0, nf - bf)
+
+                water_cost = round(water_used  * water_price_per_liter,              4)
+                elec_cost  = round((energy_used / 1000.0) * electricity_price_per_kwh, 4)
+                fert_cost  = round((fert_used   / 5.0)    * fertilizer_price_per_5l,  4)
+
+                result.append({
+                    'date':                 doc['_id'],
+                    'water_cost_nis':       water_cost,
+                    'electricity_cost_nis': elec_cost,
+                    'fertilizer_cost_nis':  fert_cost,
+                    'total_cost_nis':       round(water_cost + elec_cost + fert_cost, 4),
+                })
+
+            return result[-days:]
+        except Exception as e:
+            _CUSTOM_PRINT_FUNC(f"Error building daily cost history: {e}")
+            return []
 
     # ── Layer 3 — layer3_decisions ───────────────────────────────────────────
 

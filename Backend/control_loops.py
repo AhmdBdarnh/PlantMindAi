@@ -41,7 +41,7 @@ def _interruptible_sleep(pause_event, seconds):
 # Renamed from FAN_SCHEDULE_TEST_ENABLED → FAN_SCHEDULE_ENABLED (Step 8).
 # The day/night schedule is now permanent production behavior.
 # Set to False only to restore temperature-PID fan control.
-FAN_SCHEDULE_ENABLED      = True
+FAN_SCHEDULE_ENABLED      = False
 FAN_SCHEDULE_TEST_ENABLED = FAN_SCHEDULE_ENABLED   # backward-compatible alias
 
 FAN_DAY_START_HOUR   = 6   # 06:00 — fan at full day duty

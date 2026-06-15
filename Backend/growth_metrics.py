@@ -60,6 +60,27 @@ def _import_growth_functions():
 
 # ── S3 helpers ────────────────────────────────────────────────────────────────
 
+def _cycle_boundary():
+    """Return the active plant-cycle start as a timezone-aware datetime, or None.
+
+    Images modified before this instant belong to a previous plant and must be
+    ignored. The boundary is the 'cycle_started_at' value written by a
+    New-Plant-Cycle / resource reset. Returns None when no cycle is set."""
+    try:
+        if _mongo_db_handler is None:
+            return None
+        raw = _mongo_db_handler.get_state('cycle_started_at')
+        if not raw:
+            return None
+        dt = datetime.datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.astimezone()  # interpret naive local timestamp as aware
+        return dt
+    except Exception as e:
+        _CUSTOM_PRINT_FUNC(f"[Growth] Could not parse cycle boundary: {e}")
+        return None
+
+
 def _fetch_latest_s3_images(prefix: str) -> tuple[dict, str]:
     """
     List objects under `prefix`, find the latest file for cam1, cam2, cam3
@@ -106,6 +127,30 @@ def _fetch_latest_s3_images(prefix: str) -> tuple[dict, str]:
             f"No cam1/cam2/cam3 images found under prefix '{prefix}'. "
             "Files must start with 'cam1_', 'cam2_', or 'cam3_'."
         )
+
+    # ── Scope to the current plant cycle ──────────────────────────────────────
+    # Ignore images captured before the last New-Plant-Cycle / resource reset so a
+    # new plant never analyzes the previous plant's photos. Old images stay in S3.
+    boundary = _cycle_boundary()
+    if boundary is not None:
+        def _after_boundary(obj):
+            lm = obj.get('last_modified')
+            if lm is None:
+                return False
+            try:
+                if lm.tzinfo is None:
+                    lm = lm.replace(tzinfo=datetime.timezone.utc)
+                return lm >= boundary
+            except Exception:
+                return False
+        for cam_name in cam_buckets:
+            cam_buckets[cam_name] = [o for o in cam_buckets[cam_name] if _after_boundary(o)]
+        if not any(cam_buckets.values()):
+            raise RuntimeError(
+                "No camera images have been captured since the new plant cycle "
+                "started. Capture new photos for this plant before running growth "
+                "analysis — the previous plant's images are kept but not used."
+            )
 
     tmpdir = tempfile.mkdtemp(prefix='growth_s3_')
     cam_files: dict[str, tuple[str, str]] = {}

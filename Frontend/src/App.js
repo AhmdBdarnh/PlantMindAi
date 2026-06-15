@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import './App.css';
 import Dashboard from './pages/Dashboard';
-import PlantEnvironment from './pages/PlantEnvironment';
 import ActuatorControl from './pages/ActuatorControl';
 import ResourceConsumption from './pages/ResourceConsumption';
 import PlantGrowth from './pages/PlantGrowth';
@@ -9,6 +8,7 @@ import PlantHealth from './pages/PlantHealth';
 import LiveCams from './pages/LiveCams';
 import AISetpointAdvisor from './pages/AISetpointAdvisor';
 import Layer3Decision    from './pages/Layer3Decision';
+import TestGrowth        from './pages/TestGrowth';
 import NotificationBell from './components/NotificationBell';
 import Toast from './components/Toast';
 import { API_BASE_URL } from './api/config';
@@ -16,7 +16,6 @@ const MAX_HISTORY = 60;
 
 const NAV_ITEMS = [
   { id: 'dashboard',    label: 'Dashboard',            icon: 'M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6' },
-  { id: 'environment',  label: 'Plant Environment',    icon: 'M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z' },
   { id: 'actuators',    label: 'Actuator Control',     icon: 'M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4' },
   { id: 'resources',    label: 'Resource Consumption', icon: 'M13 10V3L4 14h7v7l9-11h-7z' },
   { id: 'health',       label: 'Plant Health',         icon: 'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z' },
@@ -24,6 +23,7 @@ const NAV_ITEMS = [
   { id: 'livecams',     label: 'Live Cams',            icon: 'M15 10l4.553-2.069A1 1 0 0121 8.82v6.36a1 1 0 01-1.447.894L15 14M3 8a2 2 0 012-2h10a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z' },
   { id: 'ai-advisor',  label: 'AI Setpoint Advisor',  icon: 'M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z' },
   { id: 'layer3',      label: 'Budget Manager',       icon: 'M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z' },
+  { id: 'testgrowth',  label: 'Test Growth',          icon: 'M9 3h6m-6 0v5l-5 9a1 1 0 00.9 1.5h14.2a1 1 0 00.9-1.5l-5-9V3m-6 0h6' },
 ];
 
 function App() {
@@ -636,16 +636,10 @@ function App() {
               lastUpdate={lastUpdate}
               captureSessions={captureSessions}
               healthDbLatest={healthDbLatest}
+              healthDbHistory={healthDbHistory}
               growthLatest={growthLatest}
+              growthHistory={growthHistory}
               onNavigate={setActivePage}
-            />
-          )}
-          {activePage === 'environment' && (
-            <PlantEnvironment
-              sensors={sensors}
-              sensorHistory={sensorHistory}
-              setpoints={setpoints}
-              lastUpdate={lastUpdate}
             />
           )}
           {activePage === 'actuators' && (
@@ -705,6 +699,9 @@ function App() {
           )}
           {activePage === 'layer3' && (
             <Layer3Decision />
+          )}
+          {activePage === 'testgrowth' && (
+            <TestGrowth />
           )}
         </main>
       </div>

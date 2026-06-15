@@ -83,7 +83,7 @@ def send_telegram_alert(
             'sensor_warning',
             'critical' if severity.upper() in ('CRITICAL', 'DANGER') else 'warning',
             title, message,
-            category='sensor', link='environment',
+            category='sensor', link='dashboard',
             meta={'component': component, 'value': current_value},
             dedup_key=f"sensor:{title}|{component or ''}",
             dedup_window_sec=COOLDOWN_SEC.get(severity.upper(), 600),
