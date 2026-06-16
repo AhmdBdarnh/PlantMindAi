@@ -56,7 +56,7 @@ function envStatus(cfg, value, sp) {
 const nis =(v, d = 2) => (v == null || isNaN(v)) ? '—' : `₪${Number(v).toFixed(d)}`;
 
 // ── Compact trend sparkline (line + area) ─────────────────────────────────────
-function Sparkline({ points, color, unit = '', height = 90, valueDec = 1 }) {
+function Sparkline({ points, color, unit = '', height = 78, valueDec = 1 }) {
   const vals = (points || []).map(p => p.value).filter(v => v != null && !isNaN(v));
   if (vals.length < 2) {
     return (
@@ -108,7 +108,7 @@ function DailyBars({ history, todayDate }) {
   if (!history || history.length === 0) {
     return (
       <div style={{
-        height: 120, display: 'flex', alignItems: 'center', justifyContent: 'center',
+        height: 96, display: 'flex', alignItems: 'center', justifyContent: 'center',
         background: '#f9fafb', borderRadius: 8, border: '1px dashed #e5e7eb',
         fontSize: 12, color: '#9ca3af', fontStyle: 'italic',
       }}>
@@ -116,29 +116,53 @@ function DailyBars({ history, todayDate }) {
       </div>
     );
   }
-  const max = Math.max(...history.map(d => d.total_cost_nis || 0), 0.0001);
+  const vals = history.map(d => d.total_cost_nis || 0);
+  const max  = Math.max(...vals, 0.0001);
+  const PLOT = 78; // px height of the tallest bar
   const fmtDay = (iso) => { try { return new Date(iso + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' }); } catch { return iso; } };
+
   return (
-    <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6, height: 130, padding: '8px 2px 0', overflowX: 'auto' }}>
-      {history.map((d) => {
-        const h = Math.max(2, ((d.total_cost_nis || 0) / max) * 96);
-        const isToday = d.date === todayDate;
-        return (
-          <div key={d.date} title={`${fmtDay(d.date)}: ${nis(d.total_cost_nis, 4)}`}
-            style={{ flex: '1 0 26px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
-            <span style={{ fontSize: 9, fontWeight: 700, color: isToday ? '#15803d' : '#9ca3af' }}>
-              {(d.total_cost_nis || 0) > 0 ? Number(d.total_cost_nis).toFixed(2) : ''}
+    <div>
+      {/* peak reference */}
+      <div style={{ fontSize: 10.5, color: '#9ca3af', marginBottom: 2 }}>Peak day: <b style={{ color: '#374151' }}>{nis(max)}</b></div>
+
+      {/* plot area with baseline */}
+      <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: history.length < 6 ? 'flex-start' : 'space-between',
+                    gap: 8, height: PLOT + 22, padding: '14px 2px 0', borderBottom: '2px solid #e5e7eb', overflowX: 'auto' }}>
+        {history.map((d) => {
+          const v = d.total_cost_nis || 0;
+          const h = v > 0 ? Math.max(6, (v / max) * PLOT) : 2;
+          const isToday = d.date === todayDate;
+          return (
+            <div key={d.date} title={`${fmtDay(d.date)}: ${nis(v, 4)}`}
+              style={{ flex: '1 0 40px', maxWidth: 70, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'flex-end', height: '100%' }}>
+              {/* value label above the bar */}
+              <span style={{ fontSize: 10.5, fontWeight: 800, color: isToday ? '#15803d' : '#6b7280', marginBottom: 4, whiteSpace: 'nowrap' }}>
+                {v > 0 ? nis(v) : '—'}
+              </span>
+              {/* bar */}
+              <div style={{
+                width: '74%', maxWidth: 38, height: h, borderRadius: '6px 6px 0 0',
+                background: isToday ? 'linear-gradient(180deg,#22c55e,#15803d)' : '#4ade80',
+                boxShadow: isToday ? '0 2px 6px rgba(21,128,61,0.35)' : 'none',
+              }} />
+            </div>
+          );
+        })}
+      </div>
+
+      {/* date labels under the baseline */}
+      <div style={{ display: 'flex', justifyContent: history.length < 6 ? 'flex-start' : 'space-between', gap: 8, marginTop: 6 }}>
+        {history.map((d) => {
+          const isToday = d.date === todayDate;
+          return (
+            <span key={d.date} style={{ flex: '1 0 40px', maxWidth: 70, textAlign: 'center', fontSize: 10.5,
+              color: isToday ? '#15803d' : '#9ca3af', fontWeight: isToday ? 800 : 500, whiteSpace: 'nowrap' }}>
+              {isToday ? 'Today' : fmtDay(d.date)}
             </span>
-            <div style={{
-              width: '100%', maxWidth: 30, height: h, borderRadius: '5px 5px 0 0',
-              background: isToday ? 'linear-gradient(180deg,#16a34a,#15803d)' : '#bbf7d0',
-            }} />
-            <span style={{ fontSize: 9, color: isToday ? '#15803d' : '#9ca3af', fontWeight: isToday ? 700 : 500, whiteSpace: 'nowrap' }}>
-              {fmtDay(d.date)}
-            </span>
-          </div>
-        );
-      })}
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -146,8 +170,8 @@ function DailyBars({ history, todayDate }) {
 // ── Section wrapper ───────────────────────────────────────────────────────────
 function Section({ icon, iconColor = '#16a34a', iconBg = '#f0fdf4', title, right, children, accentBg = '#fff', accentBorder = '#e5e7eb' }) {
   return (
-    <div style={{ background: accentBg, border: `1px solid ${accentBorder}`, borderRadius: 16, padding: '20px 22px', marginBottom: 20 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16, flexWrap: 'wrap' }}>
+    <div style={{ background: accentBg, border: `1px solid ${accentBorder}`, borderRadius: 16, padding: '16px 20px', marginBottom: 14 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14, flexWrap: 'wrap' }}>
         <div style={{ background: iconBg, borderRadius: 9, padding: 8, display: 'flex' }}>
           <Icon path={icon} size={16} color={iconColor} />
         </div>
@@ -178,6 +202,8 @@ export default function Dashboard({
   const sp = setpoints || {};
   const s  = sensors   || {};
   const isAuto = sp.operation_mode === 'autonomous';
+
+  const [tab, setTab] = useState('state'); // 'state' = sections 1+2, 'budget' = sections 3+4
 
   // ── Self-fetched data (budget / costs / recommendation) ─────────────────────
   const [decision,   setDecision]   = useState(null);
@@ -295,34 +321,52 @@ export default function Dashboard({
     .map(r => ({ value: Number(r.health_probability), label: fmtShort(r.created_at) }));
 
   // ── Growth panel ────────────────────────────────────────────────────────────
-  const gd     = growthLatest && growthLatest.status === 'success' ? growthLatest : null;
-  const gArea  = gd ? (gd.canopy_area_cm2 ?? gd.area_cm2) : null;
+  const gd = growthLatest && growthLatest.status === 'success' ? growthLatest : null;
+
+  // Growth % since day 1 — vs the FIRST measurement of the current plant cycle
+  // (history is scoped per-cycle and ordered newest-first → oldest is last).
+  const gSuccess = [...(growthHistory || [])].filter(r => r.status === 'success' && r.area_cm2 != null);
+  const gFirst   = gSuccess.length ? gSuccess[gSuccess.length - 1] : null;
+  const areaSincePct = (gd && gFirst && gFirst.area_cm2 > 0)
+    ? ((gd.area_cm2 - gFirst.area_cm2) / gFirst.area_cm2) * 100
+    : null;
+  const gDays = (gd && gFirst && gFirst.captured_at && gd.captured_at)
+    ? Math.max(0, Math.round((new Date(gd.captured_at) - new Date(gFirst.captured_at)) / 86400000))
+    : null;
+  // Volume (V_index) trend over time — oldest → newest for the chart.
   const growthSpark = [...(growthHistory || [])]
-    .filter(r => r.status === 'success' && r.height_cm != null)
+    .filter(r => r.status === 'success' && r.volume_cm3 != null)
     .reverse()
-    .map(r => ({ value: Number(r.height_cm), label: fmtShort(r.created_at) }));
+    .map(r => ({ value: Number(r.volume_cm3), label: fmtShort(r.created_at) }));
 
   return (
     <div style={{ maxWidth: 1400, margin: '0 auto' }}>
 
       {/* ── Page header ── */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20, flexWrap: 'wrap', gap: 12 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-          <div style={{ background: 'linear-gradient(135deg, #16a34a, #15803d)', borderRadius: 14, padding: 12, display: 'flex' }}>
-            <Icon path={ICONS.leaf} size={26} color='#fff' />
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, flexWrap: 'wrap', gap: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ background: 'linear-gradient(135deg, #16a34a, #15803d)', borderRadius: 10, padding: 8, display: 'flex' }}>
+            <Icon path={ICONS.leaf} size={18} color='#fff' />
           </div>
           <div>
-            <h2 style={{ margin: 0, fontSize: 22, fontWeight: 900, color: '#111827' }}>Dashboard</h2>
-            <div style={{ fontSize: 13, color: '#9ca3af', marginTop: 2 }}>System Overview · Lettuce</div>
+            <h2 style={{ margin: 0, fontSize: 18, fontWeight: 900, color: '#111827' }}>Dashboard</h2>
+            <div style={{ fontSize: 12, color: '#9ca3af' }}>System Overview · Lettuce</div>
           </div>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '8px 16px', borderRadius: 99, background: isAuto ? '#f0fdf4' : '#eff6ff', border: `1px solid ${isAuto ? '#86efac' : '#bfdbfe'}` }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 14px', borderRadius: 99, background: isAuto ? '#f0fdf4' : '#eff6ff', border: `1px solid ${isAuto ? '#86efac' : '#bfdbfe'}` }}>
           <div style={{ width: 8, height: 8, borderRadius: '50%', background: isAuto ? '#16a34a' : '#2563eb' }} />
           <Icon path={isAuto ? ICONS.auto : ICONS.manual} size={14} color={isAuto ? '#16a34a' : '#2563eb'} />
           <span style={{ fontSize: 13, fontWeight: 700, color: isAuto ? '#15803d' : '#1d4ed8' }}>{isAuto ? 'Autonomous' : 'Manual'}</span>
         </div>
       </div>
 
+      {/* ── Tab bar (below the header) ── */}
+      <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
+        <TabBtn active={tab === 'state'}  onClick={() => setTab('state')}  icon={ICONS.leaf}>Environment &amp; Plant</TabBtn>
+        <TabBtn active={tab === 'budget'} onClick={() => setTab('budget')} icon={ICONS.money}>Expenses &amp; Budget</TabBtn>
+      </div>
+
+      {tab === 'state' && (<>
       {/* ═══ 1. CURRENT ENVIRONMENT CONTROL ═══ */}
       <Section
         icon={ICONS.temp} iconColor='#d97706' iconBg='#fef3c7'
@@ -332,7 +376,7 @@ export default function Dashboard({
           {lastUpdate ? `Updated ${lastUpdate}` : 'Waiting for sensor data…'}
         </span>}
       >
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: 8 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 7 }}>
           {ENV_PARAMS.map(cfg => (
             <EnvMiniCard
               key={cfg.key}
@@ -347,12 +391,12 @@ export default function Dashboard({
       </Section>
 
       {/* ═══ 2. CURRENT PLANT STATE ═══ */}
-      <div style={{ fontSize: 13, fontWeight: 800, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.06em', margin: '0 2px 10px' }}>Current Plant State</div>
-      <div className="grid-2" style={{ marginBottom: 20 }}>
+      <div style={{ fontSize: 12, fontWeight: 800, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.06em', margin: '0 2px 8px' }}>Current Plant State</div>
+      <div className="grid-2" style={{ marginBottom: 0 }}>
 
         {/* A. Plant Health */}
-        <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16, padding: '20px 22px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+        <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16, padding: '14px 16px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
             <div style={{ background: '#f0fdf4', borderRadius: 9, padding: 8, display: 'flex' }}><Icon path={ICONS.health} size={16} color={hAccent} /></div>
             <span style={{ fontSize: 15, fontWeight: 800, color: '#111827' }}>Plant Health</span>
             {hp && <span style={{ marginLeft: 'auto', fontSize: 11, color: '#9ca3af' }}>{fmtDate(hp.created_at, true)}</span>}
@@ -369,14 +413,14 @@ export default function Dashboard({
               </div>
               <div style={{ fontSize: 13, color: '#374151', lineHeight: 1.5, marginBottom: 14 }}>{hMessage}</div>
               <div style={{ fontSize: 11, fontWeight: 700, color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 4 }}>Health trend (confidence %)</div>
-              <Sparkline points={healthSpark} color={hAccent === '#9ca3af' ? '#16a34a' : hAccent} unit='%' valueDec={0} />
+              <Sparkline points={healthSpark} color={hAccent === '#9ca3af' ? '#16a34a' : hAccent} unit='%' valueDec={0} height={58} />
             </>
           )}
         </div>
 
         {/* B. Plant Growth */}
-        <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16, padding: '20px 22px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+        <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16, padding: '14px 16px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
             <div style={{ background: '#f0fdf4', borderRadius: 9, padding: 8, display: 'flex' }}><Icon path={ICONS.growth} size={16} color='#16a34a' /></div>
             <span style={{ fontSize: 15, fontWeight: 800, color: '#111827' }}>Plant Growth</span>
             {gd && <span style={{ marginLeft: 'auto', fontSize: 11, color: '#9ca3af' }}>{fmtDate(gd.created_at, true)}</span>}
@@ -387,26 +431,35 @@ export default function Dashboard({
             </div>
           ) : (
             <>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8, marginBottom: 8 }}>
-                <Metric label='Height' value={gd.height_cm != null ? Number(gd.height_cm).toFixed(1) : '—'} unit='cm' />
-                <Metric label='Canopy' value={gArea != null ? Number(gArea).toFixed(0) : '—'} unit='cm²' />
+              {/* Just four — Height, Width, Volume, Growth % since day 1 (all from the new pipeline) */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 8 }}>
+                <Metric label='Height' value={gd.height_cm  != null ? Number(gd.height_cm ).toFixed(1) : '—'} unit='cm' />
+                <Metric label='Width'  value={gd.width_cm   != null ? Number(gd.width_cm  ).toFixed(1) : '—'} unit='cm' />
                 <Metric label='Volume' value={gd.volume_cm3 != null ? Number(gd.volume_cm3).toFixed(0) : '—'} unit='cm³' />
-                <Metric label='Growth' value={gd.growth_pct != null ? `${gd.growth_pct >= 0 ? '+' : ''}${Number(gd.growth_pct).toFixed(1)}` : '—'} unit='%' color={gd.growth_pct == null ? '#111827' : gd.growth_pct >= 0 ? '#16a34a' : '#dc2626'} />
-                <Metric label='AGR' value={gd.agr != null ? Number(gd.agr).toFixed(2) : '—'} unit='cm²/d' />
-                <Metric label='RGR' value={gd.rgr != null ? Number(gd.rgr).toFixed(3) : '—'} unit='/d' />
+                <Metric
+                  label={gDays && gDays > 0 ? `Growth · ${gDays}d` : 'Growth · day 1'}
+                  value={areaSincePct != null ? `${areaSincePct >= 0 ? '+' : ''}${areaSincePct.toFixed(1)}` : '—'}
+                  unit='%'
+                  color={areaSincePct == null ? '#111827' : areaSincePct >= 0 ? '#16a34a' : '#dc2626'}
+                />
               </div>
-              <div style={{ fontSize: 11, fontWeight: 700, color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.05em', marginTop: 8, marginBottom: 4 }}>Growth trend (height cm)</div>
-              <Sparkline points={growthSpark} color='#16a34a' unit=' cm' valueDec={1} />
+
+              {/* Growth trend chart — Volume (V_index) over time */}
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.05em', marginTop: 12, marginBottom: 4 }}>Growth trend (volume cm³)</div>
+              <Sparkline points={growthSpark} color='#16a34a' unit=' cm³' valueDec={0} height={64} />
             </>
           )}
         </div>
       </div>
+      </>)}
 
+      {tab === 'budget' && (
+      <div className="grid-2" style={{ alignItems: 'start' }}>
       {/* ═══ 3. EXPENSES ═══ */}
       <Section icon={ICONS.money} title='Expenses'
         right={resetLabelChip(cycleStart)}
       >
-        <div className="grid-4" style={{ marginBottom: 16 }}>
+        <div className="grid-2" style={{ marginBottom: 12 }}>
           <BigStat label='Total cost so far' value={nis(totalSoFar, 4)} accent />
           <BigStat label='Cost today' value={nis(costToday)} />
           <BigStat label='Cost yesterday' value={nis(costYesterday)} />
@@ -418,7 +471,7 @@ export default function Dashboard({
           />
         </div>
 
-        <div className="grid-3" style={{ marginBottom: 18 }}>
+        <div className="grid-3" style={{ marginBottom: 12 }}>
           {[
             { label: 'Water cost',       value: s.water_cost_nis,       icon: ICONS.water, iconBg: '#eff6ff', iconColor: '#2563eb' },
             { label: 'Fertilizer cost',  value: s.fertilizer_cost_nis,  icon: ICONS.fert,  iconBg: '#f0fdf4', iconColor: '#16a34a' },
@@ -453,7 +506,7 @@ export default function Dashboard({
           </div>
         ) : (
           <>
-            <div className="grid-4" style={{ marginBottom: 16 }}>
+            <div className="grid-2" style={{ marginBottom: 12 }}>
               <BigStat label='Cycle budget' value={nis(cycleBudget)} />
               <BigStat label='Spent so far' value={nis(spent)} accent />
               <BigStat label='Remaining' value={nis(remaining)} color={remaining === 0 ? '#dc2626' : '#16a34a'} />
@@ -511,8 +564,34 @@ export default function Dashboard({
           )}
         </div>
       </Section>
+      </div>
+      )}
 
     </div>
+  );
+}
+
+// ── Tab button (clear, solid button look) ─────────────────────────────────────
+function TabBtn({ active, onClick, icon, children }) {
+  return (
+    <button onClick={onClick} style={{
+      display: 'inline-flex', alignItems: 'center', gap: 9,
+      padding: '11px 22px', borderRadius: 12, cursor: 'pointer', whiteSpace: 'nowrap',
+      fontSize: 14, fontWeight: 800, transition: 'all 0.15s', outline: 'none',
+      background: active ? 'linear-gradient(135deg,#16a34a,#15803d)' : '#fff',
+      color: active ? '#fff' : '#374151',
+      border: active ? '1px solid #15803d' : '1.5px solid #d1d5db',
+      boxShadow: active ? '0 4px 12px rgba(21,128,61,0.30)' : '0 1px 2px rgba(0,0,0,0.06)',
+      transform: active ? 'translateY(-1px)' : 'none',
+    }}>
+      <span style={{
+        display: 'flex', borderRadius: 7, padding: 5,
+        background: active ? 'rgba(255,255,255,0.22)' : '#f0fdf4',
+      }}>
+        <Icon path={icon} size={15} color={active ? '#fff' : '#16a34a'} />
+      </span>
+      {children}
+    </button>
   );
 }
 
@@ -541,9 +620,9 @@ function EnvMiniCard({ label, value, target, unit, status }) {
 // ── Small helpers ─────────────────────────────────────────────────────────────
 function Metric({ label, value, unit, color = '#111827' }) {
   return (
-    <div style={{ textAlign: 'center', background: '#f9fafb', borderRadius: 8, padding: '12px 6px' }}>
-      <div style={{ fontSize: 10, color: '#9ca3af', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 4 }}>{label}</div>
-      <div style={{ fontSize: 17, fontWeight: 900, color }}>{value}<span style={{ fontSize: 10, color: '#9ca3af', fontWeight: 600 }}> {unit}</span></div>
+    <div style={{ textAlign: 'center', background: '#f9fafb', borderRadius: 8, padding: '8px 6px' }}>
+      <div style={{ fontSize: 10, color: '#9ca3af', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 3 }}>{label}</div>
+      <div style={{ fontSize: 16, fontWeight: 900, color }}>{value}<span style={{ fontSize: 10, color: '#9ca3af', fontWeight: 600 }}> {unit}</span></div>
     </div>
   );
 }
