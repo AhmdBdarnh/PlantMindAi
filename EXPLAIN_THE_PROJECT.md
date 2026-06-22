@@ -46,7 +46,7 @@ Flask (port 5000) ──► MongoDB Atlas   (כל הנתונים)
       │           ──► AWS S3          (תמונות)
       │           ──► OpenAI API      (AI המלצות)
       │           ──► HiveMQ MQTT     (telemetry)
-      │           ──► Telegram API    (התראות)
+      │           ──► Email (SMTP)    (התראות)
       │           ──► Plant.id API    (בריאות צמח)
       │
     I2C (0x30)
@@ -98,8 +98,8 @@ Flask (port 5000) ──► MongoDB Atlas   (כל הנתונים)
 | `growth_measurements` — 7 אחרונות | Layer 2 בונה context |
 | `pump_logs` — היסטוריית משאבות | Layer 2 + ממשק Resources |
 | `ai_setpoint_recommendations` — אחרונה | Layer 3, ממשק AI Advisor |
-| `budget_config` | Layer 3 Gate 3 |
-| `daily_costs` | Layer 3 Gate 3 |
+| `budget_config` | Layer 3 — בדיקת תקציב |
+| `daily_costs` | Layer 3 — בדיקת תקציב |
 | `layer3_decisions` — אחרונה | ממשק Budget Manager |
 
 **אם MongoDB לא זמין:** הbackend ממשיך לפעול. חיישנים נקראים, actuators פועלים. רק שמירת היסטוריה נכשלת.
@@ -251,7 +251,7 @@ max_completion_tokens=2000 # (16000 למודלי thinking)
 1. Layer 2 validates כל שינוי מול SAFETY_LIMITS
 2. שומר ב-MongoDB עם status=`pending`
 3. מפעיל Layer 3 אוטומטית
-4. שולח Telegram
+4. שולח Email
 
 **עלות:** כל קריאה ≈ 2000–3000 tokens. מוגבל ל-3 קריאות ביום.
 
@@ -404,42 +404,42 @@ Content-Type: application/json
 
 ---
 
-### 4.6 Telegram Bot API
+### 4.6 Email Alerts (SMTP)
 
-**מה זה:** שליחת הודעות לטלפון כשיש בעיה.
+**מה זה:** שליחת הודעות email כשיש אירוע חריג בחיישנים, ב-actuators או ב-backend.
 
-**URL:** `https://api.telegram.org/bot{TOKEN}/sendMessage`
-**chat_id:** `902586320` (מ-.env: `TELEGRAM_CHAT_ID`)
+> הערה: המודול נקרא `Backend/telegram_alerts.py` ושומר על שמו הישן + על שם הפונקציה `send_telegram_alert()` כדי לא לשבור את שאר הקוד שמייבא אותם — אבל **פנימית הוא שולח email דרך SMTP, לא Telegram**. אין יותר אינטגרציה ל-Telegram במערכת.
 
-#### מה שולחים לTelegram:
+**שרת SMTP:** `SMTP_HOST` (ברירת מחדל `smtp.gmail.com`), port `SMTP_PORT` (ברירת מחדל `587`, STARTTLS)
+**שולח:** `ALERT_EMAIL_FROM` (חשבון Gmail) + `ALERT_EMAIL_APP_PASSWORD` (App Password בן 16 תווים — לא סיסמת ההתחברות)
+**נמען:** `ALERT_EMAIL_TO` (ברירת מחדל `ahmds3b@gmail.com`)
 
-**HTTP POST:**
-```json
-{
-  "chat_id": "902586320",
-  "text": "⚠️ *WARNING* — Soil EC High\n\nComponent: EC/pH Sensor\nValue: 1650 µS/cm\nAllowed: 100–1600 µS/cm\nAction: Fertilizer pump OFF",
-  "parse_mode": "Markdown"
-}
+**מתי פעיל:** רק כש-`ALERT_EMAIL_FROM` + `ALERT_EMAIL_APP_PASSWORD` מוגדרים ב-.env. אחרת ההתראה רק מודפסת ל-terminal (`EMAIL_ENABLED=False`).
+
+#### מה שולחים (email):
+
+**Subject:**
+```
+⚠️ PlantMind AI [WARNING] — Soil EC High
 ```
 
-#### מה מקבלים מTelegram:
+**Body (plain text):**
+```
+PlantMind AI Alert
+==================
 
-```json
-{
-  "ok": true,
-  "result": {
-    "message_id": 4521,
-    "chat": {"id": 902586320},
-    "text": "...",
-    "date": 1748865000
-  }
-}
+Title:      Soil EC High
+Severity:   WARNING
+Time:       2026-06-17 14:00:00
+Component:  EC Sensor / Fertilizer
+Problem:    EC is critically above the safe threshold
+Current Value:  1650 µS/cm
+Allowed Range:  < 1600 µS/cm
+Action Taken:   Fertilizer pump OFF
+Recommendation: Monitor EC — may need manual dilution
 ```
 
-או שגיאה:
-```json
-{"ok": false, "error_code": 429, "description": "Too Many Requests"}
-```
+השליחה רצה ב-thread נפרד (`_send_email_safe`), כך ש-SMTP איטי לעולם לא חוסם את ה-control loops. אם השליחה נכשלת — ה-backend ממשיך לפעול ורק מדפיס ל-terminal.
 
 #### אילו התראות נשלחות:
 
@@ -457,9 +457,11 @@ Content-Type: application/json
 | `alert_ph_warning` | pH < 5.2 או > 7.5 | WARNING | 10 דקות |
 | `alert_actuator_failure` | pump ON נכשל 10 פעמים | CRITICAL | 2 דקות |
 
-**Cooldown:** אותה התראה לא תישלח שוב עד שיחלוף הזמן. מונע spam.
+**Cooldown:** אותה התראה (לפי `title|component`) לא תישלח שוב עד שיחלוף הזמן — INFO 30 דק׳, WARNING 10 דק׳, CRITICAL/DANGER 2 דק׳. מונע spam.
 
-**אם Telegram לא זמין:** הbackend לא נופל. ממשיך לפעול. רק מדפיס לterminal.
+**UI notifications:** כל קריאת alert גם יוצרת notification ב-UI (פעמון + toast) דרך `notifications.py`, עם dedup window שמשקף את ה-cooldown של ה-email. זה ערוץ נפרד מה-email ולעולם לא שולח email בעצמו.
+
+**אם email לא זמין/נכשל:** הbackend לא נופל. ממשיך לפעול. רק מדפיס לterminal.
 
 ---
 
@@ -531,7 +533,7 @@ moisture >= T           → כבוי
 T-H   <= moisture < T  → כבוי (מקובל: 33–45%)
 T-H-5 <= moisture < T-H → 1s פעימה (28–33%)
 T-H-10<= moisture < T-H-5 → 1.5s פעימה (23–28%)
-moisture < T-H-10       → 2s פעימה + CRITICAL טלגרם (<23%)
+moisture < T-H-10       → 2s פעימה + CRITICAL email (<23%)
 ```
 
 ### 6.5 לולאת EC (משאבת דשן)
@@ -543,14 +545,14 @@ moisture < T-H-10       → 2s פעימה + CRITICAL טלגרם (<23%)
 
 **שרשרת החלטות:**
 ```
-EC >= 2000 → DANGER: כבוי + מים לדילול + Telegram DANGER
-EC >= 1600 → כבוי + Telegram WARNING
-EC > 1000  → כבוי + Telegram WARNING
+EC >= 2000 → DANGER: כבוי + מים לדילול + Email DANGER
+EC >= 1600 → כבוי + Email WARNING
+EC > 1000  → כבוי + Email WARNING
 EC >= ec_target → כבוי
 EC >= ec_target-200 → כבוי (מקובל)
 EC >= ec_target-400 → 1s פעימה
 EC < ec_target-400  → 1.5s פעימה
-EC < 550   → Telegram WARNING (נמוך באופן מוחלט)
+EC < 550   → Email WARNING (נמוך באופן מוחלט)
 ```
 
 ---
@@ -570,7 +572,7 @@ EC < 550   → Telegram WARNING (נמוך באופן מוחלט)
 5. validates כל שינוי מול SAFETY_LIMITS
 6. שומר ב-MongoDB (status: pending/needs_manual_review/invalid)
 7. מפעיל Layer 3 אוטומטית
-8. שולח Telegram
+8. שולח Email
 ```
 
 **Setpoints נעולים — GPT לא יכול לשנות:**
@@ -591,35 +593,38 @@ EC < 550   → Telegram WARNING (נמוך באופן מוחלט)
 
 **קובץ:** `Backend/layer3_budget_manager.py`
 
-**כלל:** Layer 3 לעולם לא מפעיל actuators. כל שינוי = אישור משתמש בלבד.
+**כלל:** Layer 3 לעולם לא מפעיל actuators ולעולם לא משנה כוח/משך פעימה של משאבות. כל שינוי = אישור משתמש בלבד.
 
-### שלושה שערים:
+**Layer 3 הוא שכבת ניהול תקציב בלבד:**
+- **לא** בודק בריאות צמח — Layer 2 כבר עושה את זה.
+- **לא** בודק בטיחות חיישנים — Layer 1 מטפל בבטיחות בזמן אמת.
 
-**שער 1 — Sensor Safety:**
-- לחות קרקע < 20% → BLOCK
-- EC > 2500 → BLOCK
-- pH < 4.5 או > 8.0 → BLOCK
-- טמפ > 35°C → BLOCK
+### בדיקת תקציב (Budget Gate):
 
-**שער 2 — Plant Health:**
-- stability_score >= 0.70 + גדילה תקינה → PASS
-- stability_score 0.40–0.70 → MARGINAL
-- stability_score < 0.40 או נתונים ישנים > 48h → FAIL
+בודק את העלויות של היום מול התקציב המוגדר ב-`budget_config`, בשתי רמות:
+- **כולל:** `total_cost_nis` מול `daily_budget`
+- **לפי משאב:** מים / חשמל / דשן מול תת-התקציב שלהם
 
-**שער 3 — Budget:**
-- בודק: water_cost/water_budget, electricity/electricity_budget, total/daily_budget
-- < threshold (80%) → OK
-- >= threshold → WARNING
-- > 100% → OVER_BUDGET
+הסטטוס האפקטיבי = הגרוע מבין הבדיקה הכוללת והבדיקות לפי משאב:
+- usage < `warning_threshold_pct` (ברירת מחדל 80%) → **ok**
+- threshold ≤ usage ≤ 100% → **warning**
+- usage > 100% → **over_budget**
+
+### קיצוצים מוצעים (כש-warning / over_budget):
+
+Layer 3 מציע שינויי setpoints חוסכי-עלות (WARNING → 15% הפחתה, OVER_BUDGET → 25%), אף פעם לא מתחת לרצפות הבטיחות:
+- **LED power** (כשהחשמל הוא ה-driver) — לא מתחת ל-40% מהערך הנוכחי
+- **Night fan duty** — לא מתחת ל-15% מ-PWM המקסימלי
+- **Soil moisture target** (כשהמים הם ה-driver) — לא מתחת ל-35%
 
 ### החלטות:
 
 | החלטה | מתי | Approve |
 |---|---|---|
-| APPROVE | הכל תקין + תקציב OK | ✅ |
-| MODIFY | הכל תקין + תקציב חרג (מציע קיצוצים) | ✅ |
-| BLOCK | שער 1 או 2 נכשל | ❌ |
-| ALERT_ONLY | בריאות שולית + תקציב לא OK | ✅ |
+| APPROVE | תקציב OK → מאשר את המלצת Layer 2 כמו שהיא | ✅ |
+| MODIFY | תקציב warning/over → מציע קיצוצים חוסכי-עלות | ✅ |
+| ALERT_ONLY | לחץ תקציבי אך אין קיצוץ בטוח זמין | ✅ (מידע בלבד) |
+| BLOCK | אין המלצת Layer 2 / היא invalid / ישנה מ-48h | ❌ |
 
 ---
 
@@ -779,7 +784,7 @@ light_pause_event.set()    # מחדש light loop
 
 11:00 — fertilizer_thread בודק: EC=400, target=750
          400 >= ec_pulse_1s (350) → 1s pulse
-         EC < 550 → Telegram "EC נמוך"
+         EC < 550 → Email "EC נמוך"
          → pump ON 1s → pump OFF → ממתין 5 שעות
 
 14:00 — capture: 3 מצלמות → S3 captures/ + Plant.id
@@ -795,7 +800,7 @@ light_pause_event.set()    # מחדש light loop
          מקבל JSON: "העלה soil_ec מ-750 ל-850"
          validates → שומר pending → Layer 3 אוטומטי
 
-15:30 — Layer 3: Gate 1 PASS + Gate 2 PASS + Gate 3 OK → APPROVE
+15:30 — Layer 3: בדיקת תקציב OK → APPROVE
          שומר ב-layer3_decisions
 
 16:00 — משתמש נכנס לAI Advisor:

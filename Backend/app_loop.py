@@ -24,6 +24,11 @@ last_sensor_update = datetime.datetime.now() - datetime.timedelta(seconds=10)
 _sensor_cache      = {}
 _sensor_cache_lock = threading.Lock()
 
+# Air-temp "too high" alert fires only when the reading exceeds the CURRENT
+# temperature setpoint by this margin — not a fixed absolute. A fixed 27°C
+# threshold false-alarms whenever the setpoint is set higher (e.g. 30–32°C).
+TEMP_HIGH_ALERT_MARGIN_C = 3.0
+
 _env_sensors    = None
 _env_actuators  = None
 _setpoints      = None
@@ -287,8 +292,12 @@ def app_task():
                     air_temp_c   = _env_sensors.get_air_temperature_C()
                     air_temp_f   = _env_sensors.get_air_temperature_F()
                     air_humidity = _env_sensors.get_air_humidity()
-                    if air_temp_c > 27.0:
-                        alert_temperature_high(air_temp_c)
+                    # Alert only on genuine overshoot above the current setpoint,
+                    # not a fixed 27°C (which false-alarms at high setpoints).
+                    _temp_sp   = _setpoints.get_temperature_setpoint() if _setpoints else 27.0
+                    _temp_limit = _temp_sp + TEMP_HIGH_ALERT_MARGIN_C
+                    if air_temp_c > _temp_limit:
+                        alert_temperature_high(air_temp_c, limit=_temp_limit)
                 except Exception as e:
                     _CUSTOM_PRINT_FUNC(f"[AppLoop] Error reading temperature: {e}")
                     alert_sensor_error("DHT22 Temperature/Humidity", None, str(e))

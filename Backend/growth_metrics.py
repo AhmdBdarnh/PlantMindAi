@@ -286,6 +286,69 @@ def _run_analysis(images_dict: dict, timestamp_label: str, output_dir: str) -> d
 
 # ── Public pipeline functions ─────────────────────────────────────────────────
 
+def _notify_growth_result(doc: dict) -> None:
+    """Create ONE UI notification per growth analysis (deduped per day so repeated
+    runs on the same day don't spam the bell). Called only after a real analysis
+    completes — never on DB reads. Never raises."""
+    try:
+        import notifications
+        today = datetime.datetime.now().strftime('%Y-%m-%d')
+
+        if doc.get('status') != 'success':
+            # Abnormal result — the analysis ran but could not produce metrics.
+            notifications.create_notification(
+                'growth_attention_required', 'warning',
+                'Plant growth analysis needs attention',
+                'The daily growth analysis finished with an abnormal result and '
+                'could not compute reliable growth metrics.',
+                category='workflow', link='growth',
+                meta={'status': doc.get('status'), 'error': doc.get('error_message')},
+                dedup_key=f"growth_attention:{today}", dedup_window_sec=72000,
+            )
+            return
+
+        # Low detection coverage = the segmentation kept only part of the plant,
+        # so area/growth numbers are unreliable. Surface it instead of reporting
+        # a confident-looking but wrong growth %.
+        cov = doc.get('detection_coverage')
+        if cov is not None and cov < 0.5:
+            notifications.create_notification(
+                'growth_attention_required', 'warning',
+                'Plant growth analysis needs attention',
+                'The growth analysis ran but plant detection was weak '
+                f'(coverage {cov * 100:.0f}%). The measurement may be unreliable — '
+                'check the detection images, lighting and camera framing.',
+                category='workflow', link='growth',
+                meta={'detection_coverage': cov},
+                dedup_key=f"growth_attention:{today}", dedup_window_sec=72000,
+            )
+            return
+
+        gp = doc.get('growth_pct')
+        if gp is None:
+            trend, sev, typ = 'baseline measurement recorded', 'info', 'daily_growth_ready'
+        elif gp <= -15:
+            trend, sev, typ = f'strongly declining ({gp:+.1f}%)', 'warning', 'growth_attention_required'
+        elif gp < -2:
+            trend, sev, typ = f'declining ({gp:+.1f}%)', 'info', 'daily_growth_ready'
+        elif gp <= 2:
+            trend, sev, typ = f'stable ({gp:+.1f}%)', 'info', 'daily_growth_ready'
+        else:
+            trend, sev, typ = f'improving ({gp:+.1f}%)', 'info', 'daily_growth_ready'
+
+        title = ('Plant growth analysis needs attention' if typ == 'growth_attention_required'
+                 else 'Daily plant growth analysis is ready')
+        notifications.create_notification(
+            typ, sev, title,
+            f"Growth is {trend} since the last measurement.",
+            category='workflow', link='growth',
+            meta={'growth_pct': gp},
+            dedup_key=f"growth_ready:{today}", dedup_window_sec=72000,
+        )
+    except Exception as _ntf_err:
+        _CUSTOM_PRINT_FUNC(f"[Notifications] growth notify skipped: {_ntf_err}")
+
+
 def _build_empty_doc(source_type: str) -> dict:
     now = datetime.datetime.now()
     return {
@@ -304,6 +367,7 @@ def _build_empty_doc(source_type: str) -> dict:
         'rgr':                   None,
         'growth_pct':            None,
         'vol_growth_pct':        None,
+        'detection_coverage':    None,
         'output_folder_path':    None,
         'growth_chart_s3_key':   None,
         'detection_cam1_s3_key': None,
@@ -376,6 +440,7 @@ def run_from_s3(prefix: str = None) -> dict:
             'rgr':                   metrics.get('rgr'),
             'growth_pct':            metrics.get('growth%'),
             'vol_growth_pct':        metrics.get('vol_growth%'),
+            'detection_coverage':    metrics.get('detection_coverage'),
             'growth_chart_s3_key':   s3_output_keys.get('growth_chart'),
             'detection_cam1_s3_key': s3_output_keys.get('detection_cam1'),
             'detection_cam2_s3_key': s3_output_keys.get('detection_cam2'),
@@ -401,6 +466,7 @@ def run_from_s3(prefix: str = None) -> dict:
 
     _mongo_db_handler.insert_growth_measurement(doc)
     doc.pop('_id', None)   # MongoDB adds ObjectId after insert — not JSON serializable
+    _notify_growth_result(doc)   # one UI notification per analysis (deduped per day)
     return doc
 
 
@@ -474,6 +540,7 @@ def run_from_session_s3_keys(cam_id_to_s3_key: dict, s3_handler_ref=None) -> dic
             'rgr':                   metrics.get('rgr'),
             'growth_pct':            metrics.get('growth%'),
             'vol_growth_pct':        metrics.get('vol_growth%'),
+            'detection_coverage':    metrics.get('detection_coverage'),
             'growth_chart_s3_key':   s3_output_keys.get('growth_chart'),
             'detection_cam1_s3_key': s3_output_keys.get('detection_cam1'),
             'detection_cam2_s3_key': s3_output_keys.get('detection_cam2'),
@@ -499,6 +566,7 @@ def run_from_session_s3_keys(cam_id_to_s3_key: dict, s3_handler_ref=None) -> dic
 
     _mongo_db_handler.insert_growth_measurement(doc)
     doc.pop('_id', None)   # MongoDB adds ObjectId after insert — not JSON serializable
+    _notify_growth_result(doc)   # one UI notification per analysis (deduped per day)
     return doc
 
 
@@ -561,6 +629,7 @@ def run_from_capture(cam_results: list) -> dict:
             'rgr':                   metrics.get('rgr'),
             'growth_pct':            metrics.get('growth%'),
             'vol_growth_pct':        metrics.get('vol_growth%'),
+            'detection_coverage':    metrics.get('detection_coverage'),
             'growth_chart_s3_key':   s3_output_keys.get('growth_chart'),
             'detection_cam1_s3_key': s3_output_keys.get('detection_cam1'),
             'detection_cam2_s3_key': s3_output_keys.get('detection_cam2'),
@@ -584,4 +653,5 @@ def run_from_capture(cam_results: list) -> dict:
 
     _mongo_db_handler.insert_growth_measurement(doc)
     doc.pop('_id', None)   # MongoDB adds ObjectId after insert — not JSON serializable
+    _notify_growth_result(doc)   # one UI notification per analysis (deduped per day)
     return doc

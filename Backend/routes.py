@@ -1176,22 +1176,9 @@ def init_routes(
             return jsonify({'success': False, 'error': 'Layer 3 review already in progress.'}), 409
         _l3._run_lock.release()
 
-        # Only the Layer 2 "Send to Budget Manager" button sets triggered_by=advisor.
-        # Other callers (Budget Manager "Run Review", background auto-trigger) do not,
-        # so this notification is created only for the explicit user hand-off.
-        try:
-            _run_body = request.get_json(silent=True) or {}
-            if _run_body.get('triggered_by') == 'advisor':
-                import notifications
-                notifications.create_notification(
-                    'sent_to_budget', 'info',
-                    'Sent to Budget Manager',
-                    'The AI recommendation was sent to the Budget Manager for review.',
-                    category='workflow', link='layer3',
-                    dedup_key='sent_to_budget', dedup_window_sec=60,
-                )
-        except Exception as _ntf_err:
-            _CUSTOM_PRINT_FUNC(f"[Notifications] sent_to_budget skipped: {_ntf_err}")
+        # No notification for the Layer 2 → Layer 3 hand-off: it is an internal
+        # transition inside one workflow. The single user-facing notification is
+        # emitted by the Budget Manager when its review completes.
 
         def _bg():
             try:
@@ -1761,6 +1748,37 @@ def init_routes(
                 else:
                     fan_reason = f"Air {_t:.1f}°C near target {sp_temp:.1f}°C — stable"
 
+            # ── Fan setpoints + action ─────────────────────────────────────────
+            # The ventilator is driven by the temperature PID (cooling) unless the
+            # day/night schedule is explicitly enabled. Report whichever mode is
+            # actually active so the actuator card matches the real control logic.
+            if sched_on:
+                fan_setpoints = [
+                    {'label': 'Day power',   'value': dc_to_pct(sp_fan_day),   'unit': '%'},
+                    {'label': 'Night power', 'value': dc_to_pct(sp_fan_night), 'unit': '%'},
+                    {'label': 'Schedule',
+                     'value': f"{control_loops.FAN_DAY_START_HOUR:02d}:00 – {control_loops.FAN_NIGHT_START_HOUR:02d}:00",
+                     'unit': ''},
+                ]
+                fan_action = {
+                    'state':        'on' if fan_dc > 0 else 'off',
+                    'percentage':   dc_to_pct(fan_dc),
+                    'mode':         'schedule',
+                    'phase':        fan_phase,
+                    'current_time': now.strftime('%H:%M'),
+                }
+            else:
+                fan_setpoints = [
+                    {'label': 'Temp target', 'value': round(sp_temp, 1),       'unit': '°C'},
+                    {'label': 'Cool above',  'value': round(sp_temp + 1.0, 1), 'unit': '°C'},
+                    {'label': 'Max power',   'value': dc_to_pct(control_loops.FAN_DAY_DUTY), 'unit': '%'},
+                ]
+                fan_action = {
+                    'state':      'on' if fan_dc > 0 else 'off',
+                    'percentage': dc_to_pct(fan_dc),
+                    'mode':       'pid',
+                }
+
             # ── Heater reason ─────────────────────────────────────────────────
             DEADBAND = 1.0
             _t = air_temp
@@ -1823,20 +1841,9 @@ def init_routes(
                             {'label': 'Air Temp',  'value': _safe(air_temp, 1),     'unit': '°C', 'status': 'ok'},
                             {'label': 'Humidity',  'value': _safe(air_humidity, 1), 'unit': '%',  'status': 'ok'},
                         ],
-                        'setpoints': [
-                            {'label': 'Day power',   'value': dc_to_pct(sp_fan_day),   'unit': '%'},
-                            {'label': 'Night power', 'value': dc_to_pct(sp_fan_night), 'unit': '%'},
-                            {'label': 'Schedule',
-                             'value': f"{control_loops.FAN_DAY_START_HOUR:02d}:00 – {control_loops.FAN_NIGHT_START_HOUR:02d}:00",
-                             'unit': ''},
-                        ],
-                        'action': {
-                            'state':      'on' if fan_dc > 0 else 'off',
-                            'percentage': dc_to_pct(fan_dc),
-                            'phase':      fan_phase,
-                            'current_time': now.strftime('%H:%M'),
-                        },
-                        'reason': fan_reason,
+                        'setpoints': fan_setpoints,
+                        'action':    fan_action,
+                        'reason':    fan_reason,
                     },
                     'heater': {
                         'sensors': [

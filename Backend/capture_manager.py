@@ -293,6 +293,43 @@ def run_full_capture_cycle(triggered_by: str = 'scheduler', run_health_check: bo
                     _CUSTOM_PRINT_FUNC(
                         f"[Health] {status} ({result.get('health_probability')}%) — saved to DB"
                     )
+
+                    # One UI notification per analysis (deduped per day so repeated
+                    # captures on the same day don't spam the bell). Only created
+                    # here, when an analysis actually completes — never on DB reads.
+                    if result.get('success'):
+                        try:
+                            import notifications
+                            _today = datetime.datetime.now().strftime('%Y-%m-%d')
+                            _prob  = result.get('health_probability')
+                            _prob_txt = f"{_prob}%" if _prob is not None else "n/a"
+                            if result.get('is_healthy'):
+                                notifications.create_notification(
+                                    'daily_health_ready', 'info',
+                                    'Daily plant health analysis is ready',
+                                    f"Plant looks healthy (health score {_prob_txt}).",
+                                    category='workflow', link='health',
+                                    meta={'session_id': session_id, 'health_probability': _prob},
+                                    dedup_key=f"health_ready:{_today}", dedup_window_sec=72000,
+                                )
+                            else:
+                                _dz = result.get('diseases') or []
+                                _dz_name = (_dz[0].get('name') if _dz and isinstance(_dz[0], dict)
+                                            else None)
+                                _detail = (f"Possible issue: {_dz_name}." if _dz_name
+                                           else "A possible disease or stress was detected.")
+                                _sev = 'critical' if (_prob is not None and _prob < 40) else 'warning'
+                                notifications.create_notification(
+                                    'health_attention_required', _sev,
+                                    'Plant health requires attention',
+                                    f"{_detail} (health score {_prob_txt}).",
+                                    category='workflow', link='health',
+                                    meta={'session_id': session_id, 'health_probability': _prob,
+                                          'diseases': _dz_name},
+                                    dedup_key=f"health_attention:{_today}", dedup_window_sec=72000,
+                                )
+                        except Exception as _ntf_err:
+                            _CUSTOM_PRINT_FUNC(f"[Notifications] health notify skipped: {_ntf_err}")
                 except Exception as e:
                     _CUSTOM_PRINT_FUNC(f"[Health] Background check error: {e}")
                     alert_health_api_failure(str(e))

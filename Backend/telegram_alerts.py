@@ -65,6 +65,8 @@ def send_telegram_alert(
     action_taken:    str  = None,
     recommendation:  str  = None,
     data:            dict = None,
+    ui_notify:       bool = True,
+    notif_type:      str  = None,
 ) -> bool:
     """
     Send an alert EMAIL with cooldown and full error handling.
@@ -72,25 +74,36 @@ def send_telegram_alert(
     (Name kept as `send_telegram_alert` for backward compatibility — it now
     delivers email instead of a Telegram message.)
 
+    ui_notify:  when False, the email is still sent but NO in-app (bell/toast)
+                notification is created. Used for workflow emails (e.g. the AI
+                recommendation hand-off) whose single UI notification is owned by
+                the Budget Manager, so the bell never shows duplicate steps.
+    notif_type: machine type for the UI notification. Defaults to
+                'sensor_danger' for CRITICAL/DANGER and 'sensor_warning'
+                otherwise. Sensor-failure / actuator helpers pass their own.
+
     Returns True if the email was dispatched, False if skipped (cooldown /
     disabled) or failed.  The backend will NEVER crash if email sending fails.
     """
     # UI notification (bell/toast) — UI only, independent of email, never raises.
-    # Its own dedup window mirrors the email cooldown to avoid spam.
-    try:
-        import notifications
-        notifications.create_notification(
-            'sensor_warning',
-            'critical' if severity.upper() in ('CRITICAL', 'DANGER') else 'warning',
-            title, message,
-            category='sensor', link='dashboard',
-            meta={'component': component, 'value': current_value},
-            dedup_key=f"sensor:{title}|{component or ''}",
-            dedup_window_sec=COOLDOWN_SEC.get(severity.upper(), 600),
-            already_emailed=EMAIL_ENABLED,
-        )
-    except Exception as _ntf_err:
-        print(f"[Notifications] sensor alert skipped: {_ntf_err}")
+    # Its own dedup window mirrors the email cooldown to avoid spam. Workflow
+    # emails opt out via ui_notify=False so the bell shows one event, not steps.
+    if ui_notify:
+        try:
+            import notifications
+            _is_danger = severity.upper() in ('CRITICAL', 'DANGER')
+            notifications.create_notification(
+                notif_type or ('sensor_danger' if _is_danger else 'sensor_warning'),
+                'critical' if _is_danger else 'warning',
+                title, message,
+                category='sensor', link='dashboard',
+                meta={'component': component, 'value': current_value},
+                dedup_key=f"sensor:{title}|{component or ''}",
+                dedup_window_sec=COOLDOWN_SEC.get(severity.upper(), 600),
+                already_emailed=EMAIL_ENABLED,
+            )
+        except Exception as _ntf_err:
+            print(f"[Notifications] sensor alert skipped: {_ntf_err}")
 
     if not EMAIL_ENABLED:
         print(f"[Email] DISABLED (set ALERT_EMAIL_FROM + ALERT_EMAIL_APP_PASSWORD in .env). "
@@ -207,6 +220,7 @@ def alert_sensor_error(sensor_name: str, value, reason: str = "Invalid reading")
         current_value = str(value),
         action_taken  = "Pump disabled for this cycle",
         recommendation= f"Check {sensor_name} wiring and RS485/I2C connection",
+        notif_type    = "sensor_failure",
     )
 
 
@@ -218,6 +232,7 @@ def alert_sensor_lock(sensor_name: str, lock_minutes: int):
         component     = sensor_name,
         action_taken  = f"Pump locked for {lock_minutes} minutes",
         recommendation= f"Inspect {sensor_name} immediately",
+        notif_type    = "sensor_failure",
     )
 
 
@@ -229,6 +244,7 @@ def alert_actuator_failure(actuator_name: str, command: str, attempts: int):
         component     = actuator_name,
         action_taken  = "Retried and aborted",
         recommendation= f"Check ESP32 connection and {actuator_name} hardware",
+        notif_type    = "actuator_control_failure",
     )
 
 
@@ -253,6 +269,7 @@ def alert_dangerous_ec(ec_value: float):
         allowed_range = "750 – 1999 µS/cm",
         action_taken  = "Fertilizer pump OFF, water dilution pulse activated",
         recommendation= "Check nutrient solution immediately and perform manual dilution",
+        notif_type    = "sensor_danger",
     )
 
 
@@ -322,6 +339,7 @@ def alert_ph_critical(ph_value: float):
         allowed_range = "5.2 – 7.5  (critical threshold: 4.8)",
         action_taken  = "Warning only — add pH Up immediately",
         recommendation= "Add pH Up solution immediately and recheck within 30 minutes",
+        notif_type    = "sensor_danger",
     )
 
 
@@ -335,6 +353,7 @@ def alert_moisture_critical(moisture: float):
         allowed_range = ">= 30%",
         action_taken  = "2-second water pump pulse fired",
         recommendation= "Check water supply and irrigation system",
+        notif_type    = "sensor_danger",
     )
 
 
@@ -359,6 +378,7 @@ def alert_temperature_error(error: str):
         component     = "DHT22 Temperature/Humidity",
         action_taken  = "Control loop cycle skipped",
         recommendation= "Check DHT22 wiring and GPIO pin",
+        notif_type    = "sensor_failure",
     )
 
 
@@ -407,7 +427,7 @@ def alert_system_crash(component: str, error: str):
     )
 
 
-def alert_temperature_high(temp: float):
+def alert_temperature_high(temp: float, limit: float = None):
     send_telegram_alert(
         title         = "Temperature Too High",
         message       = (
@@ -418,7 +438,7 @@ def alert_temperature_high(temp: float):
         severity      = "WARNING",
         component     = "Temperature Sensor",
         current_value = f"{temp:.1f}°C",
-        allowed_range = "up to 27°C",
+        allowed_range = f"up to {limit:.1f}°C" if limit is not None else "up to 27°C",
         action_taken  = "Warning only — backend continues running",
         recommendation= "Check fan, cooling system, and airflow in the grow chamber",
     )
@@ -443,4 +463,5 @@ def alert_no_sensor_data(minutes: int):
         component     = "Sensor System",
         action_taken  = "None — automatic intervention not possible",
         recommendation= "Restart the backend and check all sensor connections",
+        notif_type    = "sensor_failure",
     )

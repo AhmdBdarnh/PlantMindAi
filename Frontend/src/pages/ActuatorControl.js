@@ -191,7 +191,15 @@ function ActuatorCard({ cfg, liveData, dashData, operationMode, onControlState, 
           <span style={{ fontSize: 13, fontWeight: 800, color: T.primary }}>{cfg.label}</span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          {cfg.key === 'fan' && action.phase && (
+          {cfg.key === 'fan' && action.mode === 'pid' && (
+            <span style={{
+              fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 6,
+              background: '#d1fae5', color: '#065f46', border: '1px solid #6ee7b7',
+            }}>
+              🌡 Auto · Temp PID
+            </span>
+          )}
+          {cfg.key === 'fan' && action.mode !== 'pid' && action.phase && (
             <span style={{
               fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 6,
               background: action.phase === 'day' ? '#fef9c3' : '#e0f2fe',

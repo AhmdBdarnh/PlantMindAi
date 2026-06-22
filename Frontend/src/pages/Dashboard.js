@@ -435,7 +435,7 @@ export default function Dashboard({
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 8 }}>
                 <Metric label='Height' value={gd.height_cm  != null ? Number(gd.height_cm ).toFixed(1) : '—'} unit='cm' />
                 <Metric label='Width'  value={gd.width_cm   != null ? Number(gd.width_cm  ).toFixed(1) : '—'} unit='cm' />
-                <Metric label='Volume' value={gd.volume_cm3 != null ? Number(gd.volume_cm3).toFixed(0) : '—'} unit='cm³' />
+                <Metric label='Est. Volume' value={gd.volume_cm3 != null ? Number(gd.volume_cm3).toFixed(0) : '—'} unit='cm³' />
                 <Metric
                   label={gDays && gDays > 0 ? `Growth · ${gDays}d` : 'Growth · day 1'}
                   value={areaSincePct != null ? `${areaSincePct >= 0 ? '+' : ''}${areaSincePct.toFixed(1)}` : '—'}
@@ -445,7 +445,7 @@ export default function Dashboard({
               </div>
 
               {/* Growth trend chart — Volume (V_index) over time */}
-              <div style={{ fontSize: 11, fontWeight: 700, color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.05em', marginTop: 12, marginBottom: 4 }}>Growth trend (volume cm³)</div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.05em', marginTop: 12, marginBottom: 4 }}>Growth trend (estimated volume cm³)</div>
               <Sparkline points={growthSpark} color='#16a34a' unit=' cm³' valueDec={0} height={64} />
             </>
           )}
@@ -610,7 +610,7 @@ function EnvMiniCard({ label, value, target, unit, status }) {
         <span style={{ fontSize: 19, fontWeight: 900, color: clr.val, lineHeight: 1 }}>{value ?? '—'}</span>
         <span style={{ fontSize: 10, color: '#9ca3af', fontWeight: 600 }}>{unit}</span>
         <span style={{ marginLeft: 'auto', fontSize: 11, color: '#9ca3af', fontWeight: 600, whiteSpace: 'nowrap' }}>
-          🎯 {target ?? '—'}
+          🎯 Target {target ?? '—'}
         </span>
       </div>
     </div>

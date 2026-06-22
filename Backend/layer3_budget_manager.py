@@ -1,29 +1,44 @@
 """
-layer3_budget_manager.py — Layer 3 Budget Manager for PlantMind AI.
+layer3_budget_manager.py — Layer 3 AI Budget Manager for PlantMind AI.
 
-Layer 3 is the budget governance layer only.
-It evaluates resource costs vs. configured budgets and proposes
-cost-saving setpoint modifications when spending is too high.
+Layer 3 is the budget governance layer. It evaluates resource costs vs. the
+configured budgets and, when LAYER3_USE_AI is enabled (default), sends the
+Layer 2 recommendation + today's resource costs + the budget configuration to
+GPT, which returns the management decision and any cost-saving setpoint
+modifications. A deterministic budget gate is still computed for the facts the
+AI reasons over, and a rule-based path (`_make_decision`) is kept as a
+fail-safe / test-mode fallback.
 
 Layer 3 does NOT check plant health   — Layer 2 already does this.
 Layer 3 does NOT check sensor safety  — Layer 1 handles real-time safety.
 
-Decisions:
+Decisions (made by the AI when enabled):
   APPROVE    — All costs within budget. Apply Layer 2 recommendation as-is.
   MODIFY     — One or more costs near / over budget. Propose cost reductions.
   ALERT_ONLY — Budget pressure detected but no safe modifications available.
   BLOCK      — Layer 2 recommendation is missing, invalid, or too stale to act on.
 
-Layer 3 NEVER fires actuators directly.
-Layer 3 NEVER changes pump power or pulse durations.
-All changes require explicit user approval via the frontend.
+Safety guarantees that remain enforced in code regardless of the AI output:
+  * If the OpenAI call fails or returns invalid JSON → decision fails safe to BLOCK.
+  * Any AI-proposed numeric setpoint is clamped to the safety floors below
+    (moisture ≥ 35 %, LED ≥ 40 % of current, night-fan ≥ 15 %) before it can
+    ever be applied.
+  * Layer 3 NEVER fires actuators directly and NEVER changes pump power/pulses.
+  * All changes still require explicit user approval via the frontend.
 """
 
+import os
+import json
 import datetime
 import threading
 import uuid
 
 from utils.utils import _CUSTOM_PRINT_FUNC
+
+# AI decision mode — when true (default) the management decision is produced by
+# GPT (see _ai_make_decision). Set LAYER3_USE_AI=false in .env to fall back to
+# the deterministic rule engine (_make_decision).
+LAYER3_USE_AI = os.getenv('LAYER3_USE_AI', 'true').lower() == 'true'
 
 try:
     from config import (
@@ -474,6 +489,252 @@ def _make_decision(layer2_doc: dict | None, budget_gate: dict) -> dict:
     )
 
 
+# ── AI-powered decision engine ────────────────────────────────────────────────
+
+def _current_setpoints() -> dict:
+    """Return the live setpoints dict, or {} if unavailable."""
+    try:
+        return _setpoints.get_all_setpoints() if _setpoints is not None else {}
+    except Exception:
+        return {}
+
+
+def _build_layer3_prompt(
+    layer2_doc:    dict | None,
+    budget_gate:   dict,
+    today_costs:   dict,
+    budget_config: dict,
+    current_sp:    dict,
+) -> str:
+    """Build the JSON-only prompt sent to GPT for the Layer 3 budget decision."""
+    age_h = _doc_age_hours(layer2_doc) if layer2_doc else None
+
+    layer2_summary = {
+        "exists":        layer2_doc is not None,
+        "status":        layer2_doc.get("status") if layer2_doc else None,
+        "plant_status":  layer2_doc.get("plant_status") if layer2_doc else None,
+        "age_hours":     age_h,
+        "max_age_hours": LAYER2_MAX_AGE_HOURS,
+        "changes":       (layer2_doc.get("changes") or []) if layer2_doc else [],
+    }
+
+    facts = {
+        "layer2_recommendation": layer2_summary,
+        "today_costs_nis": {
+            "water":       today_costs.get("water_cost_nis", 0.0),
+            "electricity": today_costs.get("electricity_cost_nis", 0.0),
+            "fertilizer":  today_costs.get("fertilizer_cost_nis", 0.0),
+            "total":       today_costs.get("total_cost_nis", 0.0),
+        },
+        "budget_config": {
+            "daily_budget":          budget_config.get("daily_budget"),
+            "water_budget":          budget_config.get("water_budget"),
+            "electricity_budget":    budget_config.get("electricity_budget"),
+            "fertilizer_budget":     budget_config.get("fertilizer_budget"),
+            "warning_threshold_pct": budget_config.get("warning_threshold_pct", 80),
+        },
+        "computed_budget_status": {
+            "status":           budget_gate.get("status"),
+            "usage_pct":        budget_gate.get("usage_pct"),
+            "main_cost_driver": budget_gate.get("main_cost_driver"),
+            "resource_breakdown": budget_gate.get("resource_breakdown", []),
+        },
+        "current_setpoints_for_cost_saving": {
+            "light_setpoint":         current_sp.get("light"),
+            "soil_moisture_setpoint": current_sp.get("soil_moisture"),
+            "fan_night_duty":         current_sp.get("fan_night_duty"),
+        },
+        "safety_floors": {
+            "soil_moisture_setpoint_min": MOISTURE_SETPOINT_FLOOR,
+            "light_setpoint_min_pct_of_current": LED_POWER_MIN_PCT,
+            "fan_night_duty_min": FAN_NIGHT_DUTY_MIN,
+        },
+    }
+
+    return f"""You are the Budget Manager (Layer 3) of the PlantMind AI greenhouse system.
+A separate AI advisor (Layer 2) has already produced a plant-care setpoint recommendation.
+Your ONLY job is the MANAGEMENT / BUDGET decision: decide whether that recommendation may
+proceed to the user for approval, given the resource costs and the configured budget.
+
+You do NOT evaluate plant health and you do NOT change pump power or pump pulse durations.
+You may only ever propose lowering these three cost-saving setpoints (never raise them):
+light_setpoint, fan_night_duty, soil_moisture_setpoint — and never below the safety floors.
+
+=== DECISION RULES ===
+- BLOCK      if the Layer 2 recommendation is missing, its status is "invalid", or it is
+             older than max_age_hours. Nothing can be approved in this case.
+- APPROVE    if total cost is within the daily budget (no budget pressure).
+- MODIFY     if budget usage is at/over the warning threshold or over budget AND you can
+             propose at least one safe cost-saving reduction. Reduce the main cost driver:
+             electricity → lower light_setpoint and/or fan_night_duty;
+             water → lower soil_moisture_setpoint. Use ~15% reductions for a warning and
+             ~25% for over-budget, but NEVER below the safety floors.
+- ALERT_ONLY if there is budget pressure but no safe modification is available.
+
+=== DATA (JSON) ===
+{json.dumps(facts, indent=2, default=str)}
+
+=== REQUIRED RESPONSE — return ONLY this JSON object, no markdown, no extra text ===
+{{
+  "decision": "APPROVE | MODIFY | ALERT_ONLY | BLOCK",
+  "reason": "one or two short sentences explaining the decision using the numbers above",
+  "proposed_modifications": [
+    {{
+      "type": "led_power_reduction | fan_night_reduction | moisture_target_reduction",
+      "parameter": "light_setpoint | fan_night_duty | soil_moisture_setpoint",
+      "current_value": number,
+      "proposed_value": number,
+      "unit": "sensor units | PWM duty (0-4095) | %",
+      "reason": "why this reduction saves cost",
+      "savings_impact": "low | medium | high"
+    }}
+  ]
+}}
+If decision is not MODIFY, "proposed_modifications" MUST be an empty array [].
+"""
+
+
+def _sanitize_ai_mods(mods: list, current_sp: dict) -> tuple:
+    """
+    Clamp AI-proposed modifications to the safety floors and drop anything that
+    is not a recognised cost-saving reduction. Returns (clean_mods, constraints).
+
+    This is a hard safety guardrail: even a "full AI" decision can never push an
+    actuator-affecting setpoint below its floor or above its current value.
+    """
+    clean: list = []
+    constraints: dict = {}
+    if not isinstance(mods, list):
+        return clean, constraints
+
+    cur_light    = _safe_num(current_sp.get("light"))
+    cur_moisture = _safe_num(current_sp.get("soil_moisture"))
+    cur_fan_night = _safe_num(current_sp.get("fan_night_duty"))
+
+    for m in mods:
+        if not isinstance(m, dict):
+            continue
+        param    = m.get("parameter")
+        proposed = _safe_num(m.get("proposed_value"))
+        if proposed is None:
+            continue
+
+        if param == "light_setpoint" and cur_light and cur_light > 0:
+            floor = cur_light * (LED_POWER_MIN_PCT / 100.0)
+            proposed = round(max(floor, min(proposed, cur_light)), 1)
+            if proposed >= cur_light:
+                continue
+            constraints["led_power_cap"] = round((proposed / cur_light) * 100.0, 1)
+            clean.append({**m, "parameter": param, "current_value": cur_light,
+                          "proposed_value": proposed, "unit": m.get("unit", "sensor units")})
+
+        elif param == "fan_night_duty" and cur_fan_night and cur_fan_night > 0:
+            proposed = int(max(FAN_NIGHT_DUTY_MIN, min(proposed, cur_fan_night)))
+            if proposed >= cur_fan_night:
+                continue
+            constraints["fan_night_duty"] = proposed
+            clean.append({**m, "parameter": param, "current_value": cur_fan_night,
+                          "proposed_value": proposed, "unit": m.get("unit", "PWM duty (0-4095)")})
+
+        elif param == "soil_moisture_setpoint" and cur_moisture and cur_moisture > 0:
+            proposed = round(max(MOISTURE_SETPOINT_FLOOR, min(proposed, cur_moisture)), 1)
+            if proposed >= cur_moisture:
+                continue
+            constraints["moisture_target"] = proposed
+            clean.append({**m, "parameter": param, "current_value": cur_moisture,
+                          "proposed_value": proposed, "unit": m.get("unit", "%")})
+        # any other parameter is silently dropped — Layer 3 may not change it
+
+    return clean, constraints
+
+
+def _safe_num(v):
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _ai_make_decision(
+    layer2_doc:    dict | None,
+    budget_gate:   dict,
+    today_costs:   dict,
+    budget_config: dict,
+) -> dict:
+    """
+    Produce the Layer 3 decision using GPT.
+
+    Fail-safe: any OpenAI error, missing key, or unparseable response yields a
+    BLOCK decision so that an AI/network problem can never silently approve or
+    apply a change. All proposed numeric values are clamped to the safety floors.
+    """
+    did        = str(uuid.uuid4())
+    current_sp = _current_setpoints()
+    prompt     = _build_layer3_prompt(layer2_doc, budget_gate, today_costs, budget_config, current_sp)
+
+    try:
+        import ai_setpoint_advisor
+        parsed, raw = ai_setpoint_advisor._call_openai(prompt)
+    except Exception as e:
+        _CUSTOM_PRINT_FUNC(f"[Layer3] AI decision failed ({e}) — failing safe to BLOCK.")
+        doc = _assemble_doc(
+            did, layer2_doc, budget_gate,
+            decision    = DECISION_BLOCK,
+            status      = STATUS_BLOCKED,
+            reason      = ("BLOCK — the AI Budget Manager could not be reached "
+                           f"({type(e).__name__}). No changes were applied. Try again."),
+            mods        = [],
+            constraints = {},
+        )
+        doc["ai_powered"] = True
+        doc["ai_error"]   = str(e)
+        return doc
+
+    decision = str(parsed.get("decision", "")).strip().upper()
+    reason   = parsed.get("reason") or ""
+
+    if decision not in (DECISION_APPROVE, DECISION_MODIFY, DECISION_ALERT_ONLY, DECISION_BLOCK):
+        _CUSTOM_PRINT_FUNC(f"[Layer3] AI returned unknown decision '{decision}' — failing safe to BLOCK.")
+        doc = _assemble_doc(
+            did, layer2_doc, budget_gate,
+            decision    = DECISION_BLOCK,
+            status      = STATUS_BLOCKED,
+            reason      = "BLOCK — AI returned an unrecognised decision. No changes applied.",
+            mods        = [],
+            constraints = {},
+        )
+        doc["ai_powered"]      = True
+        doc["ai_raw_response"] = raw
+        return doc
+
+    mods, constraints = _sanitize_ai_mods(parsed.get("proposed_modifications", []), current_sp)
+
+    # MODIFY with no surviving safe modification degrades to ALERT_ONLY.
+    if decision == DECISION_MODIFY and not mods:
+        decision = DECISION_ALERT_ONLY
+        reason   = (reason + " (No proposed change passed the safety floors, "
+                             "so this is informational only.)").strip()
+
+    status_map = {
+        DECISION_APPROVE:    STATUS_PENDING,
+        DECISION_MODIFY:     STATUS_PENDING,
+        DECISION_ALERT_ONLY: STATUS_ALERT_ONLY,
+        DECISION_BLOCK:      STATUS_BLOCKED,
+    }
+
+    doc = _assemble_doc(
+        did, layer2_doc, budget_gate,
+        decision    = decision,
+        status      = status_map[decision],
+        reason      = reason or f"{decision} — decided by the AI Budget Manager.",
+        mods        = mods if decision == DECISION_MODIFY else [],
+        constraints = constraints if decision == DECISION_MODIFY else {},
+    )
+    doc["ai_powered"]      = True
+    doc["ai_raw_response"] = raw
+    return doc
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def run(layer2_recommendation_id: str = None) -> dict:
@@ -538,11 +799,18 @@ def run(layer2_recommendation_id: str = None) -> dict:
                 f"| {budget_gate['reason']}"
             )
 
-            # ── Step 6: Decision ───────────────────────────────────────────
-            decision_doc = _make_decision(layer2_doc, budget_gate)
+            # ── Step 6: Decision (AI-powered when LAYER3_USE_AI, else rules) ─
+            if LAYER3_USE_AI:
+                _CUSTOM_PRINT_FUNC("[Layer3] Asking the AI Budget Manager for a decision ...")
+                decision_doc = _ai_make_decision(
+                    layer2_doc, budget_gate, today_costs, budget_config
+                )
+            else:
+                decision_doc = _make_decision(layer2_doc, budget_gate)
             _CUSTOM_PRINT_FUNC(
                 f"[Layer3] Decision: {decision_doc['decision']}  "
                 f"status={decision_doc['status']}  "
+                f"ai={decision_doc.get('ai_powered', False)}  "
                 f"mods={len(decision_doc.get('proposed_modifications', []))}"
             )
 
@@ -581,8 +849,8 @@ def run(layer2_recommendation_id: str = None) -> dict:
                     )
                 else:
                     notifications.create_notification(
-                        'budget_decision_ready', 'info',
-                        'Budget decision ready',
+                        'budget_review_ready', 'info',
+                        'Budget review ready',
                         f"Budget Manager completed its review: {_dec}.",
                         category='workflow', link='layer3',
                         meta={'decision_id': _did, 'decision': _dec},
@@ -613,6 +881,23 @@ def run(layer2_recommendation_id: str = None) -> dict:
                 'current_status': 'error',
                 'blocked_reason': str(e),
             })
+            # Single user-facing notification for a failed review — the workflow
+            # could not finish, so the user should know. Deduped per recommendation
+            # so one broken run can't spam the bell on retries.
+            try:
+                import notifications
+                _wf_key = layer2_recommendation_id or 'unknown'
+                notifications.create_notification(
+                    'workflow_failed', 'critical',
+                    'Budget review failed',
+                    'The Budget Manager could not finish reviewing the AI recommendation. '
+                    'No changes were applied.',
+                    category='workflow', link='layer3',
+                    meta={'recommendation_id': layer2_recommendation_id, 'error': str(e)},
+                    dedup_key=f"workflow_failed:{_wf_key}", dedup_window_sec=86400,
+                )
+            except Exception as _ntf_err:
+                _CUSTOM_PRINT_FUNC(f"[Notifications] workflow_failed skipped: {_ntf_err}")
             return {"success": False, "error": str(e)}
 
 

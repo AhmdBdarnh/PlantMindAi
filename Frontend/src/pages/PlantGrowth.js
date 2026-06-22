@@ -172,18 +172,6 @@ const CAMERAS = [
   { id: 4, label: 'Camera 3' },   // physical cam ID 4 = display "Camera 3"
 ];
 
-// Build date strings for today / yesterday / 2 days ago in local time
-function getDayStrings() {
-  return [0, 1, 2].map(n => {
-    const d = new Date();
-    d.setDate(d.getDate() - n);
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
-    return `${y}-${m}-${day}`;
-  });
-}
-
 function fmtDisplayDate(isoDate) {
   // "2026-06-04" → "04 Jun 2026"
   try {
@@ -214,16 +202,14 @@ function GrowthImagesTab({ growthHistory }) {
       .finally(() => setLoading(false));
   }, []);
 
-  const dayStrings = getDayStrings();   // [today, yesterday, 2daysago]
-  const DAY_LABELS = ['Today', 'Yesterday', '2 Days Ago'];
+  const MAX_COLS = 4;   // show the last 4 captures
 
-  // Group by local date → pick most-recent session per day
+  // Group ALL sessions by local date → pick most-recent session per day
   const sessionByDay = {};
   for (const s of sessions) {
     if (!s.timestamp) continue;
     // timestamp is ISO string: "2026-06-04T14:10:23..."
     const dateKey = s.timestamp.slice(0, 10);
-    if (!dayStrings.includes(dateKey)) continue;
     if (!sessionByDay[dateKey] || s.timestamp > sessionByDay[dateKey].timestamp) {
       sessionByDay[dateKey] = s;
     }
@@ -235,11 +221,32 @@ function GrowthImagesTab({ growthHistory }) {
   for (const m of (growthHistory || [])) {
     if (m.status !== 'success' || !m.captured_at) continue;
     const dateKey = String(m.captured_at).slice(0, 10);
-    if (!dayStrings.includes(dateKey)) continue;
     if (!growthByDay[dateKey] || m.captured_at > growthByDay[dateKey].captured_at) {
       growthByDay[dateKey] = m;
     }
   }
+
+  // Columns = the last MAX_COLS capture dates that actually have data
+  // (an image session and/or growth metrics), newest first. This replaces the
+  // fixed Today/Yesterday/2-days-ago view so non-consecutive captures
+  // (e.g. 19, 18, 16, 14 Jun) all appear with no empty calendar gaps.
+  const dayStrings = Array.from(new Set([
+    ...Object.keys(sessionByDay),
+    ...Object.keys(growthByDay),
+  ])).sort((a, b) => (a < b ? 1 : -1)).slice(0, MAX_COLS);
+
+  // Friendly label per column: relative when it lands on today/yesterday,
+  // otherwise "Latest" for the newest column and "Capture" for the rest
+  // (the exact date is always shown on the line below the label).
+  const _ymd = (d) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const _today = _ymd(new Date());
+  const _yest  = (() => { const d = new Date(); d.setDate(d.getDate() - 1); return _ymd(d); })();
+  const dayLabelFor = (dateStr, idx) =>
+    dateStr === _today ? 'Today'
+      : dateStr === _yest ? 'Yesterday'
+        : idx === 0 ? 'Latest'
+          : 'Capture';
 
   const T = { primary: '#111827', label: '#374151', muted: '#6b7280' };
 
@@ -271,9 +278,13 @@ function GrowthImagesTab({ growthHistory }) {
         <div style={{ textAlign: 'center', padding: '48px', color: T.muted, fontSize: 13 }}>
           Loading capture sessions…
         </div>
+      ) : dayStrings.length === 0 ? (
+        <div style={{ textAlign: 'center', padding: '48px', color: T.muted, fontSize: 13 }}>
+          No captures yet — run a growth analysis to see photos here.
+        </div>
       ) : (
-        /* ── 3-column grid: Today | Yesterday | 2 Days Ago ── */
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 20 }}>
+        /* ── last 4 captures (newest first) ── */
+        <div style={{ display: 'grid', gridTemplateColumns: `repeat(${dayStrings.length}, 1fr)`, gap: 20 }}>
           {dayStrings.map((dateStr, idx) => {
             const session  = sessionByDay[dateStr];
             const image    = session?.images?.find(img => Number(img.camera_id) === selectedCam);
@@ -290,7 +301,7 @@ function GrowthImagesTab({ growthHistory }) {
                   padding: '12px 16px',
                 }}>
                   <div style={{ fontSize: 14, fontWeight: 800, color: '#fff', marginBottom: 2 }}>
-                    {DAY_LABELS[idx]}
+                    {dayLabelFor(dateStr, idx)}
                   </div>
                   <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.6)' }}>
                     {fmtDisplayDate(dateStr)}
@@ -322,7 +333,7 @@ function GrowthImagesTab({ growthHistory }) {
                     >
                       <img
                         src={image.url}
-                        alt={`${DAY_LABELS[idx]} — ${camLabel}`}
+                        alt={`${dayLabelFor(dateStr, idx)} — ${camLabel}`}
                         style={{ width: '100%', display: 'block', objectFit: 'cover' }}
                         onError={e => { e.target.parentElement.style.display = 'none'; }}
                       />

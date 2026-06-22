@@ -330,6 +330,48 @@ export default function Layer3Decision() {
 
   const getResourceBreakdown = (name) => breakdown.find(r => r.resource === name) || {};
 
+  // ── Plain-English decision summary ────────────────────────────────────────
+  // The raw AI `reason` is a dense run-on sentence. We lead with a clear headline
+  // and a row of scannable fact chips, and keep the AI's own wording as a small
+  // detail line so no information is lost.
+  const DECISION_HEADLINE = {
+    APPROVE:    'All costs are within budget — this recommendation is ready to apply.',
+    MODIFY:     'Costs are under pressure. The cost-saving changes below keep you within budget.',
+    ALERT_ONLY: 'Costs are under pressure, but no safe savings are available right now — this is for your awareness only.',
+    BLOCK:      "This recommendation can't be applied right now. See the details below.",
+  };
+  const headline = DECISION_HEADLINE[decisionType] || decision?.reason || '';
+
+  // Layer 2 recommendation age (hours) — used for the freshness chip.
+  let l2AgeH = null;
+  if (layer2Rec?.created_at) {
+    const t = new Date(layer2Rec.created_at).getTime();
+    if (!Number.isNaN(t)) l2AgeH = Math.max(0, (Date.now() - t) / 3600000);
+  }
+
+  const cap = s => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+  const budgetPct  = decision?.budget_usage_pct;
+  const totalCost  = todayCosts.total_cost_nis;
+  const dailyBudg  = budgetInfo.daily_budget;
+  const driver     = decision?.main_cost_driver;
+  const budgetTone = budgetInfo.status === 'over_budget' ? { bg: '#fee2e2', color: '#991b1b' }
+                   : budgetInfo.status === 'warning'     ? { bg: '#fef3c7', color: '#92400e' }
+                   : { bg: '#dcfce7', color: '#166534' };
+
+  const decisionChips = [];
+  if (budgetPct != null)
+    decisionChips.push({ label: 'Budget used', value: `${fmtNum(budgetPct, 1)}%`, tone: budgetTone });
+  if (totalCost != null && dailyBudg != null)
+    decisionChips.push({ label: 'Spent today', value: `₪${fmtNum(totalCost, 4)} / ₪${fmtNum(dailyBudg, 2)}`, tone: { bg: '#eff6ff', color: '#1e40af' } });
+  if (driver)
+    decisionChips.push({ label: 'Main cost', value: cap(driver), tone: { bg: '#f3e8ff', color: '#6b21a8' } });
+  if (l2AgeH != null)
+    decisionChips.push({
+      label: 'Recommendation',
+      value: l2AgeH <= 48 ? `Fresh · ${fmtNum(l2AgeH, 1)}h old` : `Stale · ${fmtNum(l2AgeH, 1)}h old`,
+      tone: l2AgeH <= 48 ? { bg: '#dcfce7', color: '#166534' } : { bg: '#fee2e2', color: '#991b1b' },
+    });
+
   if (loading) return (
     <div style={{ padding: 60, textAlign: 'center' }}>
       <div style={{ width: 40, height: 40, border: '3px solid #e5e7eb', borderTopColor: '#2563eb', borderRadius: '50%', animation: 'spin 0.8s linear infinite', margin: '0 auto 16px' }} />
@@ -469,7 +511,21 @@ export default function Layer3Decision() {
                 <span style={{ fontSize: 18, fontWeight: 800, color: decStyle.color }}>{decStyle.label}</span>
                 <Badge text={stStyle.label} style={stStyle} />
               </div>
-              <div style={{ fontSize: 13, color: decStyle.color, opacity: 0.85, lineHeight: 1.5, maxWidth: 620 }}>{decision.reason}</div>
+              <div style={{ fontSize: 14, color: decStyle.color, fontWeight: 600, lineHeight: 1.45, maxWidth: 640 }}>{headline}</div>
+              {decisionChips.length > 0 && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 12 }}>
+                  {decisionChips.map((chip, i) => (
+                    <span key={i} style={{ display: 'inline-flex', alignItems: 'baseline', gap: 6, padding: '4px 10px', borderRadius: 99, background: chip.tone.bg, color: chip.tone.color, fontSize: 12, fontWeight: 600 }}>
+                      <span style={{ opacity: 0.7, fontWeight: 500 }}>{chip.label}:</span>{chip.value}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {decision.reason && headline !== decision.reason && (
+                <div style={{ fontSize: 12, color: decStyle.color, opacity: 0.7, lineHeight: 1.5, maxWidth: 640, marginTop: 10 }}>
+                  <span style={{ fontWeight: 700 }}>Why: </span>{decision.reason}
+                </div>
+              )}
             </div>
           </div>
           <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
@@ -595,16 +651,35 @@ export default function Layer3Decision() {
         const L2_LABEL_MAP = { 'soil ph':'soil_ph','soil ec':'soil_ec','soil moisture':'soil_moisture','light':'light','light setpoint':'light','temperature':'temperature','air temperature':'temperature','humidity':'humidity','fan day duty':'fan_day_duty','fan night duty':'fan_night_duty','soil temperature':'soil_temp' };
         const L3_PARAM_MAP = { 'light_setpoint':'light','soil_moisture_setpoint':'soil_moisture','soil_ec_setpoint':'soil_ec','fan_day_duty':'fan_day_duty','fan_night_duty':'fan_night_duty' };
         const l2Values = {};
-        if (layer2Rec?.changes) layer2Rec.changes.forEach(c => { const k = L2_LABEL_MAP[c.parameter?.toLowerCase()]; if (k) l2Values[k] = c.recommended_value; });
+        const l2Current = {};   // setpoint snapshot captured when Layer 2 ran (same source as the Proposed Changes table)
+        if (layer2Rec?.changes) layer2Rec.changes.forEach(c => {
+          const k = L2_LABEL_MAP[c.parameter?.toLowerCase()];
+          if (k) {
+            l2Values[k] = c.recommended_value;
+            if (c.current_value != null) l2Current[k] = c.current_value;
+          }
+        });
         const l3Mods = {};
-        (decision.proposed_modifications || []).forEach(m => { const k = L3_PARAM_MAP[m.parameter] || m.parameter; l3Mods[k] = m.proposed_value; });
+        const l3Current = {};   // baseline the Budget Manager saw when it proposed a modification
+        (decision.proposed_modifications || []).forEach(m => {
+          const k = L3_PARAM_MAP[m.parameter] || m.parameter;
+          l3Mods[k] = m.proposed_value;
+          if (m.current_value != null) l3Current[k] = m.current_value;
+        });
         const rows = PARAMS.map(p => {
-          const current = currentSetpoints[p.key];
+          // "Current" must be the value before this workflow ran — the Layer 2 snapshot
+          // (matching the Proposed Changes table), then the Layer 3 baseline, then the live
+          // setpoint as a last resort. Using the live setpoint directly is wrong: once a
+          // decision is approved the live value moves to the applied figure, which made the
+          // preview contradict the Proposed Changes table and hide the real difference.
+          const current = l2Current[p.key] !== undefined ? l2Current[p.key]
+                        : l3Current[p.key] !== undefined ? l3Current[p.key]
+                        : currentSetpoints[p.key];
           const l2val   = l2Values[p.key];
           const l3val   = l3Mods[p.key];
           const final   = l3val !== undefined ? l3val : (l2val !== undefined ? l2val : current);
           const source  = l3val !== undefined ? 'l3_modified' : l2val !== undefined ? 'l2_changed' : 'unchanged';
-          const diff    = final !== undefined && current !== undefined ? final - current : null;
+          const diff    = final !== undefined && current !== undefined ? Number(final) - Number(current) : null;
           return { ...p, current, l2val, l3val, final, source, diff };
         });
         const sourceStyle = { l3_modified: { bg: '#fef3c7', color: '#92400e', label: 'L3 Modified' }, l2_changed: { bg: '#dbeafe', color: '#1e40af', label: 'L2 Changed' }, unchanged: { bg: '#f3f4f6', color: '#6b7280', label: 'Unchanged' } };

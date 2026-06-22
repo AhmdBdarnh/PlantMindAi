@@ -3,7 +3,7 @@ import { API_BASE_URL } from '../api/config';
 
 // ── Test Growth ────────────────────────────────────────────────────────────────
 // Debug/verification page: shows the GROWTH ALGORITHM's detection output images
-// (segmentation overlays where the plant is detected) for the last 2 days, so the
+// (segmentation overlays where the plant is detected) for the last 3 captures, so the
 // algorithm's plant detection can be checked visually. Read-only; no DB writes.
 
 const CAMS = [
@@ -63,8 +63,8 @@ export default function TestGrowth() {
       const res  = await fetch(`${API_BASE_URL}/growth/history?limit=5`, { cache: 'no-store' });
       const data = await res.json();
       if (data?.success) {
-        // Most recent 2 measurements (last 2 days)
-        setItems((data.data || data.history || []).slice(0, 2));
+        // Most recent 3 measurements (last 3 captures)
+        setItems((data.data || data.history || []).slice(0, 3));
       } else {
         setError(data?.error || 'Could not load growth history.');
       }
@@ -90,7 +90,7 @@ export default function TestGrowth() {
           <div>
             <h2 style={{ margin: 0, fontSize: 20, fontWeight: 800, color: '#111827' }}>Test Growth</h2>
             <div style={{ fontSize: 12, color: '#9ca3af', marginTop: 2 }}>
-              Growth-algorithm detection output for the last 2 days — verify the plant is detected correctly
+              Growth-algorithm detection output for the last 3 captures — verify the plant is detected correctly
             </div>
           </div>
         </div>
@@ -120,9 +120,9 @@ export default function TestGrowth() {
         </div>
       )}
 
-      {/* One card per measurement (last 2 days) */}
+      {/* One card per measurement (last 3 captures) */}
       {!loading && items.map((m, i) => {
-        const dayLabel = i === 0 ? 'Latest' : 'Previous';
+        const dayLabel = ['Latest', 'Last 2', 'Last 3'][i] || `Last ${i + 1}`;
         const detections = CAMS.map(c => ({ ...c, url: m[c.key] }));
         const anyDetection = detections.some(d => d.url);
         return (

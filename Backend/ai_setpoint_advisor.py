@@ -75,7 +75,9 @@ LETTUCE_OPTIMAL = {
 # absolute_max: soft ceiling — AI can go here but triggers needs_manual_review
 # max_change:   normal preferred maximum — exceeding triggers needs_manual_review
 SAFETY_LIMITS = {
-    "Temperature":     {"max_change": 1.0,   "absolute_max": 2.0,   "reject_above": 2.0},
+    "Temperature":     {},   # no per-recommendation limit (user-requested): AI may set any
+                             # temperature; validator applies no max_change / reject_above cap.
+                             # (Empty dict, NOT removed — keeps it a recognized, non-locked param.)
     "Humidity":        {"max_change": 5.0,   "absolute_max": 10.0,  "reject_above": 10.0},
     "Light":           {"max_change": 100.0, "absolute_max": 200.0, "reject_above": 300.0,
                         "notes": "Light sensor may not be calibrated — prefer keeping current value if uncertain."},
@@ -682,7 +684,7 @@ def _build_prompt(data: dict) -> str:
     context = "\n\n".join(sections)
 
     limits_summary = (
-        "Temperature:     max ±1.0 °C      (hard reject > ±2.0 °C)\n"
+        "Temperature:     no limit — you may set any value within the optimal range\n"
         "Humidity:        max ±5 %         (hard reject > ±10 %)\n"
         "Light:           max ±100 units   (hard reject > ±300) — prefer no change if uncertain\n"
         "Soil pH:         max ±0.2         (hard reject > ±0.3) — NEVER ±1.0 or more\n"
@@ -709,7 +711,7 @@ A good LED can read only 20–80 in this system. Prefer no change if uncertain.
 8. If the plant is healthy with stable or positive growth, prefer keeping current setpoints \
 or making only tiny conservative adjustments.
 9. Always populate growth_assessment, environment_issues, warnings, no_change_reason, \
-and plant_stability_score — never leave them null.
+plant_stability_score, and plant_response_analysis — never leave them null.
 10. plant_stability_score: 1.0 = fully healthy and growing well, 0.0 = critical condition. \
 Compute it from all available data. Lower it if health data or growth data is old or missing.
 
@@ -721,6 +723,36 @@ Compute it from all available data. Lower it if health data or growth data is ol
 
 === SYSTEM DATA ===
 {context}
+
+=== REQUIRED ANALYSIS: CONNECT ENVIRONMENT TO PLANT RESPONSE ===
+Do NOT analyze each sensor value in isolation. Your main job is to CORRELATE the environment
+with the plant's ACTUAL RESPONSE over time, and explain the likely relationship:
+
+  1. Compare the CURRENT sensor readings (Section 3) AND the CURRENT setpoints (Section 5)
+     against the OPTIMAL RANGES above — note which factors are in range vs out of range.
+  2. Cross-check them with the 24h averages / min / max (Section 4) to see what the plant has
+     actually been exposed to recently (a brief spike differs from a sustained excess).
+  3. Read the plant's response: growth trend, health trend, and the PREVIOUS day's growth and
+     health (Sections 1–2) — is the plant improving or deteriorating?
+  4. LINK the two directions:
+       • Deterioration + an out-of-range factor during the same period → name that factor as a
+         POSSIBLE cause, and if it is a setpoint you are allowed to change, recommend adjusting it.
+         e.g. "Air temperature reached 32°C, above the optimal range for lettuce. During the same
+         period growth rate and health score decreased. This may indicate heat stress is affecting
+         development; reducing the temperature setpoint is recommended."
+       • Improvement + in-range factors → list those factors as POSITIVE factors supporting growth,
+         and prefer keeping the current setpoints.
+         e.g. "Temperature and humidity stayed within the optimal range while leaf area, volume, and
+         health score improved, which may indicate the current conditions are supporting healthy growth."
+
+EVIDENCE & CAUTION:
+  • Use cautious language — "may be contributing", "may indicate", "may be supporting". NEVER claim a
+    single sensor value DEFINITELY caused a growth/health change without supporting historical data.
+  • If there are fewer than ~3 days of growth/health history (or the data is stale), keep the language
+    tentative and lower your confidence accordingly.
+
+Put the result of this reasoning in the "plant_response_analysis" object of the JSON below, and let it
+drive your "changes" (out-of-range factors linked to deterioration are the strongest reasons to adjust).
 
 === REQUIRED JSON RESPONSE FORMAT ===
 {{
@@ -745,6 +777,27 @@ Compute it from all available data. Lower it if health data or growth data is ol
   "confidence": 0.0 to 1.0,
   "summary": "2–3 sentence summary of plant condition and what you recommend",
   "detailed_explanation": "detailed explanation of diagnosis and why you recommend or do not recommend changes",
+  "plant_response_analysis": {{
+    "growth_trend": "improving | stable | declining | insufficient_data",
+    "health_trend": "improving | stable | declining | insufficient_data",
+    "possible_causes": [
+      {{
+        "factor": "air_temperature | humidity | light | soil_ph | soil_ec | soil_temperature | soil_moisture",
+        "current_value": current numeric value,
+        "optimal_range": "min–max string with unit",
+        "relationship": "tentative explanation, e.g. 'High temperature may be contributing to reduced growth and lower plant health.'"
+      }}
+    ],
+    "positive_factors": [
+      {{
+        "factor": "factor name",
+        "current_value": current numeric value,
+        "optimal_range": "min–max string with unit",
+        "relationship": "tentative explanation, e.g. 'Humidity stayed in range and may be supporting healthy growth.'"
+      }}
+    ],
+    "summary": "1–2 sentences linking the environment to the plant's response (use 'may' unless history is strong)"
+  }},
   "recommended_setpoints": {{
     "Temperature": number,
     "Humidity": number,
@@ -1259,21 +1312,11 @@ def run_advisor(triggered_by: str = "scheduler") -> dict:
         )
         _mongo_db_handler.insert_ai_recommendation(doc)
 
-        # 6-ntf. UI notification (bell/toast) — UI only, never email, never blocks.
-        try:
-            import notifications
-            _n_changes = len(doc.get('changes') or [])
-            notifications.create_notification(
-                'ai_recommendation_ready', 'info',
-                'New AI recommendation ready',
-                (f"{_n_changes} setpoint change(s) recommended." if _n_changes
-                 else "AI analysis complete — no setpoint changes recommended."),
-                category='workflow', link='ai-advisor',
-                meta={'rec_id': doc['recommendation_id']},
-                dedup_key=f"ai_rec:{doc['recommendation_id']}", dedup_window_sec=3600,
-            )
-        except Exception as _ntf_err:
-            _CUSTOM_PRINT_FUNC(f"[Notifications] ai_recommendation_ready skipped: {_ntf_err}")
+        # 6-ntf. No UI notification here on purpose.
+        # Layer 2 → Layer 3 is one connected workflow: the single user-facing
+        # notification ("Approval required" / "Budget review ready") is emitted by
+        # the Budget Manager (layer3_budget_manager) once the review completes, so
+        # the bell never shows the intermediate "recommendation ready" step.
 
         # 6a. Trigger Layer 3 review automatically (runs in background, never blocks Layer 2)
         _trigger_layer3_review(doc['recommendation_id'])
@@ -1337,6 +1380,7 @@ def _send_telegram_notification(doc: dict):
                 severity  = "WARNING",
                 component = "AI Setpoint Advisor",
                 data={"Reason": doc.get("rejection_reason") or "See validation notes"},
+                ui_notify = False,   # email only — workflow notification is owned by Layer 3
             )
         else:
             sent = send_telegram_alert(
@@ -1356,6 +1400,7 @@ def _send_telegram_notification(doc: dict):
                     "Rec Status":       status,
                     "Summary":          summary if summary else "N/A",
                 },
+                ui_notify = False,   # email only — workflow notification is owned by Layer 3
             )
         if sent:
             try:
