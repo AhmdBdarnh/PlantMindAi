@@ -1089,19 +1089,31 @@ def init_routes(
     @bp.route('/api/ai-advisor/<rec_id>/approve', methods=['POST'])
     def ai_advisor_approve(rec_id):
         """
-        Confirm and apply an AI recommendation.
-        Re-validates all safety limits before touching any setpoint.
+        Layer 2 cannot apply setpoints directly (3-layer architecture).
+
+        This endpoint no longer changes live setpoints. It forwards the
+        recommendation to the Layer 3 Budget Manager for review. The live
+        setpoint update happens ONLY through /api/layer3/approve after the
+        user approves the budget decision. Kept for backward compatibility.
         """
-        import ai_setpoint_advisor
+        import layer3_budget_manager
         try:
-            success, message, applied = ai_setpoint_advisor.apply_recommendation(rec_id)
-            if success:
-                return jsonify({
-                    'success':         True,
-                    'message':         message,
-                    'applied_changes': applied,
-                }), 200
-            return jsonify({'success': False, 'error': message}), 400
+            doc = mongo_db_handler.get_ai_recommendation_by_id(rec_id)
+            if not doc:
+                return jsonify({'success': False, 'error': f"Recommendation '{rec_id}' not found."}), 404
+
+            # Forward to Layer 3 — never apply setpoints here.
+            result = layer3_budget_manager.run(layer2_recommendation_id=rec_id)
+            return jsonify({
+                'success':              True,
+                'applied_changes':      [],
+                'forwarded_to_layer3':  True,
+                'message':              ('Layer 2 cannot apply setpoints directly. The recommendation has '
+                                         'been forwarded to the Budget Manager (Layer 3). Open the Budget '
+                                         'Manager page to review and approve — that is the only path that '
+                                         'updates live setpoints.'),
+                'layer3_result':        result,
+            }), 200
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
 

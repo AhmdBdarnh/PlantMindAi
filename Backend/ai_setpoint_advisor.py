@@ -1417,14 +1417,26 @@ def _send_telegram_notification(doc: dict):
 
 def apply_recommendation(rec_id: str) -> tuple:
     """
-    Apply an approved recommendation to the live setpoints.
-    Re-validates all safety limits before touching any setpoint.
+    DISABLED — Layer 2 may not apply setpoints directly (3-layer architecture).
+
+    Setpoint changes must be approved through the Layer 3 Budget Manager
+    (/api/layer3/approve). This guard keeps the bypass closed even if the
+    function is called directly from code. The original apply logic is kept
+    below but is intentionally unreachable.
 
     Returns:
-        success        : bool
+        success        : bool   (always False)
         message        : str
-        applied_changes: list of {parameter, new_value}
+        applied_changes: list
     """
+    # ── Architecture guard — never apply from Layer 2 ─────────────────────────
+    return (
+        False,
+        "Direct apply is disabled. Setpoint changes must be approved through the "
+        "Layer 3 Budget Manager (/api/layer3/approve).",
+        [],
+    )
+
     doc = _mongo_db_handler.get_ai_recommendation_by_id(rec_id)
     if not doc:
         return False, f"Recommendation '{rec_id}' not found.", []

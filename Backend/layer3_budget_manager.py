@@ -98,6 +98,13 @@ MOISTURE_SETPOINT_FLOOR = 35.0         # % — minimum allowed soil moisture tar
 LED_POWER_MIN_PCT       = 40           # % — never propose LED below 40% of current
 FAN_NIGHT_DUTY_MIN      = int(4095 * 0.15)  # 15% of max PWM
 
+# Fan budget modifications are DISABLED: the cooling fan is owned by the Layer 1
+# temperature PID (control_loops.FAN_SCHEDULE_ENABLED is False), so a Layer 3
+# fan_night_duty change would have no runtime effect. Keeping this as a flag means
+# Layer 3 only proposes modifications that take effect immediately (LED + moisture).
+# To re-enable later, set this True AND enable the fan schedule in control_loops.py.
+LAYER3_ALLOW_FAN_MODS   = False
+
 # ── Layer 2 staleness limit ───────────────────────────────────────────────────
 
 LAYER2_MAX_AGE_HOURS = 48   # Layer 2 data older than this → BLOCK (run Layer 2 again)
@@ -304,7 +311,9 @@ def _build_proposed_modifications(
                 constraints['led_power_cap'] = round((proposed_light / current_light) * 100.0, 1)
 
     # ── Night fan duty reduction (electricity driver) ─────────────────────────
-    if main_driver in ('electricity', None) or budget_status == BUDGET_OVER_BUDGET:
+    # Disabled: the fan is PID-controlled, so a Layer 3 fan change has no runtime
+    # effect. Gated behind LAYER3_ALLOW_FAN_MODS (see flag at top of module).
+    if LAYER3_ALLOW_FAN_MODS and (main_driver in ('electricity', None) or budget_status == BUDGET_OVER_BUDGET):
         try:
             import control_loops
             current_night_duty = control_loops.FAN_NIGHT_DUTY
@@ -628,7 +637,7 @@ def _sanitize_ai_mods(mods: list, current_sp: dict) -> tuple:
             clean.append({**m, "parameter": param, "current_value": cur_light,
                           "proposed_value": proposed, "unit": m.get("unit", "sensor units")})
 
-        elif param == "fan_night_duty" and cur_fan_night and cur_fan_night > 0:
+        elif param == "fan_night_duty" and LAYER3_ALLOW_FAN_MODS and cur_fan_night and cur_fan_night > 0:
             proposed = int(max(FAN_NIGHT_DUTY_MIN, min(proposed, cur_fan_night)))
             if proposed >= cur_fan_night:
                 continue

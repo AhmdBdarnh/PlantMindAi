@@ -36,14 +36,16 @@ Layer 2 — AI Setpoint Advisor (daily, human-approved)
   │  Status: pending / needs_manual_review / invalid
   │  Auto-triggers Layer 3 immediately after
   ▼
-Layer 3 — Budget Manager (automatic gate check, human-approved)
+Layer 3 — Budget Manager (automatic, human-approved)
      layer3_budget_manager.py
-     Three gates: Sensor Safety → Plant Health → Budget
+     Budget gate only: compares today's water/electricity/fertilizer costs vs budget_config
+     BLOCK preconditions: no Layer 2 rec / rec invalid / rec older than 48h (LAYER2_MAX_AGE_HOURS)
      Decisions: APPROVE / MODIFY / BLOCK / ALERT_ONLY
+     Decision engine: AI-powered when LAYER3_USE_AI=true (default), else rule-based
      All changes require explicit user approval via frontend
 ```
 
-**Critical rule**: Layer 3 NEVER fires actuators. Layer 3 NEVER changes pump power or pulse durations. All setpoint changes require human "Approve" in the dashboard.
+**Critical rule**: Layer 3 NEVER fires actuators. Layer 3 NEVER changes pump power or pulse durations. It only writes a decision document to MongoDB. All setpoint changes require human "Approve" in the dashboard.
 
 ---
 
@@ -76,7 +78,7 @@ Flask Backend (port 5000)  ──►  MongoDB Atlas  (sensor history, setpoints,
 | `Backend/config.py` | All constants: pins, credentials, price constants |
 | `Backend/control_loops.py` | Layer 1: PID and hysteresis control loops + fan schedule |
 | `Backend/setpoints.py` | Setpoint storage, MongoDB persistence, operation mode |
-| `Backend/app_loop.py` | 10s sensor polling, 1s actuator logging, resource accumulation |
+| `Backend/app_loop.py` | 5s sensor polling, 1s actuator logging, resource accumulation |
 | `Backend/routes.py` | All Flask REST API routes (Blueprint) |
 | `Backend/actuator_helpers.py` | Manual-mode actuator apply helper |
 | `Backend/mongo_db_handler.py` | MongoDB wrapper for all collections |
@@ -159,16 +161,17 @@ Duty cycle range: **0–4095** for all actuators (12-bit PWM).
 - PID: KP=20, KI=7.5, KD=0.1
 - Controls both LED strips together
 - Resets PID on setpoint change; strips off if setpoint=0
-- Sample time: 0.1s — **holds I2C bus constantly** (see I2C contention note)
+- Sample time: 1.0s
 - In manual mode: wakes up but does nothing (returns immediately)
 
 ### Fan Schedule (`fan_schedule_task`)
-- `FAN_SCHEDULE_ENABLED = True` — **permanent production behavior** (not a test)
-- Day (06:00–20:00): duty from `setpoints.get_fan_day_duty()`, fallback 4095 (100%)
-- Night (20:00–06:00): duty from `setpoints.get_fan_night_duty()`, fallback 1024 (25%)
-- Check interval: 60s
-- Overrides temperature PID fan control when enabled
-- Paused in manual mode
+- `FAN_SCHEDULE_ENABLED = False` — **currently DISABLED**. The cooling fan is controlled
+  by the temperature PID. The schedule thread only starts when this flag is True.
+- When enabled: Day (06:00–20:00) duty from `setpoints.get_fan_day_duty()`, fallback 4095 (100%);
+  Night (20:00–06:00) duty from `setpoints.get_fan_night_duty()`, fallback 1024 (25%); 60s check interval;
+  overrides the temperature PID fan control; paused in manual mode.
+- ⚠️ Because the schedule is disabled, Layer 3 fan modifications are also disabled
+  (`LAYER3_ALLOW_FAN_MODS = False`) so no inert fan changes can be proposed or approved.
 
 ### Soil Moisture (`set_soil_moisture_setpoint_task`)
 - Graduated pulse irrigation based on live setpoints
@@ -178,8 +181,11 @@ Duty cycle range: **0–4095** for all actuators (12-bit PWM).
   - `target-H-5 <= moisture < target-H` → 1s pulse
   - `target-H-10 <= moisture < target-H-5` → 1.5s pulse
   - `moisture < target-H-10` → 2s pulse + Telegram CRITICAL alert
-- After any pulse: `ABSORB_WAIT_SEC` (currently 60s TEST MODE, normally 7200s / 2h)
+- High-moisture alert at absolute 75% (always active)
+- After any pulse: `ABSORB_WAIT_SEC = 10800` (3h)
 - Check interval: 30s
+- Hard cap: `MAX_PUMP_SEC = 3` — a single pulse can never exceed 3s
+- Settle guard: after a manual→auto switch, 2 valid reads required before the pump may fire
 - Safety: RS485 None/NaN/0/≤5% = sensor error → pump blocked
 - Safety: 3 consecutive bad reads → 1h pump lock + Telegram alert
 - Pauses light loop before firing (I2C bus contention fix)
@@ -196,12 +202,14 @@ Duty cycle range: **0–4095** for all actuators (12-bit PWM).
   - `ec_target-400 <= EC < ec_target-200` → Low: 1s pulse
   - `EC < ec_target-400` → Very low: 1.5s pulse
   - `EC < 550` → Telegram WARNING "EC low" (fires alongside pump)
-- After any pulse: `SETTLE_WAIT_SEC` (currently 90s TEST MODE, normally 14400s / 4h)
+- After any pulse: `SETTLE_WAIT_SEC = 18000` (5h)
 - Check interval: 3600s (1h)
+- Hard cap: `MAX_PULSE_SEC = 2` — a single fertilizer pulse can never exceed 2s
 - pH: warning-only — does NOT block fertilization
 - pH thresholds: PH_CRITICAL_LOW=4.8, PH_LOW_WARN=5.2, PH_HIGH_WARN=7.5
 - EC validity range: 50–9000 µS/cm; invalid EC → pump locked
-- Safety: same 3-failure lock as moisture loop
+- Absolute EC thresholds (2000/1600/1000/550) are independent of the setpoint — they always apply
+- Safety: same 3-failure lock + manual→auto settle guard as moisture loop
 
 ---
 
@@ -213,9 +221,9 @@ Duty cycle range: **0–4095** for all actuators (12-bit PWM).
 | Air humidity | 68% | humidity |
 | Light intensity | 600 | light |
 | Soil pH | 6.3 | soil_ph |
-| Soil EC | 1300 µS/cm | soil_ec |
+| Soil EC | 850 µS/cm | soil_ec |
 | Soil temperature | 21.0°C | soil_temp |
-| Soil moisture | 70% | soil_moisture |
+| Soil moisture | 50% | soil_moisture |
 | Soil hysteresis | 10% | soil_hysteresis |
 | Water flow | 2.0 L/h | water_flow |
 | Fertilizer flow | 0.5 L/h | fertilizer_flow |
@@ -233,7 +241,7 @@ Setpoints are loaded from MongoDB on startup and saved immediately when changed.
 **Daily schedule**: fires at 15:30 via `daily_ai_advisor_thread`.
 
 **Pipeline**:
-1. Collect context: current setpoints, sensor cache, 24h stats from MongoDB, plant health (last 7), growth metrics (last 7), actuator states, pump history, resource totals
+1. Collect context: current setpoints, sensor cache, 24h sensor stats from MongoDB, latest two plant-health records, latest + previous growth measurement + trend, actuator states, pump history, resource totals, and data-age notes
 2. Build structured text prompt with 8 sections
 3. Call GPT (model from `OPENAI_MODEL` env var, default `gpt-4o`)
 4. Validate response against `SAFETY_LIMITS` (max change per parameter, hard reject limits)
@@ -241,54 +249,60 @@ Setpoints are loaded from MongoDB on startup and saved immediately when changed.
 6. Auto-trigger Layer 3 in background thread
 7. Send Telegram notification
 
-**Safety limits** (per recommendation):
+**Safety limits** (`SAFETY_LIMITS`, per recommendation). `max_change` exceeded → needs manual review;
+`reject_above` exceeded → hard rejected; values between trigger a clamp + review:
 | Parameter | Max change | Hard reject above |
 |---|---|---|
-| Temperature | ±1.0°C | ±2.0°C |
+| Temperature | *(no per-recommendation limit — AI may set any value)* | — |
 | Humidity | ±5% | ±10% |
 | Light | ±100 units | ±300 units |
 | Soil pH | ±0.2 | ±0.3 |
 | Soil EC | ±100 µS/cm | ±200 µS/cm |
+| Soil Temp | ±1.0°C | ±2.0°C |
 | Soil Moisture | ±10% | ±15% |
 | Soil Hysteresis | ±2% (always needs review) | ±5% |
 
 **Rate limit**: `AI_MAX_CALLS_PER_DAY` (default 3) — resets at midnight.
 
-**Human actions**: Approve (`POST /api/ai-advisor/<rec_id>/approve`) or Reject (`POST /api/ai-advisor/<rec_id>/reject`). Approve calls `apply_recommendation()` which re-validates before applying.
+**Human actions**: Send to Budget Manager (frontend → `POST /api/layer3/run`) or Reject (`POST /api/ai-advisor/<rec_id>/reject`, marks the recommendation rejected — no setpoint change). Layer 2 has **no apply action** — approval and the live setpoint update happen only in Layer 3. `POST /api/ai-advisor/<rec_id>/approve` is kept for backward compatibility but now only forwards to Layer 3.
 
 ---
 
 ## Layer 3 — Budget Manager
 
-**Auto-triggered** by Layer 2 immediately after saving a recommendation. Also triggerable manually via `POST /api/layer3/run`.
+**Auto-triggered** by Layer 2 immediately after saving a recommendation (fire-and-forget background thread — Layer 2 never waits on it). Also triggerable manually via `POST /api/layer3/run`.
 
-**Three gates (in order)**:
+**This is a budget gate only** — there is no separate sensor-safety or plant-health gate in the decision engine. `gate_results` contains only `budget`. Sensor safety is enforced entirely by Layer 1; plant health/growth is consumed by Layer 2.
 
-1. **Sensor Safety Gate** — checks live sensor values:
-   - Soil moisture < 20% → BLOCK
-   - EC > 1800 µS/cm → BLOCK
-   - EC < 100 µS/cm → BLOCK (sensor dead)
-   - pH < 5.0 or > 8.0 → BLOCK
-   - Temperature < 10°C or > 35°C → BLOCK
-   - Marginal values → WARN
+**Budget evaluation** (`_run_budget_gate`): compares today's costs (water + electricity + fertilizer, from `get_today_costs`) against `budget_config`. Status = worst of the total check and each per-resource check:
+- `usage_pct < warning_threshold_pct` → **ok**
+- `warning_threshold_pct ≤ usage_pct ≤ 100` → **warning**
+- `usage_pct > 100` → **over_budget**
 
-2. **Plant Health Gate** — checks Layer 2's `plant_stability_score` and `growth_assessment`:
-   - Score < 0.3 or declining growth → BLOCK
-   - Score 0.3–0.5 or stagnating → WARN
+**Decision flow** (`_make_decision`, rule-based; `_ai_make_decision` when `LAYER3_USE_AI=true`):
+1. No Layer 2 recommendation found → **BLOCK**
+2. Layer 2 recommendation `status == invalid` → **BLOCK**
+3. Layer 2 recommendation older than `LAYER2_MAX_AGE_HOURS` (48h) → **BLOCK**
+4. Budget **ok** → **APPROVE** (apply Layer 2 as-is)
+5. Budget **warning** / **over_budget** → **MODIFY** (propose cost-saving cuts)
+6. Budget pressure but no safe modifications available → **ALERT_ONLY**
 
-3. **Budget Gate** — checks today's resource costs vs. `budget_config`:
-   - Over budget → MODIFY or ALERT_ONLY
-   - Near warning threshold → WARN
+**Proposed modifications** (`_build_proposed_modifications`, cost-saving only, never pump power/pulse):
+- LED setpoint reduction (electricity driver) — never below `LED_POWER_MIN_PCT` (40%) of current
+- Soil moisture target reduction (water driver) — never below `MOISTURE_SETPOINT_FLOOR` (35%)
+- Reduction scale: WARNING → 15%, OVER_BUDGET → 25%
+- ⚠️ Night-fan-duty reduction is **disabled** via `LAYER3_ALLOW_FAN_MODS = False` (the fan is PID-controlled,
+  so a Layer 3 fan change has no runtime effect). Re-enable only together with the fan schedule.
 
 **Final decisions**:
 | Decision | Meaning | Approve button |
 |---|---|---|
-| APPROVE | Safe + affordable. Apply Layer 2 as-is | Enabled |
-| MODIFY | Safe but expensive. Apply with cuts | Enabled |
-| BLOCK | Unsafe. Do NOT apply | **Disabled** |
-| ALERT_ONLY | No changes, just inform user | Enabled (acknowledge only) |
+| APPROVE | Within budget — apply Layer 2 recommendation as-is | Enabled |
+| MODIFY | Budget pressure — apply Layer 2 plus cost-saving cuts | Enabled |
+| BLOCK | No / invalid / stale (>48h) Layer 2 recommendation — nothing to apply | **Disabled** |
+| ALERT_ONLY | Budget pressure but no safe cuts possible — informational only | Enabled (acknowledge only) |
 
-**Human actions**: `POST /api/layer3/approve` or `POST /api/layer3/reject`.
+**Human actions**: `POST /api/layer3/approve` or `POST /api/layer3/reject`. Approve applies the supported setpoint changes via `GH_Setpoints` setters and saves `runtime_constraints`; it also syncs the linked Layer 2 recommendation to `approved`.
 
 ---
 
@@ -342,20 +356,23 @@ Two endpoints:
 
 | Collection | Contents |
 |---|---|
-| `sensors_data` | Time-series sensor readings (inserted every 10s) |
+| `sensors_data` | Time-series sensor readings (inserted every ~5s) |
 | `actuators_data` | Actuator state changes (upserted on change) |
-| `resources` | Live resource totals (upserted every 10s) |
+| `actuator_events` | Discrete actuator on/off events |
+| `resources` | Live resource totals (upserted every ~5s) |
 | `setpoints` | Single document `_id: "greenhouse_setpoints"` |
 | `system_state` | Key-value store for persisting totals across restarts |
 | `pump_logs` | Every pump pulse (type, duration, DC, flow rate) |
-| `plant_images` | Capture session metadata with S3 keys |
+| `plant_images` / `capture_sessions` | Capture session metadata with S3 keys |
 | `plant_health_results` | Plant.id v3 health check results |
 | `growth_measurements` | Growth analysis outputs (area, height, AGR, RGR…) |
 | `ai_setpoint_recommendations` | Layer 2 AI recommendations |
-| `layer3_decisions` | Layer 3 gate results and final decisions |
+| `layer3_decisions` | Layer 3 decisions (budget gate result + final decision) |
+| `layer3_status` | Latest Layer 3 run status for the dashboard |
 | `budget_config` | Budget limits (daily, monthly, per-resource) |
 | `daily_costs` | Daily baseline costs for budget gate |
 | `runtime_constraints` | Active constraints from approved Layer 3 MODIFY decisions |
+| `notifications` | In-app bell/toast notifications (workflow + alerts) |
 
 ---
 
@@ -460,11 +477,11 @@ loops/setpoints/operation_mode
 | flask_thread | HTTP server | event-driven |
 | serial_logger_thread | Terminal display | 1s |
 | temperature_thread | Temp PID loop | 10s |
-| light_thread | Light PID loop | 0.1s |
-| soil_thread | Moisture hysteresis | 30s / 7200s absorb |
-| fertilizer_thread | EC-based fertilization | 3600s / 14400s settle |
-| app_thread | Sensor polling + MQTT + DB | 10s sensors / 1s actuators |
-| fan_schedule_thread | Day/night fan schedule | 60s |
+| light_thread | Light PID loop | 1s |
+| soil_thread | Moisture hysteresis | 30s / 10800s absorb |
+| fertilizer_thread | EC-based fertilization | 3600s / 18000s settle |
+| app_thread | Sensor polling + MQTT + DB | 5s sensors / 1s actuators |
+| fan_schedule_thread | Day/night fan schedule | 60s — **only if `FAN_SCHEDULE_ENABLED` (currently False)** |
 | daily_capture_thread | Plant photo at 14:00 | daily |
 | daily_growth_capture_thread | Growth photos at 14:10 | daily |
 | daily_growth_thread | Growth analysis at 14:15 | daily |
@@ -485,7 +502,9 @@ loops/setpoints/operation_mode
 
 ## Important Behaviours to Know
 
-**I2C bus contention**: The light PID loop runs every 100ms and holds the I2C bus. Before any pump fires, `light_pause_event.clear()` + 0.2s sleep, then `light_pause_event.set()` after. Both soil and fertilizer loops do this. Never send I2C commands without this guard.
+**I2C bus contention**: The light PID loop runs every 1s and frequently uses the I2C bus. Before any pump fires, `light_pause_event.clear()` + 0.2s sleep, then `light_pause_event.set()` after. Both soil and fertilizer loops do this. Never send I2C commands without this guard.
+
+**Control-loop supervisor**: Each Layer 1 loop runs inside `_supervised()` ([app.py](Backend/app.py)). If a loop raises an unhandled exception it forces `stop_all_actuators()` (so a crash can never leave a pump running), logs the traceback, and restarts the loop after 5s. A loop thread can never die silently.
 
 **Startup sequence**: ESP32 restart → 10s boot wait → PWM channel init with 1–5s delays between each. Do not shorten. Pumps are explicitly set to OFF after init as a safety guarantee.
 
@@ -497,14 +516,16 @@ loops/setpoints/operation_mode
 
 **Pump safety**: Each pump has a first-valid-read gate — it won't fire until at least one good sensor reading has been confirmed after mode switch to autonomous. This prevents false-dry triggers on startup.
 
-**Fan schedule overrides temperature PID**: When `FAN_SCHEDULE_ENABLED = True` (the default), the temperature loop never touches the cooling fan. The fan schedule thread owns it.
+**Fan schedule overrides temperature PID**: `FAN_SCHEDULE_ENABLED` is currently **False**, so the temperature PID owns the cooling fan. When the flag is True, the fan schedule thread owns the fan and the temperature loop never touches it.
 
 **CAM_CALIBRATION**: The `CAM_CALIBRATION` dict in `plant-growth-calculator/functions.py` is calibrated for real camera positions. Never change it.
 
 **S3 prefixes are separate**: Health captures → `captures/`, Growth captures → `growth_capture_input/`, Growth outputs → `growth_outputs/`. Never mix these prefixes.
 
-**Layer 3 setpoint map**: Only `light_setpoint`, `soil_ec_setpoint`, `soil_moisture_setpoint`, `fan_day_duty`, `fan_night_duty` are mapped to setters. Temperature, pH, humidity are not in the Layer 3 map — they come only from Layer 2 user-approve.
+**Layer 3 setpoint map**: `_L3_SETPOINT_MAP` in [routes.py](Backend/routes.py) now maps **all** setpoints — temperature, humidity, light, soil_ph, soil_ec, soil_temp, soil_moisture, soil_hysteresis, fan_day_duty, fan_night_duty — to their `GH_Setpoints` setters. On an APPROVE with no proposed modifications, the Layer 2 `changes` are converted via `_L2_TO_L3_PARAM_MAP` and applied.
 
-**Sensor cache**: `/api/sensors` reads from `app_loop._sensor_cache` (updated every 10s), never from hardware directly. Returns 503 if cache is empty (sensor loop still initializing).
+**Single approval path**: `/api/layer3/approve` is the **only** path that writes live setpoints. Layer 2 cannot apply setpoints directly — `/api/ai-advisor/<rec_id>/approve` now just **forwards** the recommendation to Layer 3 (it never changes setpoints), and `apply_recommendation()` has a hard guard that always refuses. The frontend Layer 2 page reflects this: it only offers "Run Now" and "Send to Budget Manager".
+
+**Sensor cache**: `/api/sensors` reads from `app_loop._sensor_cache` (updated every ~5s), never from hardware directly. Returns 503 if cache is empty (sensor loop still initializing).
 
 **Serial log**: `utils/utils.py` `_CUSTOM_PRINT_FUNC` can be silenced per module. `set_serial_log_enabled(False)` suppresses output before the serial logger starts. Set `DEBUG_VERBOSE=true` in `.env` to see all werkzeug GET logs.
